@@ -7,6 +7,7 @@ import {
 } from "./protocol.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+const MAX_SAMPLE_COUNT = 10_000;
 
 export interface ListCommand {
   readonly name: "list";
@@ -20,6 +21,7 @@ export interface HardwareCommand {
   readonly count: number;
   readonly payloadSize: number;
   readonly timeoutMs: number;
+  readonly allowInboxDrain: true;
   readonly output?: string;
 }
 
@@ -56,6 +58,7 @@ function parseHardwareCommand(
       count: { type: "string" },
       "payload-size": { type: "string" },
       "timeout-ms": { type: "string", default: String(DEFAULT_TIMEOUT_MS) },
+      "allow-inbox-drain": { type: "boolean", default: false },
       output: { type: "string" },
     },
   } as const;
@@ -72,6 +75,11 @@ function parseHardwareCommand(
 
   const a = required(parsed.values.a, "--a");
   const b = required(parsed.values.b, "--b");
+  if (!parsed.values["allow-inbox-drain"]) {
+    throw new UsageError(
+      "--allow-inbox-drain is required because Companion inbox messages are consumed during a run",
+    );
+  }
   if (a === b) {
     throw new UsageError("--a and --b must name different serial ports");
   }
@@ -85,7 +93,7 @@ function parseHardwareCommand(
     required(parsed.values.count, "--count"),
     "--count",
     1,
-    1_000_000,
+    MAX_SAMPLE_COUNT,
   );
   const timeoutMs = integer(
     required(parsed.values["timeout-ms"], "--timeout-ms"),
@@ -114,6 +122,7 @@ function parseHardwareCommand(
     count,
     payloadSize,
     timeoutMs,
+    allowInboxDrain: true,
     ...(parsed.values.output === undefined
       ? {}
       : { output: parsed.values.output }),

@@ -7,25 +7,32 @@ import {
   MeshCoreRadio,
   listRadioPorts,
   type ChannelConfiguration,
+  type RadioIdentity,
   type RadioPort,
 } from "./radio.js";
-import { createReport, writeReport } from "./report.js";
+import { RunArtifacts } from "./report.js";
 import {
+  runDirectionalBench,
   runRoundTrips,
+  type DirectionalBenchResult,
+  type DirectionalSample,
   type RoundTripResult,
   type RoundTripSample,
 } from "./runner.js";
 
 const HELP = `Usage:
   npm run fieldlink -- radios list
-  npm run fieldlink -- ping --a <port> --b <port> --channel <0-7> --count <n>
-  npm run fieldlink -- bench --a <port> --b <port> --channel <0-7> --count <n> --payload-size <12-163>
+  npm run fieldlink -- ping --a <port> --b <port> --channel <0-7> --count <n> --allow-inbox-drain
+  npm run fieldlink -- bench --a <port> --b <port> --channel <0-7> --count <n> --payload-size <12-163> --allow-inbox-drain
 
 Options:
-  --timeout-ms <ms>  Per-round-trip timeout. Default: 30000
-  --output <path>    JSON result path. Default: results/<timestamp>-<command>.json
-  --help             Show this help
+  --allow-inbox-drain  Required acknowledgement that both Companion inboxes are consumed
+  --timeout-ms <ms>   Full send-and-delivery deadline per sample. Default: 30000
+  --output <path>     Artifact directory. Default: results/<timestamp>-<command>/
+  --help              Show this help
 `;
+
+type HardwareResult = RoundTripResult | DirectionalBenchResult;
 
 async function main(arguments_: readonly string[]): Promise<number> {
   if (
@@ -46,50 +53,222 @@ async function main(arguments_: readonly string[]): Promise<number> {
 }
 
 async function runHardwareCommand(command: HardwareCommand): Promise<number> {
-  const radioA = new MeshCoreRadio(command.a);
-  const radioB = new MeshCoreRadio(command.b);
   const startedAt = new Date().toISOString();
-  process.stderr.write(`Opening A=${command.a} and B=${command.b}\n`);
+  const artifacts = await RunArtifacts.create(
+    {
+      schemaVersion: 2,
+      command: command.name,
+      startedAt,
+      radios: { a: command.a, b: command.b },
+      channel: command.channel,
+      requestedCountPerPhase: command.count,
+      datagramBytes: command.payloadSize,
+      timeoutMs: command.timeoutMs,
+      inboxDrainAccepted: command.allowInboxDrain,
+    },
+    command.output,
+  );
+  const abortController = new AbortController();
+  let artifactError: Error | undefined;
+  const record = (type: string, data: unknown): void => {
+    void artifacts.record(type, data).catch((error: unknown) => {
+      artifactError ??= asError(error);
+    });
+  };
+  const interrupt = (signal: NodeJS.Signals): void => {
+    if (!abortController.signal.aborted) {
+      record("interrupted", { signal });
+      abortController.abort(signal);
+      process.stderr.write(
+        `\n${signal}: stopping after the active radio operation\n`,
+      );
+    }
+  };
+  const onSigint = (): void => {
+    interrupt("SIGINT");
+  };
+  const onSigterm = (): void => {
+    interrupt("SIGTERM");
+  };
+  process.once("SIGINT", onSigint);
+  process.once("SIGTERM", onSigterm);
 
-  let channel: ChannelConfiguration;
-  let result: RoundTripResult;
+  const radioA = new MeshCoreRadio(command.a, {
+    onInboxMessage: (message) => {
+      record("inbox-message", { radio: "A", message });
+    },
+    onListenerError: (error) => {
+      record("listener-error", { radio: "A", error });
+    },
+  });
+  const radioB = new MeshCoreRadio(command.b, {
+    onInboxMessage: (message) => {
+      record("inbox-message", { radio: "B", message });
+    },
+    onListenerError: (error) => {
+      record("listener-error", { radio: "B", error });
+    },
+  });
+
+  process.stderr.write(
+    [
+      "WARNING: use dedicated test radios only.",
+      "FieldLink must drain both shared MeshCore Companion inboxes; every consumed message is preserved in events.jsonl.",
+      `Opening A=${command.a} and B=${command.b}`,
+    ].join("\n") + "\n",
+  );
+
+  let identityA: RadioIdentity | undefined;
+  let identityB: RadioIdentity | undefined;
+  let channel: ChannelConfiguration | undefined;
+  let result: HardwareResult | undefined;
+  let runError: Error | undefined;
+  const cleanupErrors: string[] = [];
+
   try {
     await Promise.all([radioA.open(), radioB.open()]);
-    const [channelA, channelB] = await Promise.all([
-      radioA.getChannel(command.channel),
-      radioB.getChannel(command.channel),
-    ]);
+    const [queriedIdentityA, queriedIdentityB, channelA, channelB] =
+      await Promise.all([
+        radioA.getIdentity(),
+        radioB.getIdentity(),
+        radioA.getChannel(command.channel),
+        radioB.getChannel(command.channel),
+      ]);
+    identityA = queriedIdentityA;
+    identityB = queriedIdentityB;
+    verifyDistinctMatchingRadios(identityA, identityB);
     verifyMatchingChannels(channelA, channelB);
     channel = channelA;
+    record("radio-identity", {
+      a: safeIdentity(identityA),
+      b: safeIdentity(identityB),
+    });
+    record("channel", { index: channel.index, name: channel.name });
 
     process.stderr.write(
       `Testing channel ${channel.index} (${channel.name || "unnamed"}) with ${command.payloadSize}-byte datagrams\n`,
     );
-    result = await runRoundTrips({
+    const common = {
       a: radioA,
       b: radioB,
       channel: command.channel,
       count: command.count,
       datagramBytes: command.payloadSize,
       timeoutMs: command.timeoutMs,
-      onSample: samplePrinter(command),
-    });
+      signal: abortController.signal,
+      onAnomaly: (anomaly: unknown) => {
+        record("anomaly", anomaly);
+      },
+    };
+    if (command.name === "ping") {
+      result = await runRoundTrips({
+        ...common,
+        onSample: pingSampleRecorder(record),
+      });
+    } else {
+      result = await runDirectionalBench({
+        ...common,
+        onSample: benchSampleRecorder(command, record),
+      });
+    }
+  } catch (error: unknown) {
+    runError = asError(error);
+    record("run-error", runError);
   } finally {
-    await Promise.allSettled([radioA.close(), radioB.close()]);
+    const closed = await Promise.allSettled([radioA.close(), radioB.close()]);
+    for (const [index, closeResult] of closed.entries()) {
+      if (closeResult.status === "rejected") {
+        const message = `${index === 0 ? "A" : "B"}: ${asError(closeResult.reason).message}`;
+        cleanupErrors.push(message);
+        record("cleanup-error", { radio: index === 0 ? "A" : "B", message });
+      }
+    }
   }
 
-  const report = createReport(
-    command,
-    channel,
+  const interrupted = abortController.signal.aborted;
+  const failed =
+    runError !== undefined ||
+    artifactError !== undefined ||
+    cleanupErrors.length > 0 ||
+    result === undefined ||
+    resultFailed(result);
+  const summary = {
+    schemaVersion: 2,
+    command: command.name,
     startedAt,
-    new Date().toISOString(),
-    result,
-    FIELDLINK_DATA_TYPE,
-    FIELDLINK_HEADER_BYTES,
-  );
-  const outputPath = await writeReport(report, command.output);
-  printSummary(result, outputPath);
-  return result.summary.failed === 0 ? 0 : 1;
+    finishedAt: new Date().toISOString(),
+    status: interrupted ? "interrupted" : failed ? "failed" : "passed",
+    interrupted,
+    ...(identityA === undefined ? {} : { radioA: safeIdentity(identityA) }),
+    ...(identityB === undefined ? {} : { radioB: safeIdentity(identityB) }),
+    ...(channel === undefined
+      ? {}
+      : { channel: { index: channel.index, name: channel.name } }),
+    protocol: {
+      meshCoreDataType: FIELDLINK_DATA_TYPE,
+      meshCoreDelivery: "flood",
+      datagramBytes: command.payloadSize,
+      fieldLinkHeaderBytes: FIELDLINK_HEADER_BYTES,
+      applicationBodyBytes: command.payloadSize - FIELDLINK_HEADER_BYTES,
+    },
+    ...(result === undefined ? {} : { result }),
+    ...(runError === undefined ? {} : { error: runError.message }),
+    ...(artifactError === undefined
+      ? {}
+      : { artifactError: artifactError.message }),
+    cleanupErrors,
+  };
+  let finishError: Error | undefined;
+  try {
+    await artifacts.finish(summary);
+  } catch (error: unknown) {
+    finishError = asError(error);
+  } finally {
+    process.removeListener("SIGINT", onSigint);
+    process.removeListener("SIGTERM", onSigterm);
+  }
+
+  if (finishError !== undefined) {
+    process.stderr.write(`fieldlink: ${finishError.message}\n`);
+    process.stderr.write(`Partial artifacts: ${artifacts.paths.directory}\n`);
+    return interrupted ? 130 : 1;
+  }
+
+  if (result !== undefined) {
+    printSummary(result, artifacts.paths.directory);
+  } else {
+    process.stderr.write(
+      `fieldlink: ${runError?.message ?? "run did not produce a result"}\n`,
+    );
+    process.stderr.write(`Artifacts: ${artifacts.paths.directory}\n`);
+  }
+  if (interrupted) {
+    return 130;
+  }
+  return failed ? 1 : 0;
+}
+
+function verifyDistinctMatchingRadios(
+  identityA: RadioIdentity,
+  identityB: RadioIdentity,
+): void {
+  if (Buffer.from(identityA.publicKey).equals(identityB.publicKey)) {
+    throw new Error(
+      "A and B report the same MeshCore public key; select two distinct physical radios",
+    );
+  }
+  const a = identityA.radio;
+  const b = identityB.radio;
+  if (
+    a.frequency !== b.frequency ||
+    a.bandwidth !== b.bandwidth ||
+    a.spreadingFactor !== b.spreadingFactor ||
+    a.codingRate !== b.codingRate
+  ) {
+    throw new Error(
+      "A and B use different LoRa frequency, bandwidth, spreading factor, or coding rate settings",
+    );
+  }
 }
 
 function verifyMatchingChannels(
@@ -114,42 +293,84 @@ function verifyMatchingChannels(
   }
 }
 
-function samplePrinter(
-  command: HardwareCommand,
+function pingSampleRecorder(
+  record: (type: string, data: unknown) => void,
 ): (sample: RoundTripSample) => void {
-  if (command.name === "ping") {
-    return (sample) => {
-      if (sample.status === "ok") {
-        process.stdout.write(
-          `seq=${sample.sequence} rtt=${formatNumber(sample.rttMs)}ms forward_snr=${formatNumber(sample.forwardSnrDb)}dB return_snr=${formatNumber(sample.returnSnrDb)}dB\n`,
-        );
-      } else {
-        process.stdout.write(
-          `seq=${sample.sequence} status=${sample.status}${sample.error === undefined ? "" : ` error=${sample.error}`}\n`,
-        );
-      }
-    };
-  }
-
   return (sample) => {
-    const interval = Math.max(1, Math.floor(command.count / 10));
-    if (sample.sequence % interval === 0 || sample.sequence === command.count) {
-      process.stderr.write(`Progress ${sample.sequence}/${command.count}\n`);
+    record("sample", sample);
+    if (sample.status === "ok") {
+      process.stdout.write(
+        `seq=${sample.sequence} rtt=${formatNumber(sample.rttMs)}ms forward_snr=${formatNumber(sample.forwardSnrDb)}dB return_snr=${formatNumber(sample.returnSnrDb)}dB\n`,
+      );
+    } else {
+      process.stdout.write(
+        `seq=${sample.sequence} status=${sample.status}${sample.error === undefined ? "" : ` error=${sample.error}`}\n`,
+      );
     }
   };
 }
 
-function printSummary(result: RoundTripResult, outputPath: string): void {
-  const { summary } = result;
-  process.stdout.write(
-    [
-      `Completed: ${summary.completed}/${summary.attempted} (${summary.successPercent}%)`,
-      `Duration: ${summary.durationMs} ms`,
-      `Verified goodput: ${summary.verifiedGoodputBitsPerSecond} bit/s`,
-      `RTT p50/p95: ${formatNumber(summary.rttMs?.p50)}/${formatNumber(summary.rttMs?.p95)} ms`,
-      `Result: ${outputPath}`,
-    ].join("\n") + "\n",
+function benchSampleRecorder(
+  command: HardwareCommand,
+  record: (type: string, data: unknown) => void,
+): (sample: DirectionalSample) => void {
+  return (sample) => {
+    record("sample", sample);
+    const interval = Math.max(1, Math.floor(command.count / 10));
+    if (sample.sequence % interval === 0 || sample.sequence === command.count) {
+      process.stderr.write(
+        `Progress ${sample.direction} ${sample.sequence}/${command.count}\n`,
+      );
+    }
+  };
+}
+
+function resultFailed(result: HardwareResult): boolean {
+  if (result.kind === "round-trip") {
+    return result.summary.failed > 0 || result.summary.anomalyTotal > 0;
+  }
+  return result.phases.some(
+    (phase) => phase.failed > 0 || phase.anomalyTotal > 0,
   );
+}
+
+function printSummary(result: HardwareResult, outputDirectory: string): void {
+  if (result.kind === "round-trip") {
+    const { summary } = result;
+    process.stdout.write(
+      [
+        `Completed: ${summary.completed}/${summary.attempted} (${summary.successPercent}%)`,
+        `Duration: ${summary.durationMs} ms`,
+        `Application goodput: ${summary.applicationGoodputBitsPerSecond} bit/s`,
+        `Mesh datagram bitrate: ${summary.meshDatagramBitsPerSecond} bit/s`,
+        `RTT p50/p95/p99: ${formatNumber(summary.rttMs?.p50)}/${formatNumber(summary.rttMs?.p95)}/${formatNumber(summary.rttMs?.p99)} ms`,
+        `Anomalies: ${summary.anomalyTotal}`,
+        `Artifacts: ${outputDirectory}`,
+      ].join("\n") + "\n",
+    );
+    return;
+  }
+  for (const phase of result.phases) {
+    process.stdout.write(
+      `${phase.direction}: ${phase.delivered}/${phase.attempted} (${phase.successPercent}%), app_goodput=${phase.applicationGoodputBitsPerSecond} bit/s, mesh_bitrate=${phase.meshDatagramBitsPerSecond} bit/s, one_way_p95=${formatNumber(phase.oneWayLatencyMs?.p95)} ms, anomalies=${phase.anomalyTotal}\n`,
+    );
+  }
+  process.stdout.write(`Artifacts: ${outputDirectory}\n`);
+}
+
+function safeIdentity(
+  identity: RadioIdentity,
+): Omit<RadioIdentity, "publicKey"> {
+  return {
+    fingerprint: identity.fingerprint,
+    name: identity.name,
+    model: identity.model,
+    firmwareVersion: identity.firmwareVersion,
+    firmwareBuildDate: identity.firmwareBuildDate,
+    firmwareProtocolCode: identity.firmwareProtocolCode,
+    clientProtocolVersion: identity.clientProtocolVersion,
+    radio: identity.radio,
+  };
 }
 
 function printPorts(ports: readonly RadioPort[]): void {
@@ -157,7 +378,6 @@ function printPorts(ports: readonly RadioPort[]): void {
     process.stdout.write("No serial ports found.\n");
     return;
   }
-
   process.stdout.write("PATH\tMANUFACTURER\tSERIAL\tUSB VID:PID\n");
   for (const port of ports) {
     const usbId =
@@ -174,6 +394,10 @@ function formatNumber(value: number | undefined): string {
   return value === undefined ? "n/a" : value.toFixed(2);
 }
 
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
 try {
   process.exitCode = await main(process.argv.slice(2));
 } catch (error: unknown) {
@@ -181,8 +405,7 @@ try {
     process.stderr.write(`fieldlink: ${error.message}\n\n${HELP}`);
     process.exitCode = 2;
   } else {
-    const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`fieldlink: ${message}\n`);
+    process.stderr.write(`fieldlink: ${asError(error).message}\n`);
     process.exitCode = 1;
   }
 }

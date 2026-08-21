@@ -1,42 +1,47 @@
+import { performance } from "node:perf_hooks";
 import { describe, expect, it } from "vitest";
 
-import { decodeDatagram } from "../src/protocol.js";
+import {
+  DatagramKind,
+  decodeDatagram,
+  encodeDatagram,
+} from "../src/protocol.js";
 import type {
   ChannelDatagram,
   DatagramListener,
   DatagramRadio,
 } from "../src/radio.js";
 import { FIELDLINK_DATA_TYPE } from "../src/radio.js";
-import { runRoundTrips } from "../src/runner.js";
+import {
+  runDirectionalBench,
+  runRoundTrips,
+  type RoundTripSample,
+} from "../src/runner.js";
 
 class LoopbackRadio implements DatagramRadio {
   readonly #listeners = new Set<DatagramListener>();
+  readonly sendStartedAt: number[] = [];
   peer: LoopbackRadio | undefined;
   snrDb = -4;
-  dropSequence: number | undefined;
-  corruptResponses = false;
+  delayMs = 0;
+  duplicate = false;
+  dropKind: number | undefined;
+  transform: ((bytes: Uint8Array) => Uint8Array) | undefined;
 
   async send(channel: number, bytes: Uint8Array): Promise<void> {
+    this.sendStartedAt.push(performance.now());
+    if (this.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+    }
     const decoded = decodeDatagram(bytes);
-    if (decoded?.sequence === this.dropSequence) {
+    if (decoded?.kind === this.dropKind) {
       return;
     }
-
-    const delivered = Uint8Array.from(bytes);
-    if (this.corruptResponses && decoded?.kind === 2) {
-      const lastIndex = delivered.length - 1;
-      delivered[lastIndex] = (delivered[lastIndex] ?? 0) ^ 0xff;
-    }
-    const datagram: ChannelDatagram = {
-      channel,
-      dataType: FIELDLINK_DATA_TYPE,
-      snrDb: this.snrDb,
-      pathLength: 0xff,
-      bytes: delivered,
-    };
-    const peerListeners = this.peer === undefined ? [] : this.peer.#listeners;
-    for (const listener of peerListeners) {
-      await listener(datagram);
+    const delivered =
+      this.transform?.(Uint8Array.from(bytes)) ?? Uint8Array.from(bytes);
+    await this.#deliver(channel, delivered);
+    if (this.duplicate) {
+      await this.#deliver(channel, Uint8Array.from(delivered));
     }
   }
 
@@ -45,6 +50,22 @@ class LoopbackRadio implements DatagramRadio {
     return () => {
       this.#listeners.delete(listener);
     };
+  }
+
+  async waitUntilIdle(): Promise<void> {}
+
+  async #deliver(channel: number, bytes: Uint8Array): Promise<void> {
+    const datagram: ChannelDatagram = {
+      channel,
+      dataType: FIELDLINK_DATA_TYPE,
+      snrDb: this.snrDb,
+      pathLength: 0xff,
+      bytes,
+    };
+    const listeners = this.peer === undefined ? [] : this.peer.#listeners;
+    for (const listener of listeners) {
+      await listener(datagram);
+    }
   }
 }
 
@@ -57,10 +78,11 @@ function radioPair(): readonly [LoopbackRadio, LoopbackRadio] {
 }
 
 describe("two-radio round trips", () => {
-  it("verifies request and response bytes and reports RTT and SNR", async () => {
+  it("verifies bytes and reports application and mesh metrics", async () => {
     const [a, b] = radioPair();
     a.snrDb = -7;
     b.snrDb = -5;
+    const samples: RoundTripSample[] = [];
 
     const result = await runRoundTrips({
       a,
@@ -70,6 +92,7 @@ describe("two-radio round trips", () => {
       datagramBytes: 64,
       timeoutMs: 50,
       runId: 123,
+      onSample: (sample) => samples.push(sample),
     });
 
     expect(result.summary).toMatchObject({
@@ -77,22 +100,25 @@ describe("two-radio round trips", () => {
       completed: 3,
       failed: 0,
       successPercent: 100,
-      verifiedBytes: 384,
+      applicationBytes: 312,
+      meshDatagramBytes: 384,
       requestsReceivedByB: 3,
       responsesSentByB: 3,
       responsesReceivedByA: 3,
-      corruptDatagrams: 0,
+      anomalyTotal: 0,
     });
     expect(result.summary.forwardSnrDb?.mean).toBe(-7);
     expect(result.summary.returnSnrDb?.mean).toBe(-5);
-    expect(result.samples.every((sample) => sample.status === "ok")).toBe(true);
+    expect(result.summary.rttMs?.p99).toBeTypeOf("number");
+    expect(samples.every((sample) => sample.status === "ok")).toBe(true);
   });
 
-  it("counts a missing request as a timeout instead of inventing latency", async () => {
+  it("starts the deadline before send and waits for a late send before continuing", async () => {
     const [a, b] = radioPair();
-    a.dropSequence = 2;
+    a.delayMs = 25;
+    const samples: RoundTripSample[] = [];
 
-    const result = await runRoundTrips({
+    await runRoundTrips({
       a,
       b,
       channel: 1,
@@ -100,15 +126,47 @@ describe("two-radio round trips", () => {
       datagramBytes: 16,
       timeoutMs: 5,
       runId: 456,
+      onSample: (sample) => samples.push(sample),
     });
 
-    expect(result.summary.completed).toBe(1);
-    expect(result.samples[1]).toEqual({ sequence: 2, status: "timeout" });
+    expect(samples.map((sample) => sample.status)).toEqual([
+      "timeout",
+      "timeout",
+    ]);
+    const [firstSend, secondSend] = a.sendStartedAt;
+    expect(firstSend).toBeDefined();
+    expect(secondSend).toBeDefined();
+    if (firstSend === undefined || secondSend === undefined) {
+      throw new Error("expected two send timestamps");
+    }
+    expect(secondSend - firstSend).toBeGreaterThanOrEqual(20);
   });
 
-  it("reports payload corruption separately from loss", async () => {
+  it("preserves forward SNR when the response is lost", async () => {
     const [a, b] = radioPair();
-    b.corruptResponses = true;
+    a.snrDb = -9;
+    b.dropKind = DatagramKind.response;
+    const samples: RoundTripSample[] = [];
+
+    const result = await runRoundTrips({
+      a,
+      b,
+      channel: 1,
+      count: 1,
+      datagramBytes: 16,
+      timeoutMs: 5,
+      runId: 789,
+      onSample: (sample) => samples.push(sample),
+    });
+
+    expect(samples[0]).toMatchObject({ status: "timeout", forwardSnrDb: -9 });
+    expect(result.summary.forwardSnrDb?.mean).toBe(-9);
+  });
+
+  it("counts duplicate requests and responses as run-failing anomalies", async () => {
+    const [a, b] = radioPair();
+    a.duplicate = true;
+    b.duplicate = true;
 
     const result = await runRoundTrips({
       a,
@@ -117,10 +175,116 @@ describe("two-radio round trips", () => {
       count: 1,
       datagramBytes: 32,
       timeoutMs: 50,
-      runId: 789,
+      runId: 100,
     });
 
-    expect(result.summary.corruptDatagrams).toBe(1);
-    expect(result.samples[0]?.status).toBe("corrupt");
+    expect(result.summary.anomalies.duplicateRequests).toBe(1);
+    expect(result.summary.anomalies.duplicateResponses).toBe(1);
+    expect(result.summary.anomalyTotal).toBe(2);
+  });
+
+  it.each([
+    ["malformedDatagrams", (bytes: Uint8Array) => bytes.slice(0, 4)],
+    [
+      "malformedDatagrams",
+      (bytes: Uint8Array) => {
+        bytes[0] = 0;
+        return bytes;
+      },
+    ],
+    [
+      "malformedDatagrams",
+      (bytes: Uint8Array) => {
+        bytes[2] = 0xff;
+        return bytes;
+      },
+    ],
+    [
+      "payloadMismatches",
+      (bytes: Uint8Array) => {
+        bytes[bytes.length - 1] = (bytes.at(-1) ?? 0) ^ 0xff;
+        return bytes;
+      },
+    ],
+    [
+      "unexpectedRunIds",
+      () => encodeDatagram(DatagramKind.request, 999, 1, 32),
+    ],
+    [
+      "unexpectedKinds",
+      () => encodeDatagram(DatagramKind.response, 101, 1, 32),
+    ],
+    [
+      "unexpectedSequences",
+      () => encodeDatagram(DatagramKind.request, 101, 99, 32),
+    ],
+  ] as const)("classifies %s explicitly", async (counter, transform) => {
+    const [a, b] = radioPair();
+    a.transform = transform;
+
+    const result = await runRoundTrips({
+      a,
+      b,
+      channel: 1,
+      count: 1,
+      datagramBytes: 32,
+      timeoutMs: 5,
+      runId: 101,
+    });
+
+    expect(result.summary.anomalies[counter]).toBe(1);
+  });
+});
+
+describe("directional benchmark", () => {
+  it("runs A-to-B and B-to-A as independent phases", async () => {
+    const [a, b] = radioPair();
+    a.snrDb = -6;
+    b.snrDb = -3;
+
+    const result = await runDirectionalBench({
+      a,
+      b,
+      channel: 1,
+      count: 2,
+      datagramBytes: 64,
+      timeoutMs: 50,
+      runId: 202,
+    });
+
+    expect(result.phases[0]).toMatchObject({
+      direction: "A-to-B",
+      attempted: 2,
+      delivered: 2,
+      applicationBytes: 104,
+      meshDatagramBytes: 128,
+    });
+    expect(result.phases[0].snrDb?.mean).toBe(-6);
+    expect(result.phases[1]).toMatchObject({
+      direction: "B-to-A",
+      attempted: 2,
+      delivered: 2,
+      applicationBytes: 104,
+      meshDatagramBytes: 128,
+    });
+    expect(result.phases[1].snrDb?.mean).toBe(-3);
+  });
+
+  it("reports zero application goodput for a header-only datagram", async () => {
+    const [a, b] = radioPair();
+
+    const result = await runDirectionalBench({
+      a,
+      b,
+      channel: 1,
+      count: 1,
+      datagramBytes: 12,
+      timeoutMs: 50,
+      runId: 203,
+    });
+
+    expect(result.phases[0].applicationBytes).toBe(0);
+    expect(result.phases[0].applicationGoodputBitsPerSecond).toBe(0);
+    expect(result.phases[0].meshDatagramBitsPerSecond).toBeGreaterThan(0);
   });
 });

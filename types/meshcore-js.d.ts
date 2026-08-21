@@ -8,28 +8,61 @@ declare module "@liamcottle/meshcore.js" {
     readonly data: Uint8Array;
   }
 
+  export interface MeshCoreChannelMessage {
+    readonly channelIdx: number;
+    readonly pathLen: number;
+    readonly txtType: number;
+    readonly senderTimestamp: number;
+    readonly text: string;
+  }
+
+  export interface MeshCoreContactMessage {
+    readonly pubKeyPrefix: Uint8Array;
+    readonly pathLen: number;
+    readonly txtType: number;
+    readonly senderTimestamp: number;
+    readonly text: string;
+  }
+
   export interface MeshCoreChannelInfo {
     readonly channelIdx: number;
     readonly name: string;
     readonly secret: Uint8Array;
   }
 
+  export interface MeshCoreSelfInfo {
+    readonly publicKey: Uint8Array;
+    readonly name: string;
+    readonly radioFreq: number;
+    readonly radioBw: number;
+    readonly radioSf: number;
+    readonly radioCr: number;
+    readonly txPower: number;
+    readonly maxTxPower: number;
+  }
+
+  export interface MeshCoreDeviceInfo {
+    readonly firmwareVer: number;
+    readonly firmware_build_date: string;
+    readonly manufacturerModel: string;
+  }
+
   export type MeshCoreWaitingMessage =
     | { readonly channelData: MeshCoreChannelData }
-    | { readonly channelMessage: unknown }
-    | { readonly contactMessage: unknown };
+    | { readonly channelMessage: MeshCoreChannelMessage }
+    | { readonly contactMessage: MeshCoreContactMessage };
 
-  type MeshCoreListener = (...arguments_: readonly unknown[]) => void;
+  export type MeshCoreListener = (...arguments_: readonly unknown[]) => void;
 
-  export class NodeJSSerialConnection {
-    constructor(path: string);
-
+  export class SerialConnection {
     connect(): Promise<void>;
     close(): Promise<void>;
     on(eventName: string | number, listener: MeshCoreListener): this;
     once(eventName: string | number, listener: MeshCoreListener): this;
     off(eventName: string | number, listener: MeshCoreListener): this;
     getChannel(channelIndex: number): Promise<MeshCoreChannelInfo>;
+    getSelfInfo(): Promise<MeshCoreSelfInfo>;
+    deviceQuery(appTargetVersion: number): Promise<MeshCoreDeviceInfo>;
     sendChannelData(
       channelIndex: number,
       pathLength: number,
@@ -38,9 +71,18 @@ declare module "@liamcottle/meshcore.js" {
       payload: Uint8Array,
     ): Promise<void>;
     syncNextMessage(): Promise<MeshCoreWaitingMessage | null>;
+    protected onConnected(): Promise<void>;
+    protected onDisconnected(): void;
+    protected onDataReceived(data: Uint8Array): Promise<void>;
+    protected emit(
+      eventName: string | number,
+      ...arguments_: readonly unknown[]
+    ): void;
+    protected write(bytes: Uint8Array): Promise<void>;
   }
 
   export const Constants: {
+    readonly SupportedCompanionProtocolVersion: number;
     readonly DataTypes: {
       readonly Dev: number;
     };

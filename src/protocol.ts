@@ -9,6 +9,8 @@ const VERSION = 1;
 export const DatagramKind = {
   request: 1,
   response: 2,
+  aToB: 3,
+  bToA: 4,
 } as const;
 
 export type DatagramKind = (typeof DatagramKind)[keyof typeof DatagramKind];
@@ -62,13 +64,13 @@ export function decodeDatagram(bytes: Uint8Array): DecodedDatagram | null {
   }
 
   const kind = bytes[3];
-  if (kind !== DatagramKind.request && kind !== DatagramKind.response) {
+  if (!Object.values(DatagramKind).includes(kind as DatagramKind)) {
     return null;
   }
 
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   return {
-    kind,
+    kind: kind as DatagramKind,
     runId: view.getUint32(4, true),
     sequence: view.getUint32(8, true),
     bytes,
