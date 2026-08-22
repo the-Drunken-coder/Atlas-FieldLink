@@ -108,6 +108,15 @@ class FieldLinkSerialConnection extends SerialConnection {
       baudRate: 115_200,
       autoOpen: false,
     });
+    this.#serialPort.on("data", (data: Buffer) => {
+      void this.onDataReceived(new Uint8Array(data));
+    });
+    this.#serialPort.on("close", () => {
+      this.onDisconnected();
+    });
+    this.#serialPort.on("error", (error) => {
+      this.emit("error", error);
+    });
   }
 
   async connect(): Promise<void> {
@@ -119,15 +128,6 @@ class FieldLinkSerialConnection extends SerialConnection {
         }
         resolve();
       });
-    });
-    this.#serialPort.on("data", (data: Buffer) => {
-      void this.onDataReceived(new Uint8Array(data));
-    });
-    this.#serialPort.once("close", () => {
-      this.onDisconnected();
-    });
-    this.#serialPort.on("error", (error) => {
-      this.emit("error", error);
     });
     await this.onConnected();
   }

@@ -193,6 +193,8 @@ async function runHardwareCommand(command: HardwareCommand): Promise<number> {
   } catch (error: unknown) {
     artifactError ??= asError(error);
   }
+  process.removeListener("SIGINT", onSigint);
+  process.removeListener("SIGTERM", onSigterm);
 
   const interrupted = abortController.signal.aborted;
   const failed =
@@ -232,9 +234,6 @@ async function runHardwareCommand(command: HardwareCommand): Promise<number> {
     await artifacts.finish(summary);
   } catch (error: unknown) {
     finishError = asError(error);
-  } finally {
-    process.removeListener("SIGINT", onSigint);
-    process.removeListener("SIGTERM", onSigterm);
   }
 
   if (finishError !== undefined) {
