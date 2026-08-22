@@ -188,6 +188,12 @@ async function runHardwareCommand(command: HardwareCommand): Promise<number> {
     }
   }
 
+  try {
+    await artifacts.flush();
+  } catch (error: unknown) {
+    artifactError ??= asError(error);
+  }
+
   const interrupted = abortController.signal.aborted;
   const failed =
     runError !== undefined ||

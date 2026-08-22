@@ -74,6 +74,13 @@ export class RunArtifacts {
     return write;
   }
 
+  async flush(): Promise<void> {
+    await this.#writeTail;
+    if (this.#writeError !== undefined) {
+      throw this.#writeError;
+    }
+  }
+
   async finish(summary: unknown): Promise<void> {
     if (this.#closed) {
       throw new Error("Run artifacts are already closed");
@@ -81,13 +88,14 @@ export class RunArtifacts {
     this.#closed = true;
     const errors: Error[] = [];
     try {
-      await this.#writeTail;
-      await this.#events.sync();
+      await this.flush();
     } catch (error: unknown) {
       errors.push(asError(error));
     }
-    if (this.#writeError !== undefined) {
-      errors.push(this.#writeError);
+    try {
+      await this.#events.sync();
+    } catch (error: unknown) {
+      errors.push(asError(error));
     }
     try {
       await this.#events.close();
