@@ -223,6 +223,28 @@ describe("MeshCore radio adapter", () => {
     expect(connection.closeCalls).toBe(1);
   });
 
+  it("becomes unavailable after an unexpected disconnect", async () => {
+    const connection = new FakeConnection();
+    const radio = new MeshCoreRadio("/dev/test", { connection });
+    await radio.open();
+
+    connection.emit("disconnected");
+
+    await expect(radio.getChannel(1)).rejects.toThrow("disconnected");
+    await expect(radio.close()).rejects.toThrow("Could not cleanly close");
+  });
+
+  it("becomes unavailable after a serial error", async () => {
+    const connection = new FakeConnection();
+    const radio = new MeshCoreRadio("/dev/test", { connection });
+    await radio.open();
+
+    connection.emit("error", new Error("serial failure"));
+
+    await expect(radio.getChannel(1)).rejects.toThrow("serial failure");
+    await expect(radio.close()).rejects.toThrow("Could not cleanly close");
+  });
+
   it("isolates a failing datagram listener", async () => {
     const connection = new FakeConnection();
     connection.messages.push({

@@ -82,6 +82,7 @@ export interface RoundTripSummary {
   readonly responsesReceivedByA: number;
   readonly anomalies: AnomalyCounts;
   readonly anomalyTotal: number;
+  readonly operationErrors: readonly string[];
   readonly interrupted: boolean;
   readonly rttMs: Distribution | null;
   readonly forwardSnrDb: Distribution | null;
@@ -110,6 +111,7 @@ export interface DirectionalSummary {
   readonly meshDatagramBitsPerSecond: number;
   readonly anomalies: AnomalyCounts;
   readonly anomalyTotal: number;
+  readonly operationErrors: readonly string[];
   readonly interrupted: boolean;
   readonly oneWayLatencyMs: Distribution | null;
   readonly snrDb: Distribution | null;
@@ -135,6 +137,7 @@ interface CommonRunOptions {
   readonly runId?: number;
   readonly signal?: AbortSignal;
   readonly onAnomaly?: (anomaly: AnomalyEvent) => void;
+  readonly onError?: (error: string) => void;
 }
 
 export interface RoundTripOptions extends CommonRunOptions {
@@ -175,6 +178,7 @@ export async function runRoundTrips(
   const rttValues: number[] = [];
   const forwardSnrValues: number[] = [];
   const returnSnrValues: number[] = [];
+  const operationErrors: string[] = [];
   let attempted = 0;
   let completed = 0;
   let requestsReceivedByB = 0;
@@ -306,7 +310,17 @@ export async function runRoundTrips(
       }
       options.onSample?.(sample);
       if (outcome.status === "timeout" || outcome.status === "send-error") {
-        await settleLateOperations([sendPromise], [options.a, options.b]);
+        const lateErrors = await settleLateOperations(
+          [sendPromise],
+          [options.a, options.b],
+        );
+        operationErrors.push(...lateErrors);
+        for (const error of lateErrors) {
+          options.onError?.(error);
+        }
+        if (lateErrors.length > 0) {
+          break;
+        }
       }
       if (outcome.status === "aborted") {
         break;
@@ -342,6 +356,7 @@ export async function runRoundTrips(
       responsesReceivedByA,
       anomalies,
       anomalyTotal: countAnomalies(anomalies),
+      operationErrors,
       interrupted: options.signal?.aborted === true,
       rttMs: distribution(rttValues),
       forwardSnrDb: distribution(forwardSnrValues),
@@ -400,6 +415,7 @@ async function runDirectionalPhase(
   const anomalies = emptyAnomalies();
   const latencyValues: number[] = [];
   const snrValues: number[] = [];
+  const operationErrors: string[] = [];
   let attempted = 0;
   let delivered = 0;
   const recordAnomaly = anomalyRecorder(anomalies, options.onAnomaly);
@@ -479,10 +495,17 @@ async function runDirectionalPhase(
       }
       options.onSample?.(sample);
       if (outcome.status === "timeout" || outcome.status === "send-error") {
-        await settleLateOperations(
+        const lateErrors = await settleLateOperations(
           [sendPromise],
           [options.sender, options.receiver],
         );
+        operationErrors.push(...lateErrors);
+        for (const error of lateErrors) {
+          options.onError?.(error);
+        }
+        if (lateErrors.length > 0) {
+          break;
+        }
       }
       if (outcome.status === "aborted") {
         break;
@@ -510,6 +533,7 @@ async function runDirectionalPhase(
     meshDatagramBitsPerSecond: bitrate(meshDatagramBytes, durationMs),
     anomalies,
     anomalyTotal: countAnomalies(anomalies),
+    operationErrors,
     interrupted: options.signal?.aborted === true,
     oneWayLatencyMs: distribution(latencyValues),
     snrDb: distribution(snrValues),
@@ -729,9 +753,14 @@ function waitForOutcome(
 async function settleLateOperations(
   operations: readonly Promise<unknown>[],
   radios: readonly DatagramRadio[],
-): Promise<void> {
-  await Promise.allSettled(operations);
-  await Promise.all(radios.map((radio) => radio.waitUntilIdle()));
+): Promise<readonly string[]> {
+  const operationResults = await Promise.allSettled(operations);
+  const idleResults = await Promise.allSettled(
+    radios.map((radio) => radio.waitUntilIdle()),
+  );
+  return [...operationResults, ...idleResults].flatMap((result) =>
+    result.status === "rejected" ? [errorMessage(result.reason)] : [],
+  );
 }
 
 function anomalyRecorder(

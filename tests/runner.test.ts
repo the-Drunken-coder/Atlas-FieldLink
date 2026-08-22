@@ -15,6 +15,7 @@ import { FIELDLINK_DATA_TYPE } from "../src/radio.js";
 import {
   runDirectionalBench,
   runRoundTrips,
+  type DirectionalSample,
   type RoundTripSample,
 } from "../src/runner.js";
 
@@ -27,6 +28,7 @@ class LoopbackRadio implements DatagramRadio {
   duplicate = false;
   dropKind: number | undefined;
   transform: ((bytes: Uint8Array) => Uint8Array) | undefined;
+  idleError: Error | undefined;
 
   async send(channel: number, bytes: Uint8Array): Promise<void> {
     this.sendStartedAt.push(performance.now());
@@ -52,7 +54,12 @@ class LoopbackRadio implements DatagramRadio {
     };
   }
 
-  async waitUntilIdle(): Promise<void> {}
+  waitUntilIdle(): Promise<void> {
+    if (this.idleError !== undefined) {
+      return Promise.reject(this.idleError);
+    }
+    return Promise.resolve();
+  }
 
   async #deliver(channel: number, bytes: Uint8Array): Promise<void> {
     const datagram: ChannelDatagram = {
@@ -161,6 +168,28 @@ describe("two-radio round trips", () => {
 
     expect(samples[0]).toMatchObject({ status: "timeout", forwardSnrDb: -9 });
     expect(result.summary.forwardSnrDb?.mean).toBe(-9);
+  });
+
+  it("preserves partial results when a radio cannot settle", async () => {
+    const [a, b] = radioPair();
+    a.dropKind = DatagramKind.request;
+    a.idleError = new Error("radio queue stayed busy");
+    const samples: RoundTripSample[] = [];
+
+    const result = await runRoundTrips({
+      a,
+      b,
+      channel: 1,
+      count: 3,
+      datagramBytes: 16,
+      timeoutMs: 5,
+      runId: 790,
+      onSample: (sample) => samples.push(sample),
+    });
+
+    expect(result.summary.attempted).toBe(1);
+    expect(result.summary.operationErrors).toEqual(["radio queue stayed busy"]);
+    expect(samples).toHaveLength(1);
   });
 
   it("counts duplicate requests and responses as run-failing anomalies", async () => {
@@ -286,5 +315,34 @@ describe("directional benchmark", () => {
     expect(result.phases[0].applicationBytes).toBe(0);
     expect(result.phases[0].applicationGoodputBitsPerSecond).toBe(0);
     expect(result.phases[0].meshDatagramBitsPerSecond).toBeGreaterThan(0);
+  });
+
+  it("reports an active sample as aborted and stops both phases", async () => {
+    const [a, b] = radioPair();
+    a.delayMs = 25;
+    const controller = new AbortController();
+    const samples: DirectionalSample[] = [];
+    setTimeout(() => {
+      controller.abort();
+    }, 5);
+
+    const result = await runDirectionalBench({
+      a,
+      b,
+      channel: 1,
+      count: 5,
+      datagramBytes: 32,
+      timeoutMs: 50,
+      runId: 204,
+      signal: controller.signal,
+      onSample: (sample) => samples.push(sample),
+    });
+
+    expect(samples).toEqual([
+      { direction: "A-to-B", sequence: 1, status: "aborted" },
+    ]);
+    expect(result.interrupted).toBe(true);
+    expect(result.phases[0].attempted).toBe(1);
+    expect(result.phases[1].attempted).toBe(0);
   });
 });

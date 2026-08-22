@@ -55,11 +55,10 @@ declare module "@liamcottle/meshcore.js" {
   export type MeshCoreListener = (...arguments_: readonly unknown[]) => void;
 
   export class SerialConnection {
-    connect(): Promise<void>;
     close(): Promise<void>;
-    on(eventName: string | number, listener: MeshCoreListener): this;
-    once(eventName: string | number, listener: MeshCoreListener): this;
-    off(eventName: string | number, listener: MeshCoreListener): this;
+    on(eventName: string | number, listener: MeshCoreListener): void;
+    once(eventName: string | number, listener: MeshCoreListener): void;
+    off(eventName: string | number, listener: MeshCoreListener): void;
     getChannel(channelIndex: number): Promise<MeshCoreChannelInfo>;
     getSelfInfo(): Promise<MeshCoreSelfInfo>;
     deviceQuery(appTargetVersion: number): Promise<MeshCoreDeviceInfo>;

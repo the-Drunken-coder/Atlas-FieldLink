@@ -26,6 +26,7 @@ export class RunArtifacts {
   readonly paths: ArtifactPaths;
   readonly #events: FileHandle;
   #writeTail: Promise<void> = Promise.resolve();
+  #writeError: Error | undefined;
   #closed = false;
 
   private constructor(paths: ArtifactPaths, events: FileHandle) {
@@ -64,7 +65,12 @@ export class RunArtifacts {
     const write = this.#writeTail.then(() =>
       this.#events.appendFile(line, "utf8"),
     );
-    this.#writeTail = write;
+    this.#writeTail = write.then(
+      () => undefined,
+      (error: unknown) => {
+        this.#writeError ??= asError(error);
+      },
+    );
     return write;
   }
 
@@ -79,6 +85,9 @@ export class RunArtifacts {
       await this.#events.sync();
     } catch (error: unknown) {
       errors.push(asError(error));
+    }
+    if (this.#writeError !== undefined) {
+      errors.push(this.#writeError);
     }
     try {
       await this.#events.close();

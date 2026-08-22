@@ -159,6 +159,9 @@ async function runHardwareCommand(command: HardwareCommand): Promise<number> {
       onAnomaly: (anomaly: unknown) => {
         record("anomaly", anomaly);
       },
+      onError: (message: string) => {
+        record("runner-error", { message });
+      },
     };
     if (command.name === "ping") {
       result = await runRoundTrips({

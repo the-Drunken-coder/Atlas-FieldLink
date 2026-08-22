@@ -12,6 +12,7 @@ const FLOOD_PATH_LENGTH = 0xff;
 const INBOX_POLL_INTERVAL_MS = 500;
 const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
+const DEFAULT_IDLE_TIMEOUT_MS = 60_000;
 const MIN_CHANNEL_DATAGRAM_FIRMWARE_CODE = 12;
 
 export const FIELDLINK_DATA_TYPE = Constants.DataTypes.Dev;
@@ -71,7 +72,6 @@ export type InboxMessage = MeshCoreWaitingMessage;
 
 type CompanionConnection = Pick<
   SerialConnection,
-  | "connect"
   | "close"
   | "getChannel"
   | "getSelfInfo"
@@ -79,6 +79,7 @@ type CompanionConnection = Pick<
   | "sendChannelData"
   | "syncNextMessage"
 > & {
+  connect(): Promise<void>;
   on(
     eventName: string | number,
     listener: (...arguments_: readonly unknown[]) => void,
@@ -109,7 +110,7 @@ class FieldLinkSerialConnection extends SerialConnection {
     });
   }
 
-  override async connect(): Promise<void> {
+  async connect(): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       this.#serialPort.open((error) => {
         if (error) {
@@ -380,17 +381,11 @@ export class MeshCoreRadio implements DatagramRadio {
         { cause: this.#fatalError },
       );
     }
-    try {
-      await withTimeout(
-        Promise.all([this.#commandTail, this.#drainPromise]),
-        this.#commandTimeoutMs,
-        `waiting for ${this.#path} commands to finish`,
-      );
-    } catch (error: unknown) {
-      const idleError = asError(error);
-      this.#makeFatal(idleError);
-      throw idleError;
-    }
+    await withTimeout(
+      Promise.all([this.#commandTail, this.#drainPromise]),
+      DEFAULT_IDLE_TIMEOUT_MS,
+      `waiting for ${this.#path} commands to finish`,
+    );
   }
 
   #requestDrain(): void {
