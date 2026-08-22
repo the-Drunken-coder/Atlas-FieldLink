@@ -13,6 +13,13 @@ export interface ListCommand {
   readonly name: "list";
 }
 
+export interface AdapterCommand {
+  readonly name: "adapter";
+  readonly radio: string;
+  readonly channel: number;
+  readonly allowInboxDrain: true;
+}
+
 export interface HardwareCommand {
   readonly name: "ping" | "bench";
   readonly a: string;
@@ -25,7 +32,7 @@ export interface HardwareCommand {
   readonly output?: string;
 }
 
-export type FieldLinkCommand = ListCommand | HardwareCommand;
+export type FieldLinkCommand = AdapterCommand | ListCommand | HardwareCommand;
 
 export class UsageError extends Error {}
 
@@ -40,7 +47,39 @@ export function parseCommand(arguments_: readonly string[]): FieldLinkCommand {
   if (arguments_[0] === "ping" || arguments_[0] === "bench") {
     return parseHardwareCommand(arguments_[0], arguments_.slice(1));
   }
-  throw new UsageError("Expected 'radios list', 'ping', or 'bench'");
+  if (arguments_[0] === "adapter") {
+    return parseAdapterCommand(arguments_.slice(1));
+  }
+  throw new UsageError("Expected 'radios list', 'adapter', 'ping', or 'bench'");
+}
+
+function parseAdapterCommand(arguments_: readonly string[]): AdapterCommand {
+  const config = {
+    args: [...arguments_],
+    allowPositionals: false,
+    strict: true,
+    options: {
+      radio: { type: "string" },
+      channel: { type: "string" },
+      "allow-inbox-drain": { type: "boolean", default: false },
+    },
+  } as const;
+  const parse = () => parseArgs(config);
+  let parsed: ReturnType<typeof parse>;
+  try {
+    parsed = parse();
+  } catch (error: unknown) {
+    throw usageError(error);
+  }
+  if (!parsed.values["allow-inbox-drain"]) {
+    throw inboxDrainError();
+  }
+  return {
+    name: "adapter",
+    radio: required(parsed.values.radio, "--radio"),
+    channel: parseChannel(parsed.values.channel),
+    allowInboxDrain: true,
+  };
 }
 
 function parseHardwareCommand(
@@ -63,32 +102,22 @@ function parseHardwareCommand(
     },
   } as const;
   const parse = () => parseArgs(config);
-
   let parsed: ReturnType<typeof parse>;
   try {
     parsed = parse();
   } catch (error: unknown) {
-    throw new UsageError(
-      error instanceof Error ? error.message : String(error),
-    );
+    throw usageError(error);
   }
 
   const a = required(parsed.values.a, "--a");
   const b = required(parsed.values.b, "--b");
   if (!parsed.values["allow-inbox-drain"]) {
-    throw new UsageError(
-      "--allow-inbox-drain is required because Companion inbox messages are consumed during a run",
-    );
+    throw inboxDrainError();
   }
   if (a === b) {
     throw new UsageError("--a and --b must name different serial ports");
   }
-  const channel = integer(
-    required(parsed.values.channel, "--channel"),
-    "--channel",
-    0,
-    7,
-  );
+  const channel = parseChannel(parsed.values.channel);
   const count = integer(
     required(parsed.values.count, "--count"),
     "--count",
@@ -127,6 +156,20 @@ function parseHardwareCommand(
       ? {}
       : { output: parsed.values.output }),
   };
+}
+
+function parseChannel(value: string | undefined): number {
+  return integer(required(value, "--channel"), "--channel", 0, 7);
+}
+
+function usageError(error: unknown): UsageError {
+  return new UsageError(error instanceof Error ? error.message : String(error));
+}
+
+function inboxDrainError(): UsageError {
+  return new UsageError(
+    "--allow-inbox-drain is required because Companion inbox messages are consumed while the adapter runs",
+  );
 }
 
 function required(value: string | undefined, option: string): string {

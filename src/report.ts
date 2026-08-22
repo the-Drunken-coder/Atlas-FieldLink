@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import type { HardwareCommand } from "./args.js";
 
 export interface RunManifest {
-  readonly schemaVersion: 2;
+  readonly schemaVersion: 3;
   readonly command: HardwareCommand["name"];
   readonly startedAt: string;
   readonly radios: { readonly a: string; readonly b: string };
@@ -13,6 +13,10 @@ export interface RunManifest {
   readonly datagramBytes: number;
   readonly timeoutMs: number;
   readonly inboxDrainAccepted: true;
+  readonly execution: {
+    readonly adapterProcesses: 2;
+    readonly radiosPerAdapter: 1;
+  };
 }
 
 export interface ArtifactPaths {

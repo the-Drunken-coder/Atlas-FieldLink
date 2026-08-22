@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import { RunArtifacts } from "../src/report.js";
 
 const manifest = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   command: "ping",
   startedAt: "2026-08-21T12:00:00.000Z",
   radios: { a: "/dev/a", b: "/dev/b" },
@@ -15,6 +15,10 @@ const manifest = {
   datagramBytes: 16,
   timeoutMs: 100,
   inboxDrainAccepted: true,
+  execution: {
+    adapterProcesses: 2,
+    radiosPerAdapter: 1,
+  },
 } as const;
 
 describe("run artifacts", () => {

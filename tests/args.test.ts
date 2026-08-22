@@ -7,6 +7,24 @@ describe("CLI arguments", () => {
     expect(parseCommand(["radios", "list"])).toEqual({ name: "list" });
   });
 
+  it("parses one adapter process", () => {
+    expect(
+      parseCommand([
+        "adapter",
+        "--radio",
+        "/dev/radio",
+        "--channel",
+        "2",
+        "--allow-inbox-drain",
+      ]),
+    ).toEqual({
+      name: "adapter",
+      radio: "/dev/radio",
+      channel: 2,
+      allowInboxDrain: true,
+    });
+  });
+
   it("parses the required benchmark command", () => {
     expect(
       parseCommand([

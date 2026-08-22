@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 
+import {
+  AdapterProcessRadio,
+  runAdapterProcess,
+  type StartAdapterProcessOptions,
+} from "./adapter-process.js";
 import { parseCommand, UsageError, type HardwareCommand } from "./args.js";
 import { FIELDLINK_HEADER_BYTES } from "./protocol.js";
 import {
   FIELDLINK_DATA_TYPE,
-  MeshCoreRadio,
   listRadioPorts,
   type ChannelConfiguration,
+  type InboxMessage,
   type RadioIdentity,
   type RadioPort,
 } from "./radio.js";
@@ -23,10 +28,12 @@ import {
 
 const HELP = `Usage:
   npm run fieldlink -- radios list
+  npm run fieldlink -- adapter --radio <port> --channel <0-7> --allow-inbox-drain
   npm run fieldlink -- ping --a <port> --b <port> --channel <0-7> --count <n> --allow-inbox-drain
   npm run fieldlink -- bench --a <port> --b <port> --channel <0-7> --count <n> --payload-size <12-163> --allow-inbox-drain
 
 Options:
+  --radio <port>      Serial radio owned by one adapter process
   --allow-inbox-drain  Required acknowledgement that both Companion inboxes are consumed
   --timeout-ms <ms>   Full send-and-delivery deadline per sample. Default: 30000
   --output <path>     Artifact directory. Default: results/<timestamp>-<command>/
@@ -46,6 +53,9 @@ async function main(arguments_: readonly string[]): Promise<number> {
   }
 
   const command = parseCommand(arguments_);
+  if (command.name === "adapter") {
+    return runAdapterProcess(command);
+  }
   if (command.name === "list") {
     printPorts(await listRadioPorts());
     return 0;
@@ -57,7 +67,7 @@ async function runHardwareCommand(command: HardwareCommand): Promise<number> {
   const startedAt = new Date().toISOString();
   const artifacts = await RunArtifacts.create(
     {
-      schemaVersion: 2,
+      schemaVersion: 3,
       command: command.name,
       startedAt,
       radios: { a: command.a, b: command.b },
@@ -66,6 +76,10 @@ async function runHardwareCommand(command: HardwareCommand): Promise<number> {
       datagramBytes: command.payloadSize,
       timeoutMs: command.timeoutMs,
       inboxDrainAccepted: command.allowInboxDrain,
+      execution: {
+        adapterProcesses: 2,
+        radiosPerAdapter: 1,
+      },
     },
     command.output,
   );
@@ -87,31 +101,16 @@ async function runHardwareCommand(command: HardwareCommand): Promise<number> {
   process.on("SIGINT", onSigint);
   process.on("SIGTERM", onSigterm);
 
-  const radioA = new MeshCoreRadio(command.a, {
-    onInboxMessage: (message) => {
-      record("inbox-message", { radio: "A", message });
-    },
-    onListenerError: (error) => {
-      record("listener-error", { radio: "A", error });
-    },
-  });
-  const radioB = new MeshCoreRadio(command.b, {
-    onInboxMessage: (message) => {
-      record("inbox-message", { radio: "B", message });
-    },
-    onListenerError: (error) => {
-      record("listener-error", { radio: "B", error });
-    },
-  });
-
   process.stderr.write(
     [
       "WARNING: use dedicated test radios only.",
       "FieldLink must drain both shared MeshCore Companion inboxes; every consumed message is preserved in events.jsonl.",
-      `Opening A=${command.a} and B=${command.b}`,
+      `Starting one adapter process for A=${command.a} and one for B=${command.b}`,
     ].join("\n") + "\n",
   );
 
+  let radioA: AdapterProcessRadio | undefined;
+  let radioB: AdapterProcessRadio | undefined;
   let identityA: RadioIdentity | undefined;
   let identityB: RadioIdentity | undefined;
   let channel: ChannelConfiguration | undefined;
@@ -120,22 +119,21 @@ async function runHardwareCommand(command: HardwareCommand): Promise<number> {
   const cleanupErrors: string[] = [];
 
   try {
-    await Promise.all([radioA.open(), radioB.open()]);
-    const [queriedIdentityA, queriedIdentityB, channelA, channelB] =
-      await Promise.all([
-        radioA.getIdentity(),
-        radioB.getIdentity(),
-        radioA.getChannel(command.channel),
-        radioB.getChannel(command.channel),
-      ]);
-    identityA = queriedIdentityA;
-    identityB = queriedIdentityB;
+    [radioA, radioB] = await startAdapterPair(command, record);
+    identityA = radioA.identity;
+    identityB = radioB.identity;
+    const channelA = radioA.channelConfiguration;
+    const channelB = radioB.channelConfiguration;
     verifyDistinctMatchingRadios(identityA, identityB);
     verifyMatchingChannels(channelA, channelB);
     channel = channelA;
     record("radio-identity", {
       a: safeIdentity(identityA),
       b: safeIdentity(identityB),
+    });
+    record("adapter-process", {
+      a: { processId: radioA.processId, radio: command.a },
+      b: { processId: radioB.processId, radio: command.b },
     });
     record("channel", { index: channel.index, name: channel.name });
 
@@ -172,12 +170,19 @@ async function runHardwareCommand(command: HardwareCommand): Promise<number> {
     runError = asError(error);
     record("run-error", runError);
   } finally {
-    const closed = await Promise.allSettled([radioA.close(), radioB.close()]);
+    const adapters = [radioA, radioB].filter(
+      (adapter): adapter is AdapterProcessRadio => adapter !== undefined,
+    );
+    const closed = await Promise.allSettled(
+      adapters.map((adapter) => adapter.close()),
+    );
     for (const [index, closeResult] of closed.entries()) {
       if (closeResult.status === "rejected") {
-        const message = `${index === 0 ? "A" : "B"}: ${asError(closeResult.reason).message}`;
+        const adapter = adapters[index];
+        const label = adapter === radioA ? "A" : "B";
+        const message = `${label}: ${asError(closeResult.reason).message}`;
         cleanupErrors.push(message);
-        record("cleanup-error", { radio: index === 0 ? "A" : "B", message });
+        record("cleanup-error", { radio: label, message });
       }
     }
   }
@@ -197,7 +202,7 @@ async function runHardwareCommand(command: HardwareCommand): Promise<number> {
     result === undefined ||
     resultFailed(result);
   const summary = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     command: command.name,
     startedAt,
     finishedAt: new Date().toISOString(),
@@ -208,6 +213,15 @@ async function runHardwareCommand(command: HardwareCommand): Promise<number> {
     ...(channel === undefined
       ? {}
       : { channel: { index: channel.index, name: channel.name } }),
+    ...(radioA === undefined || radioB === undefined
+      ? {}
+      : {
+          execution: {
+            adapterProcesses: 2,
+            radiosPerAdapter: 1,
+            processIds: { a: radioA.processId, b: radioB.processId },
+          },
+        }),
     protocol: {
       meshCoreDataType: FIELDLINK_DATA_TYPE,
       meshCoreDelivery: "flood",
@@ -250,6 +264,55 @@ async function runHardwareCommand(command: HardwareCommand): Promise<number> {
     return 130;
   }
   return failed ? 1 : 0;
+}
+
+async function startAdapterPair(
+  command: HardwareCommand,
+  record: (type: string, data: unknown) => void,
+): Promise<readonly [AdapterProcessRadio, AdapterProcessRadio]> {
+  const options = (
+    label: "A" | "B",
+    path: string,
+  ): StartAdapterProcessOptions => ({
+    path,
+    channel: command.channel,
+    allowInboxDrain: command.allowInboxDrain,
+    onInboxMessage: (message: InboxMessage) => {
+      record("inbox-message", { radio: label, message });
+    },
+    onListenerError: (error) => {
+      record("listener-error", { radio: label, error });
+    },
+    onStderr: (message) => {
+      record("adapter-stderr", { radio: label, message });
+      process.stderr.write(`[adapter ${label}] ${message}`);
+    },
+  });
+  const [a, b] = await Promise.allSettled([
+    AdapterProcessRadio.start(options("A", command.a)),
+    AdapterProcessRadio.start(options("B", command.b)),
+  ]);
+  if (a.status === "fulfilled" && b.status === "fulfilled") {
+    return [a.value, b.value];
+  }
+  const started = [a, b].flatMap((result) =>
+    result.status === "fulfilled" ? [result.value] : [],
+  );
+  const stopped = await Promise.allSettled(
+    started.map((adapter) => adapter.close()),
+  );
+  const errors = [a, b].flatMap((result) =>
+    result.status === "rejected" ? [asError(result.reason)] : [],
+  );
+  errors.push(
+    ...stopped.flatMap((result) =>
+      result.status === "rejected" ? [asError(result.reason)] : [],
+    ),
+  );
+  throw new AggregateError(
+    errors,
+    `Could not start both adapter processes: ${errors.map((error) => error.message).join("; ")}`,
+  );
 }
 
 function verifyDistinctMatchingRadios(
