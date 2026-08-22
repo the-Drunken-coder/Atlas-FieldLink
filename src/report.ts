@@ -75,7 +75,11 @@ export class RunArtifacts {
   }
 
   async flush(): Promise<void> {
-    await this.#writeTail;
+    let tail: Promise<void>;
+    do {
+      tail = this.#writeTail;
+      await tail;
+    } while (tail !== this.#writeTail);
     if (this.#writeError !== undefined) {
       throw this.#writeError;
     }

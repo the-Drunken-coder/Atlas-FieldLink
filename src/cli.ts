@@ -11,6 +11,7 @@ import {
   type RadioPort,
 } from "./radio.js";
 import { RunArtifacts } from "./report.js";
+import { createRunSignals } from "./run-signals.js";
 import {
   runDirectionalBench,
   runRoundTrips,
@@ -68,30 +69,23 @@ async function runHardwareCommand(command: HardwareCommand): Promise<number> {
     },
     command.output,
   );
-  const abortController = new AbortController();
   let artifactError: Error | undefined;
   const record = (type: string, data: unknown): void => {
     void artifacts.record(type, data).catch((error: unknown) => {
       artifactError ??= asError(error);
     });
   };
-  const interrupt = (signal: NodeJS.Signals): void => {
-    if (!abortController.signal.aborted) {
-      record("interrupted", { signal });
-      abortController.abort(signal);
-      process.stderr.write(
-        `\n${signal}: stopping after the active radio operation\n`,
-      );
-    }
-  };
+  const signals = createRunSignals(record, (message) => {
+    process.stderr.write(message);
+  });
   const onSigint = (): void => {
-    interrupt("SIGINT");
+    signals.handle("SIGINT");
   };
   const onSigterm = (): void => {
-    interrupt("SIGTERM");
+    signals.handle("SIGTERM");
   };
-  process.once("SIGINT", onSigint);
-  process.once("SIGTERM", onSigterm);
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigterm);
 
   const radioA = new MeshCoreRadio(command.a, {
     onInboxMessage: (message) => {
@@ -155,7 +149,7 @@ async function runHardwareCommand(command: HardwareCommand): Promise<number> {
       count: command.count,
       datagramBytes: command.payloadSize,
       timeoutMs: command.timeoutMs,
-      signal: abortController.signal,
+      signal: signals.signal,
       onAnomaly: (anomaly: unknown) => {
         record("anomaly", anomaly);
       },
@@ -193,10 +187,9 @@ async function runHardwareCommand(command: HardwareCommand): Promise<number> {
   } catch (error: unknown) {
     artifactError ??= asError(error);
   }
-  process.removeListener("SIGINT", onSigint);
-  process.removeListener("SIGTERM", onSigterm);
+  signals.beginFinalization();
 
-  const interrupted = abortController.signal.aborted;
+  const interrupted = signals.signal.aborted;
   const failed =
     runError !== undefined ||
     artifactError !== undefined ||
@@ -234,6 +227,9 @@ async function runHardwareCommand(command: HardwareCommand): Promise<number> {
     await artifacts.finish(summary);
   } catch (error: unknown) {
     finishError = asError(error);
+  } finally {
+    process.removeListener("SIGINT", onSigint);
+    process.removeListener("SIGTERM", onSigterm);
   }
 
   if (finishError !== undefined) {
