@@ -58,4 +58,4 @@ npm run check
 git diff --check
 ```
 
-Automated tests do not replace a hardware run, but a hardware run is not required for documentation-only or isolated pure-logic changes. For documentation-only changes, check affected links and paths, run `npm run format:check`, and run `git diff --check`.
+Automated tests do not replace a hardware run, but a hardware run is not required for documentation-only or isolated pure-logic changes. For documentation-only changes, check affected links and paths, run `npx prettier --check AGENTS.md README.md docs`, and run `git diff --check`.
