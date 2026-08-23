@@ -82,6 +82,10 @@ The CLI uses `@liamcottle/meshcore.js` for USB framing, Companion Protocol comma
 
 The 12-byte FieldLink test header contains a magic value, version, operation kind, random run ID, and sequence number. The remaining bytes follow a deterministic pattern so the receiver can detect truncation or corruption.
 
+## Documentation
+
+Start at [`docs/README.md`](docs/README.md) for focused project documentation, durable design decisions, and active problem notes. Repository-wide agent guidance lives in [`AGENTS.md`](AGENTS.md).
+
 ## Development
 
 ```bash
