@@ -2,7 +2,11 @@ import { PassThrough } from "node:stream";
 import { createInterface } from "node:readline";
 import { describe, expect, it } from "vitest";
 
-import { AdapterProcessRadio, serveAdapter } from "../src/adapter-process.js";
+import {
+  AdapterProcessRadio,
+  adapterNodeArguments,
+  serveAdapter,
+} from "../src/adapter-process.js";
 import {
   FIELDLINK_DATA_TYPE,
   type ChannelDatagram,
@@ -185,8 +189,56 @@ describe("single-radio adapter process", () => {
       },
     });
 
-    await expect(adapter.waitUntilIdle()).rejects.toThrow("closed its output");
-    await expect(adapter.close()).rejects.toThrow("closed its output");
+    const expected = /closed its output|exited with code 7/;
+    await expect(adapter.waitUntilIdle()).rejects.toThrow(expected);
+    await expect(adapter.close()).rejects.toThrow(expected);
+  });
+
+  it("drains a close response written immediately before child exit", async () => {
+    const adapter = await AdapterProcessRadio.start({
+      path: "/dev/fixture",
+      channel: 1,
+      allowInboxDrain: true,
+      program: {
+        executable: process.execPath,
+        arguments: ["-e", ADAPTER_FIXTURE, "exit-on-close"],
+      },
+    });
+
+    await expect(adapter.close()).resolves.toBeUndefined();
+  });
+
+  it("makes a request timeout the adapter's persistent failure", async () => {
+    const adapter = await AdapterProcessRadio.start({
+      path: "/dev/fixture",
+      channel: 1,
+      allowInboxDrain: true,
+      requestTimeoutMs: 20,
+      program: {
+        executable: process.execPath,
+        arguments: ["-e", ADAPTER_FIXTURE, "ignore-idle"],
+      },
+    });
+
+    const expected = "did not answer idle after 20 ms";
+    await expect(adapter.waitUntilIdle()).rejects.toThrow(expected);
+    await expect(adapter.close()).rejects.toThrow(expected);
+  });
+
+  it("keeps loader arguments but removes controller execution modes", () => {
+    expect(
+      adapterNodeArguments([
+        "--inspect-brk",
+        "--inspect-port=9230",
+        "--watch",
+        "--watch-path",
+        "src",
+        "--watch-preserve-output",
+        "--import",
+        "tsx",
+        "--enable-source-maps",
+      ]),
+    ).toEqual(["--import", "tsx", "--enable-source-maps"]);
   });
 
   it("includes child stderr when adapter startup fails", async () => {
@@ -336,6 +388,9 @@ lines.on("line", (line) => {
   if (request.type === "idle" && process.argv.includes("exit-on-idle")) {
     process.exit(7);
   }
+  if (request.type === "idle" && process.argv.includes("ignore-idle")) {
+    return;
+  }
   if (request.type === "send") {
     write({
       type: "datagram",
@@ -352,6 +407,9 @@ lines.on("line", (line) => {
     if (request.type === "close") {
       lines.close();
       process.stdin.destroy();
+      if (process.argv.includes("exit-on-close")) {
+        process.exit(0);
+      }
     }
   });
 });

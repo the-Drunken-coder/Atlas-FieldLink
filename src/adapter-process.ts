@@ -15,10 +15,15 @@ import {
   type RadioIdentity,
 } from "./radio.js";
 
-const START_TIMEOUT_MS = 30_000;
 const REQUEST_TIMEOUT_MS = 75_000;
 const EXIT_TIMEOUT_MS = 5_000;
 const BYTES_MARKER = "$fieldlinkBytes";
+const CONTROLLER_OPTIONS_WITH_VALUES = new Set([
+  "--inspect-port",
+  "--inspect-publish-uid",
+  "--watch-kill-signal",
+  "--watch-path",
+]);
 
 interface ManagedRadio extends DatagramRadio {
   open(): Promise<void>;
@@ -73,6 +78,8 @@ export interface StartAdapterProcessOptions {
   readonly onInboxMessage?: (message: InboxMessage) => void | Promise<void>;
   readonly onListenerError?: (error: Error) => void | Promise<void>;
   readonly onStderr?: (message: string) => void;
+  readonly onStderrEnd?: () => void;
+  readonly requestTimeoutMs?: number;
 }
 
 export interface ServeAdapterOptions {
@@ -217,6 +224,7 @@ export class AdapterProcessRadio implements DatagramRadio {
   readonly #writer: WireWriter;
   readonly #onInboxMessage: StartAdapterProcessOptions["onInboxMessage"];
   readonly #onListenerError: StartAdapterProcessOptions["onListenerError"];
+  readonly #requestTimeoutMs: number;
   #ready: Extract<AdapterMessage, { readonly type: "ready" }> | undefined;
   #resolveReady: () => void = () => undefined;
   #rejectReady: (error: Error) => void = () => undefined;
@@ -226,6 +234,7 @@ export class AdapterProcessRadio implements DatagramRadio {
   #closed = false;
   #failure: Error | undefined;
   #closePromise: Promise<void> | undefined;
+  #exit: ChildExit | undefined;
 
   private constructor(
     child: ChildProcessWithoutNullStreams,
@@ -235,6 +244,7 @@ export class AdapterProcessRadio implements DatagramRadio {
     this.#writer = new WireWriter(child.stdin);
     this.#onInboxMessage = options.onInboxMessage;
     this.#onListenerError = options.onListenerError;
+    this.#requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
     this.path = options.path;
     this.channel = options.channel;
     this.#readyPromise = new Promise((resolve, reject) => {
@@ -270,7 +280,11 @@ export class AdapterProcessRadio implements DatagramRadio {
         String(options.channel),
         "--allow-inbox-drain",
       ],
-      { stdio: "pipe" },
+      {
+        stdio: "pipe",
+        // The controller owns foreground signals and closes adapters over NDJSON.
+        detached: process.platform !== "win32",
+      },
     );
     let stderr = "";
     child.stderr.setEncoding("utf8");
@@ -278,15 +292,15 @@ export class AdapterProcessRadio implements DatagramRadio {
       stderr = `${stderr}${chunk}`.slice(-8_192);
       options.onStderr?.(chunk);
     });
+    child.stderr.once("end", () => {
+      options.onStderrEnd?.();
+    });
 
     const adapter = new AdapterProcessRadio(child, options);
     adapter.#readMessages();
     try {
-      await withTimeout(
-        adapter.#readyPromise,
-        START_TIMEOUT_MS,
-        `Adapter for ${options.path} did not become ready after ${START_TIMEOUT_MS} ms`,
-      );
+      // Radio operations own their deadlines. Inbox draining has no fixed duration.
+      await adapter.#readyPromise;
       return adapter;
     } catch (error: unknown) {
       child.stdin.end();
@@ -366,13 +380,12 @@ export class AdapterProcessRadio implements DatagramRadio {
     const message: AdapterRequest = { ...request, id };
     return new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.#pending.delete(id);
-        reject(
+        this.#fail(
           new Error(
-            `Adapter for ${this.path} did not answer ${request.type} after ${REQUEST_TIMEOUT_MS} ms`,
+            `Adapter for ${this.path} did not answer ${request.type} after ${this.#requestTimeoutMs} ms`,
           ),
         );
-      }, REQUEST_TIMEOUT_MS);
+      }, this.#requestTimeoutMs);
       this.#pending.set(id, {
         resolve: () => {
           clearTimeout(timer);
@@ -384,9 +397,7 @@ export class AdapterProcessRadio implements DatagramRadio {
         },
       });
       void this.#writer.write(message).catch((error: unknown) => {
-        this.#pending.delete(id);
-        clearTimeout(timer);
-        reject(asError(error));
+        this.#fail(asError(error));
       });
     });
   }
@@ -404,12 +415,19 @@ export class AdapterProcessRadio implements DatagramRadio {
           }
           this.#handleMessage(parseAdapterMessage(line));
         }
-        if ((!this.#closing && !this.#closed) || this.#pending.size > 0) {
-          this.#fail(new Error(`Adapter for ${this.path} closed its output`));
+        if (!this.#closing || this.#pending.size > 0) {
+          const failure =
+            this.#exit === undefined
+              ? new Error(`Adapter for ${this.path} closed its output`)
+              : new Error(
+                  `Adapter for ${this.path} exited ${describeExit(this.#exit.code, this.#exit.signal)}`,
+                );
+          this.#fail(failure);
         }
       } catch (error: unknown) {
         this.#fail(asError(error));
       } finally {
+        this.#closed = true;
         lines.close();
       }
     })();
@@ -417,14 +435,7 @@ export class AdapterProcessRadio implements DatagramRadio {
       this.#fail(error);
     });
     this.#child.once("exit", (code, signal) => {
-      this.#closed = true;
-      if (!this.#closing || this.#pending.size > 0) {
-        this.#fail(
-          new Error(
-            `Adapter for ${this.path} exited ${describeExit(code, signal)}`,
-          ),
-        );
-      }
+      this.#exit = { code, signal };
     });
   }
 
@@ -529,6 +540,11 @@ interface PendingRequest {
   readonly reject: (error: Error) => void;
 }
 
+interface ChildExit {
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+}
+
 class WireWriter {
   readonly #output: Writable;
   #tail: Promise<void> = Promise.resolve();
@@ -581,10 +597,34 @@ function currentAdapterProgram(): AdapterProgram {
   return {
     executable: process.execPath,
     arguments: [
-      ...process.execArgv,
+      ...adapterNodeArguments(process.execArgv),
       fileURLToPath(new URL(`./cli.${extension}`, import.meta.url)),
     ],
   };
+}
+
+/** Keeps source loaders and preloads while removing controller-only Node modes. */
+export function adapterNodeArguments(arguments_: readonly string[]): string[] {
+  const filtered: string[] = [];
+  for (let index = 0; index < arguments_.length; index += 1) {
+    const argument = arguments_[index];
+    if (argument === undefined) {
+      continue;
+    }
+    if (CONTROLLER_OPTIONS_WITH_VALUES.has(argument)) {
+      index += 1;
+      continue;
+    }
+    if (
+      argument.startsWith("--inspect") ||
+      argument === "--watch" ||
+      argument.startsWith("--watch-")
+    ) {
+      continue;
+    }
+    filtered.push(argument);
+  }
+  return filtered;
 }
 
 async function terminateChild(
@@ -620,28 +660,6 @@ function waitForExit(
       resolve(true);
     };
     child.once("exit", onExit);
-  });
-}
-
-function withTimeout<Result>(
-  promise: Promise<Result>,
-  timeoutMs: number,
-  message: string,
-): Promise<Result> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(message));
-    }, timeoutMs);
-    void promise.then(
-      (result) => {
-        clearTimeout(timer);
-        resolve(result);
-      },
-      (error: unknown) => {
-        clearTimeout(timer);
-        reject(asError(error));
-      },
-    );
   });
 }
 

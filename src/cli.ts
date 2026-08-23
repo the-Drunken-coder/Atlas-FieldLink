@@ -273,21 +273,27 @@ async function startAdapterPair(
   const options = (
     label: "A" | "B",
     path: string,
-  ): StartAdapterProcessOptions => ({
-    path,
-    channel: command.channel,
-    allowInboxDrain: command.allowInboxDrain,
-    onInboxMessage: (message: InboxMessage) => {
-      record("inbox-message", { radio: label, message });
-    },
-    onListenerError: (error) => {
-      record("listener-error", { radio: label, error });
-    },
-    onStderr: (message) => {
-      record("adapter-stderr", { radio: label, message });
-      process.stderr.write(`[adapter ${label}] ${message}`);
-    },
-  });
+  ): StartAdapterProcessOptions => {
+    const stderr = createAdapterStderrWriter(label);
+    return {
+      path,
+      channel: command.channel,
+      allowInboxDrain: command.allowInboxDrain,
+      onInboxMessage: (message: InboxMessage) => {
+        record("inbox-message", { radio: label, message });
+      },
+      onListenerError: (error) => {
+        record("listener-error", { radio: label, error });
+      },
+      onStderr: (message) => {
+        record("adapter-stderr", { radio: label, message });
+        stderr.write(message);
+      },
+      onStderrEnd: () => {
+        stderr.end();
+      },
+    };
+  };
   const [a, b] = await Promise.allSettled([
     AdapterProcessRadio.start(options("A", command.a)),
     AdapterProcessRadio.start(options("B", command.b)),
@@ -313,6 +319,29 @@ async function startAdapterPair(
     errors,
     `Could not start both adapter processes: ${errors.map((error) => error.message).join("; ")}`,
   );
+}
+
+function createAdapterStderrWriter(label: "A" | "B") {
+  let pending = "";
+  return {
+    write(message: string): void {
+      pending += message;
+      let newline = pending.indexOf("\n");
+      while (newline !== -1) {
+        process.stderr.write(
+          `[adapter ${label}] ${pending.slice(0, newline + 1)}`,
+        );
+        pending = pending.slice(newline + 1);
+        newline = pending.indexOf("\n");
+      }
+    },
+    end(): void {
+      if (pending.length > 0) {
+        process.stderr.write(`[adapter ${label}] ${pending}\n`);
+        pending = "";
+      }
+    },
+  };
 }
 
 function verifyDistinctMatchingRadios(
