@@ -254,6 +254,7 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
     finishedAt: new Date().toISOString(),
     status: interrupted ? "interrupted" : failed ? "failed" : "passed",
     interrupted,
+    ...(interrupted || failed ? { partial: true } : {}),
     ...(interruptedBy === undefined ? {} : { interruptedBy }),
     payloadSize: command.payloadSize,
     retryStrategy: command.retryStrategy,
@@ -300,7 +301,12 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
     process.stderr.write(`Partial artifacts: ${artifacts.paths.directory}\n`);
     return interrupted ? 130 : 1;
   }
-  if (!failed && durationMs !== undefined && sendResult !== undefined) {
+  if (
+    !interrupted &&
+    !failed &&
+    durationMs !== undefined &&
+    sendResult !== undefined
+  ) {
     process.stdout.write(
       [
         `Test passed: ${command.message}, ${command.payloadSize} payload bytes`,

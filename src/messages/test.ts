@@ -1,3 +1,5 @@
+import { randomInt } from "node:crypto";
+
 import {
   MessageValidationError,
   type MessageDefinition,
@@ -5,6 +7,7 @@ import {
 
 const HEADER_BYTES = 5;
 const MAX_ENCODED_BYTES = 1024 * 1024;
+let nextExerciseCorrelationId = randomInt(0x1_0000_0000);
 
 /**
  * Test proves end-to-end FieldLink delivery without introducing Atlas domain
@@ -16,9 +19,10 @@ const MAX_ENCODED_BYTES = 1024 * 1024;
  * exact copy of the payload. Responses are delivered to listeners and are
  * never echoed, which prevents response loops.
  *
- * The hardware exercise sends a deterministic request. It completes when the
- * source receives the matching response. Payload presets cover a normal
- * single frame, the largest single frame, and a fragmented transfer.
+ * The hardware exercise sends a request with a process-unique correlation ID
+ * and deterministic payload. It completes when the source receives the
+ * matching response. Payload presets cover a normal single frame, the largest
+ * single frame, and a fragmented transfer.
  *
  * Examples:
  * - `{ type: "test", kind: "request", correlationId: 1, payload: new Uint8Array() }`
@@ -105,7 +109,7 @@ export const testMessage = {
       return {
         type: "test",
         kind: "request",
-        correlationId: 0x464c_0001,
+        correlationId: takeExerciseCorrelationId(),
         payload: Uint8Array.from(
           { length: payloadBytes },
           (_value, index) => (index * 31 + 17) & 0xff,
@@ -134,6 +138,12 @@ export const testMessage = {
     });
   },
 } satisfies MessageDefinition<TestMessage>;
+
+function takeExerciseCorrelationId(): number {
+  const correlationId = nextExerciseCorrelationId;
+  nextExerciseCorrelationId = (nextExerciseCorrelationId + 1) >>> 0;
+  return correlationId;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;

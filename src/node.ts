@@ -761,7 +761,6 @@ export class FieldLinkNode {
       });
       return;
     }
-    transfer.lastActivity = this.#now();
     if (
       frame.windowStart >= transfer.fragmentCount ||
       frame.windowStart + frame.windowCount > transfer.fragmentCount
@@ -771,6 +770,7 @@ export class FieldLinkNode {
       });
       return;
     }
+    transfer.lastActivity = this.#now();
     const bitmap = transfer.completed
       ? (1 << frame.windowCount) - 1
       : transfer.receiver.receipt(

@@ -208,6 +208,22 @@ describe("adapter process proxy", () => {
     ).rejects.toThrow();
   });
 
+  it("rejects and reaps startup when its signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("startup cancelled"));
+
+    await expect(
+      AdapterProcessNode.start({
+        path: "test",
+        channel: 1,
+        allowInboxDrain: true,
+        signal: controller.signal,
+        exitTimeoutMs: 10,
+        program: nodeScript(`${writeReady()} setInterval(()=>{},1000);`),
+      }),
+    ).rejects.toThrow("startup cancelled");
+  });
+
   it("waits for startup evidence callbacks before completing close", async () => {
     let releaseInbox = (): void => undefined;
     const inboxReleased = new Promise<void>((resolve) => {

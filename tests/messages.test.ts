@@ -116,4 +116,12 @@ describe("Test message", () => {
       }),
     ).toBe(false);
   });
+
+  it("uses a new correlation ID for every exercise", () => {
+    const first = testMessage.exercise.create(64);
+    const second = testMessage.exercise.create(64);
+
+    expect(second.correlationId).not.toBe(first.correlationId);
+    expect(second.payload).toEqual(first.payload);
+  });
 });

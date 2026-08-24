@@ -464,6 +464,9 @@ export class AdapterProcessNode {
     options.signal?.addEventListener("abort", abort, { once: true });
     let ready: ({ readonly type: "ready" } & AdapterReady) | undefined;
     try {
+      if (options.signal?.aborted === true) {
+        throw abortError(options.signal);
+      }
       while (ready === undefined) {
         const first = await Promise.race([iterator.next(), spawnError]);
         if (first.done) {
