@@ -491,7 +491,7 @@ describe("MeshCore transport", () => {
     await expect(transport.close()).rejects.toThrow("Could not cleanly close");
   });
 
-  it("surfaces inbox listener failures without stopping the drain", async () => {
+  it("stops draining when inbox evidence cannot be preserved", async () => {
     const connection = new FakeConnection();
     connection.messages.push(
       {
@@ -514,20 +514,16 @@ describe("MeshCore transport", () => {
       },
       null,
     );
-    const errors: Error[] = [];
     const onInbox = vi.fn().mockRejectedValueOnce(new Error("disk full"));
     const transport = new MeshCoreTransport("/dev/cu.test", {
       channel: 2,
       connection,
       onInboxMessage: onInbox,
-      onListenerError: (error) => {
-        errors.push(error);
-      },
     });
     await transport.open();
-    await transport.startInbox();
-    expect(onInbox).toHaveBeenCalledTimes(2);
-    expect(errors[0]?.message).toBe("disk full");
+    await expect(transport.startInbox()).rejects.toThrow("disk full");
+    expect(onInbox).toHaveBeenCalledTimes(1);
+    expect(connection.messages).toHaveLength(2);
     await transport.close();
   });
 });

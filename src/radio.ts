@@ -511,14 +511,7 @@ export class MeshCoreTransport implements FieldLinkTransport {
   }
 
   async #notifyInboxMessage(message: InboxMessage): Promise<void> {
-    if (this.#onInboxMessage === undefined) {
-      return;
-    }
-    try {
-      await this.#onInboxMessage(message);
-    } catch (error: unknown) {
-      await this.#notifyListenerError(asError(error));
-    }
+    await this.#onInboxMessage?.(message);
   }
 
   async #notifyListenerError(error: Error): Promise<void> {
