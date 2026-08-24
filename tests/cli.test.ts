@@ -69,6 +69,75 @@ describe("CLI message catalog", () => {
 });
 
 describe("CLI message exercise", () => {
+  it("waits for parent inbox evidence before acknowledging the adapter", async () => {
+    let releaseInboxEvidence = (): void => undefined;
+    const inboxEvidence = new Promise<void>((resolve) => {
+      releaseInboxEvidence = resolve;
+    });
+    const artifacts = {
+      paths: {
+        directory: "test-artifacts",
+        manifest: "test-artifacts/manifest.json",
+        events: "test-artifacts/events.jsonl",
+        summary: "test-artifacts/summary.json",
+      },
+      record: (type: string) =>
+        type === "inbox-message" ? inboxEvidence : Promise.resolve(),
+      flush: () => Promise.resolve(),
+      finish: () => Promise.resolve(),
+    } as unknown as TestArtifacts;
+    const create = vi
+      .spyOn(TestArtifacts, "create")
+      .mockResolvedValue(artifacts);
+    let acknowledged = false;
+    let acknowledgedBeforePersistence = false;
+    const start = vi.spyOn(AdapterProcessNode, "start");
+    start.mockImplementationOnce(async (options) => {
+      const acknowledgement = Promise.resolve(
+        options.onInboxMessage?.({
+          channelMessage: {
+            channelIdx: 1,
+            pathLen: 1,
+            txtType: 0,
+            senderTimestamp: 1,
+            text: "preserve me",
+          },
+        }),
+      );
+      void acknowledgement.then(() => {
+        acknowledged = true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      acknowledgedBeforePersistence = acknowledged;
+      releaseInboxEvidence();
+      await acknowledgement;
+      throw new Error("adapter A stopped after evidence test");
+    });
+    start.mockRejectedValueOnce(new Error("adapter B stopped"));
+    try {
+      await expect(
+        main([
+          "test",
+          "--a",
+          "/dev/cu.a",
+          "--b",
+          "/dev/cu.b",
+          "--channel",
+          "1",
+          "--timeout-ms",
+          "1000",
+          "--allow-inbox-drain",
+        ]),
+      ).resolves.toBe(1);
+      expect(acknowledgedBeforePersistence).toBe(false);
+      expect(acknowledged).toBe(true);
+    } finally {
+      releaseInboxEvidence();
+      start.mockRestore();
+      create.mockRestore();
+    }
+  });
+
   it("cancels sibling startup when one adapter fails", async () => {
     const artifacts = {
       paths: {

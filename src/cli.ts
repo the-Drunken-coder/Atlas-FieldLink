@@ -83,22 +83,31 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
   const controller = new AbortController();
   let artifactSink: TestArtifacts | undefined = undefined;
   let artifactError: Error | undefined;
-  const record = (type: string, data: unknown): void => {
+  const preserveEvidence = async (
+    type: string,
+    data: unknown,
+  ): Promise<void> => {
     const sink = artifactSink;
     if (sink === undefined) {
       return;
     }
-    void sink.record(type, data).catch((error: unknown) => {
+    try {
+      await sink.record(type, data);
+    } catch (error: unknown) {
       const failure = asError(error);
       artifactError ??= failure;
+      const persistenceError = new Error(
+        `Could not preserve test evidence: ${failure.message}`,
+        { cause: failure },
+      );
       if (!controller.signal.aborted) {
-        controller.abort(
-          new Error(`Could not preserve test evidence: ${failure.message}`, {
-            cause: failure,
-          }),
-        );
+        controller.abort(persistenceError);
       }
-    });
+      throw persistenceError;
+    }
+  };
+  const record = (type: string, data: unknown): void => {
+    void preserveEvidence(type, data).catch(() => undefined);
   };
   let interruptedBy: "SIGINT" | "SIGTERM" | undefined;
   let interruptionRecorded = false;
@@ -189,6 +198,7 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
       selectedChannel,
       controller.signal,
       record,
+      preserveEvidence,
     );
     verifyPreflight(a, b);
     await Promise.all([
@@ -360,6 +370,7 @@ async function startAdapterPair(
   channel: number,
   signal: AbortSignal,
   record: (type: string, data: unknown) => void,
+  preserveEvidence: (type: string, data: unknown) => Promise<void>,
 ): Promise<readonly [AdapterProcessNode, AdapterProcessNode]> {
   const startupController = new AbortController();
   const startupSignal = AbortSignal.any([signal, startupController.signal]);
@@ -376,9 +387,8 @@ async function startAdapterPair(
       allowInboxDrain: true,
       signal: startupSignal,
       requestTimeoutMs: command.timeoutMs + ADAPTER_REQUEST_TIMEOUT_MARGIN_MS,
-      onInboxMessage: (message) => {
-        record("inbox-message", { radio: label, message });
-      },
+      onInboxMessage: (message) =>
+        preserveEvidence("inbox-message", { radio: label, message }),
       onListenerError: (error) => {
         record("listener-error", { radio: label, message: error.message });
       },
