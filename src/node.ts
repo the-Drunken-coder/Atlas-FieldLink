@@ -156,6 +156,7 @@ export class FieldLinkNode {
   #nextTransmissionId = randomUint16();
   #pendingSends = 0;
   #closed = false;
+  #closePromise: Promise<void> | undefined;
 
   constructor(options: FieldLinkNodeOptions) {
     this.nodeId = parseNodeId(options.nodeId);
@@ -311,25 +312,27 @@ export class FieldLinkNode {
     }
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) {
-      return;
-    }
+  close(): Promise<void> {
+    this.#closePromise ??= this.#close();
+    return this.#closePromise;
+  }
+
+  async #close(): Promise<void> {
     this.#closed = true;
     clearInterval(this.#cleanupTimer);
     this.#unsubscribeTransport();
-    await Promise.allSettled(this.#activeReceives);
-    for (const signals of this.#outbound.values()) {
-      signals.reject(new Error("FieldLink node closed"));
-    }
-    this.#outbound.clear();
-    this.#inbound.clear();
     const errors: Error[] = [];
     try {
       await this.#scheduler.close();
     } catch (error: unknown) {
       errors.push(asError(error));
     }
+    await Promise.allSettled(this.#activeReceives);
+    for (const signals of this.#outbound.values()) {
+      signals.reject(new Error("FieldLink node closed"));
+    }
+    this.#outbound.clear();
+    this.#inbound.clear();
     try {
       await this.#transport.close();
     } catch (error: unknown) {
@@ -650,12 +653,9 @@ export class FieldLinkNode {
       );
       return;
     }
-    transfer.lastActivity = this.#now();
     if (transfer.completed) {
+      transfer.lastActivity = this.#now();
       return;
-    }
-    if (snrDb !== undefined) {
-      transfer.snrDb = snrDb;
     }
     if (frame.fragmentIndex >= transfer.fragmentCount) {
       this.#protocolError(
@@ -677,6 +677,10 @@ export class FieldLinkNode {
         { logicalId: key },
       );
       return;
+    }
+    transfer.lastActivity = this.#now();
+    if (snrDb !== undefined) {
+      transfer.snrDb = snrDb;
     }
     if (transfer.received[frame.fragmentIndex] === 0) {
       transfer.bytes.set(frame.body, offset);

@@ -371,6 +371,11 @@ interface PendingRequest {
   readonly cleanup: () => void;
 }
 
+interface AdapterExit {
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+}
+
 /** Parent-side FieldLinkNode proxy for a radio-owning adapter process. */
 export class AdapterProcessNode {
   readonly processId: number;
@@ -395,14 +400,14 @@ export class AdapterProcessNode {
   #activation: Promise<void> | undefined;
   #activated = false;
   #closed = false;
-  #exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  #exit: Promise<AdapterExit>;
   #readerDone: Promise<void> = Promise.resolve();
 
   private constructor(
     child: ChildProcessWithoutNullStreams,
     ready: AdapterReady,
     options: StartAdapterProcessOptions,
-    exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>,
+    exit: Promise<AdapterExit>,
   ) {
     this.#child = child;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
@@ -433,11 +438,13 @@ export class AdapterProcessNode {
       options.onStderrEnd?.();
     });
 
-    const exit = new Promise<{
-      code: number | null;
-      signal: NodeJS.Signals | null;
-    }>((resolve) => {
+    const exit = new Promise<AdapterExit>((resolve) => {
       child.once("exit", (code, signal) => {
+        resolve({ code, signal });
+      });
+    });
+    const closed = new Promise<AdapterExit>((resolve) => {
+      child.once("close", (code, signal) => {
         resolve({ code, signal });
       });
     });
@@ -483,8 +490,20 @@ export class AdapterProcessNode {
       }
     } catch (error: unknown) {
       lines.close();
-      child.kill("SIGTERM");
-      throw error;
+      const startError = asError(error);
+      try {
+        await terminateAndReapAdapter(
+          child,
+          closed,
+          options.exitTimeoutMs ?? EXIT_TIMEOUT_MS,
+        );
+      } catch (cleanupError: unknown) {
+        throw new AggregateError(
+          [startError, asError(cleanupError)],
+          "Could not start and clean up adapter process",
+        );
+      }
+      throw startError;
     } finally {
       options.signal?.removeEventListener("abort", abort);
     }
@@ -576,8 +595,7 @@ export class AdapterProcessNode {
     }
     this.#child.stdin.end();
     const reaped = Promise.all([this.#exit, this.#readerDone]);
-    let exitResult:
-      { code: number | null; signal: NodeJS.Signals | null } | undefined;
+    let exitResult: AdapterExit | undefined;
     try {
       [exitResult] = await withTimeout(
         reaped,
@@ -586,24 +604,14 @@ export class AdapterProcessNode {
       );
     } catch (error: unknown) {
       closeErrors.push(asError(error));
-      this.#child.kill("SIGTERM");
       try {
-        [exitResult] = await withTimeout(
+        [exitResult] = await terminateAndReapAdapter(
+          this.#child,
           reaped,
           this.#exitTimeoutMs,
-          "adapter process termination",
         );
-      } catch {
-        this.#child.kill("SIGKILL");
-        try {
-          [exitResult] = await withTimeout(
-            reaped,
-            this.#exitTimeoutMs,
-            "adapter process kill",
-          );
-        } catch (killError: unknown) {
-          closeErrors.push(asError(killError));
-        }
+      } catch (cleanupError: unknown) {
+        closeErrors.push(asError(cleanupError));
       }
     }
     if (
@@ -1114,6 +1122,27 @@ function withTimeout<Result>(
       },
     );
   });
+}
+
+async function terminateAndReapAdapter<Result>(
+  child: ChildProcessWithoutNullStreams,
+  reaped: Promise<Result>,
+  timeoutMs: number,
+): Promise<Result> {
+  child.kill("SIGTERM");
+  try {
+    return await withTimeout(reaped, timeoutMs, "adapter process termination");
+  } catch (terminationError: unknown) {
+    child.kill("SIGKILL");
+    try {
+      return await withTimeout(reaped, timeoutMs, "adapter process kill");
+    } catch (killError: unknown) {
+      throw new AggregateError(
+        [asError(terminationError), asError(killError)],
+        "Could not reap adapter process",
+      );
+    }
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

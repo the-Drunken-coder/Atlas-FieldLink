@@ -196,6 +196,18 @@ describe("adapter process proxy", () => {
     await adapter.close();
   });
 
+  it("reaps an adapter that fails before readiness", async () => {
+    await expect(
+      AdapterProcessNode.start({
+        path: "test",
+        channel: 1,
+        allowInboxDrain: true,
+        exitTimeoutMs: 10,
+        program: nodeScript(malformedStartupChildScript()),
+      }),
+    ).rejects.toThrow();
+  });
+
   it("waits for startup evidence callbacks before completing close", async () => {
     let releaseInbox = (): void => undefined;
     const inboxReleased = new Promise<void>((resolve) => {
@@ -528,4 +540,10 @@ process.stdin.resume();`;
 function nonzeroCloseChildScript(): string {
   return `${writeReady()}
 ${activateThen('if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(7));}')}`;
+}
+
+function malformedStartupChildScript(): string {
+  return `process.on("SIGTERM",()=>{});
+setInterval(()=>{},1000);
+process.stdout.write("{malformed}\\n");`;
 }
