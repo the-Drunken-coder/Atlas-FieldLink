@@ -6,7 +6,11 @@ import {
   messageRegistry,
   type MessageName,
 } from "./messages/index.js";
-import type { RetryStrategyName } from "./retry-strategies/index.js";
+import {
+  retryStrategies,
+  retryStrategyByName,
+  type RetryStrategyName,
+} from "./retry-strategies/index.js";
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -120,8 +124,11 @@ function parseTestCommand(arguments_: readonly string[]): TestCommand {
     throw inboxDrainError();
   }
   const retryStrategy = required(parsed["retry-strategy"], "--retry-strategy");
-  if (retryStrategy !== "selective-window") {
-    throw new UsageError("--retry-strategy must be 'selective-window'");
+  const strategy = retryStrategyByName(retryStrategy);
+  if (strategy === undefined) {
+    throw new UsageError(
+      `--retry-strategy must be one of: ${retryStrategies.map((item) => item.name).join(", ")}`,
+    );
   }
   return {
     name: "test",
@@ -138,7 +145,7 @@ function parseTestCommand(arguments_: readonly string[]): TestCommand {
         definition.exercise.maximumPayloadBytes,
       ),
     ),
-    retryStrategy,
+    retryStrategy: strategy.name,
     timeoutMs: integer(
       required(parsed["timeout-ms"], "--timeout-ms"),
       "--timeout-ms",

@@ -29,28 +29,34 @@ npm ci
 ## FieldLinkNode
 
 ```ts
-import { FieldLinkNode } from "atlas-fieldlink";
+import { FieldLinkNode, type FieldLinkTransport } from "atlas-fieldlink";
 
-const unsubscribe = node.onMessage((received) => {
-  console.log(received.source, received.message);
-});
+async function sendTest(nodeId: string, transport: FieldLinkTransport) {
+  const node = new FieldLinkNode({ nodeId, transport });
 
-const result = await node.send(
-  {
-    type: "test",
-    kind: "request",
-    correlationId: 1,
-    payload: Uint8Array.of(1, 2, 3),
-  },
-  {
-    destination: "0123456789abcdef",
-    priority: "normal",
-    retryStrategy: "selective-window",
-  },
-);
+  const unsubscribe = node.onMessage((received) => {
+    console.log(received.source, received.message);
+  });
 
-unsubscribe();
-await node.close();
+  try {
+    return await node.send(
+      {
+        type: "test",
+        kind: "request",
+        correlationId: 1,
+        payload: Uint8Array.of(1, 2, 3),
+      },
+      {
+        destination: "0123456789abcdef",
+        priority: "normal",
+        retryStrategy: "selective-window",
+      },
+    );
+  } finally {
+    unsubscribe();
+    await node.close();
+  }
+}
 ```
 
 The module exposes this interface:

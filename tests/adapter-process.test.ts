@@ -10,7 +10,7 @@ import {
 import { encodeFrame, FrameKind } from "../src/frame.js";
 import { testMessage } from "../src/messages/test.js";
 import { FieldLinkNode, parseNodeId } from "../src/node.js";
-import { MemoryTransport } from "./helpers.js";
+import { eventually, MemoryTransport } from "./helpers.js";
 
 const nodeA = parseNodeId("aaaaaaaaaaaaaaaa");
 const nodeB = parseNodeId("bbbbbbbbbbbbbbbb");
@@ -21,6 +21,7 @@ describe("NDJSON adapter server", () => {
     const output = new PassThrough();
     const transport = new MemoryTransport();
     const node = new FieldLinkNode({ nodeId: nodeB, transport });
+    let started = false;
     const reader = lineReader(output);
     const serving = serveAdapter({
       path: "/dev/cu.test",
@@ -31,6 +32,10 @@ describe("NDJSON adapter server", () => {
       createRuntime: () =>
         Promise.resolve({
           node,
+          start: () => {
+            started = true;
+            return Promise.resolve();
+          },
           ready: ready(123),
         }),
     });
@@ -40,6 +45,7 @@ describe("NDJSON adapter server", () => {
       supportedMessages: [{ id: 1, name: "test" }],
       retryStrategies: [{ id: 1, name: "selective-window" }],
     });
+    expect(started).toBe(true);
     input.write(
       `${JSON.stringify({
         id: 1,
@@ -149,6 +155,57 @@ describe("adapter process proxy", () => {
     await expect(adapter.close()).resolves.toBeUndefined();
   });
 
+  it("preserves startup inbox evidence without delivering stale messages", async () => {
+    const inbox: unknown[] = [];
+    const adapter = await AdapterProcessNode.start({
+      path: "test",
+      channel: 39,
+      allowInboxDrain: true,
+      onInboxMessage: (message) => {
+        inbox.push(message);
+      },
+      program: nodeScript(preReadyEvidenceChildScript()),
+    });
+    const messages: unknown[] = [];
+    adapter.onMessage((message) => {
+      messages.push(message);
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(adapter.channel.index).toBe(39);
+    expect(inbox).toHaveLength(1);
+    expect(messages).toHaveLength(0);
+    await adapter.close();
+  });
+
+  it("waits for startup evidence callbacks before completing close", async () => {
+    let releaseInbox = (): void => undefined;
+    const inboxReleased = new Promise<void>((resolve) => {
+      releaseInbox = resolve;
+    });
+    let inboxStarted = false;
+    const adapter = await AdapterProcessNode.start({
+      path: "test",
+      channel: 1,
+      allowInboxDrain: true,
+      onInboxMessage: async () => {
+        inboxStarted = true;
+        await inboxReleased;
+      },
+      program: nodeScript(closeWithBufferedInboxChildScript()),
+    });
+
+    let closed = false;
+    const closing = adapter.close().then(() => {
+      closed = true;
+    });
+    await eventually(() => inboxStarted);
+    expect(closed).toBe(false);
+    releaseInbox();
+    await closing;
+    expect(closed).toBe(true);
+  });
+
   it("rejects pending work when the child exits", async () => {
     const adapter = await AdapterProcessNode.start({
       path: "test",
@@ -251,7 +308,7 @@ process.stdin.once("data",chunk=>{const request=JSON.parse(String(chunk).trim())
   });
 });
 
-function ready(processId: number) {
+function ready(processId: number, channelIndex = 1) {
   return {
     processId,
     identity: {
@@ -273,7 +330,7 @@ function ready(processId: number) {
       },
     },
     channel: {
-      index: 1,
+      index: channelIndex,
       name: "test",
       configured: true,
       keyFingerprint: "0011223344556677",
@@ -317,8 +374,58 @@ function nodeScript(source: string) {
   return { executable: process.execPath, arguments: ["-e", source] };
 }
 
-function writeReady(): string {
-  return `process.stdout.write(${JSON.stringify(`${JSON.stringify({ type: "ready", ...ready(999) })}\n`)});`;
+function writeReady(channelIndex = 1): string {
+  return `process.stdout.write(${JSON.stringify(`${JSON.stringify({ type: "ready", ...ready(999, channelIndex) })}\n`)});`;
+}
+
+function preReadyEvidenceChildScript(): string {
+  const inbox = {
+    type: "inbox-message",
+    message: {
+      channelMessage: {
+        channelIdx: 39,
+        pathLen: 1,
+        txtType: 0,
+        senderTimestamp: 1,
+        text: "stale",
+      },
+    },
+  };
+  const stale = {
+    type: "message",
+    message: {
+      message: {
+        type: "test",
+        kind: "response",
+        correlationId: 1,
+        payload: { $fieldlinkBytes: "" },
+      },
+      source: nodeA,
+      destination: nodeB,
+      logicalId: "0000000000000001",
+      delivery: "complete",
+      receivedAt: "2026-08-24T12:00:00.000Z",
+    },
+  };
+  return `process.stdout.write(${JSON.stringify(`${JSON.stringify(inbox)}\n${JSON.stringify(stale)}\n${JSON.stringify({ type: "ready", ...ready(999, 39) })}\n`)});
+process.stdin.on("data",chunk=>{const request=JSON.parse(String(chunk).trim());if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}});`;
+}
+
+function closeWithBufferedInboxChildScript(): string {
+  const inbox = {
+    type: "inbox-message",
+    message: {
+      channelMessage: {
+        channelIdx: 1,
+        pathLen: 1,
+        txtType: 0,
+        senderTimestamp: 1,
+        text: "final",
+      },
+    },
+  };
+  return `${writeReady()}
+process.stdin.once("data",chunk=>{const request=JSON.parse(String(chunk).trim());const lines=JSON.stringify({type:"response",id:request.id,ok:true})+"\\n"+${JSON.stringify(JSON.stringify(inbox))}+"\\n";process.stdout.write(lines,()=>process.exit(0));});`;
 }
 
 function cooperativeChildScript(): string {

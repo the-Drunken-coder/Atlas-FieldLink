@@ -19,3 +19,4 @@ export {
   type StartAdapterProcessOptions,
 } from "./adapter-process.js";
 export { messageRegistry, type MessageDefinition } from "./messages/index.js";
+export type { RetryStrategyName } from "./retry-strategies/index.js";

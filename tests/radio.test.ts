@@ -48,6 +48,18 @@ describe("radio discovery", () => {
     ]);
   });
 
+  it("uses callout paths when the macOS device directory cannot be read", () => {
+    expect(
+      radioPortCandidates(
+        [
+          { path: "/dev/tty.Bluetooth-Incoming-Port" },
+          { path: "/dev/tty.usbserial-4", vendorId: "10c4" },
+        ],
+        "darwin",
+      ),
+    ).toEqual([{ path: "/dev/cu.usbserial-4", vendorId: "10c4" }]);
+  });
+
   it("filters generic serial devices on other platforms", () => {
     expect(
       radioPortCandidates(
@@ -353,6 +365,39 @@ describe("MeshCore transport", () => {
     await transport.startInbox();
     expect(consumed).toEqual(inbox);
     expect(delivered).toEqual([Uint8Array.of(3)]);
+    await transport.close();
+  });
+
+  it("forces another drain pass when an explicit flush joins an active drain", async () => {
+    const connection = new FakeConnection();
+    let releaseFirst: ((message: InboxMessage | null) => void) | undefined;
+    const syncNextMessage = vi
+      .spyOn(connection, "syncNextMessage")
+      .mockImplementationOnce(
+        () =>
+          new Promise<InboxMessage | null>((resolve) => {
+            releaseFirst = resolve;
+          }),
+      )
+      .mockResolvedValue(null);
+    const transport = new MeshCoreTransport("/dev/cu.test", {
+      channel: 2,
+      connection,
+    });
+    await transport.open();
+
+    const first = transport.flushInbox();
+    const second = transport.flushInbox();
+    await vi.waitFor(() => {
+      expect(releaseFirst).toBeDefined();
+    });
+    if (releaseFirst === undefined) {
+      throw new Error("The first inbox read did not start");
+    }
+    releaseFirst(null);
+    await Promise.all([first, second]);
+
+    expect(syncNextMessage).toHaveBeenCalledTimes(2);
     await transport.close();
   });
 

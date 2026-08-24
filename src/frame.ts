@@ -151,6 +151,7 @@ export function decodeFrame(bytes: Uint8Array): FieldLinkFrame {
       };
     case FrameKind.receiptRequest:
       requireExactLength(bytes, offset + 3, "receipt request");
+      requireWindowCount(view.getUint8(offset + 2));
       return {
         ...base,
         kind,
@@ -159,6 +160,7 @@ export function decodeFrame(bytes: Uint8Array): FieldLinkFrame {
       };
     case FrameKind.receipt:
       requireExactLength(bytes, offset + 4, "receipt");
+      requireWindowCount(view.getUint8(offset + 2));
       return {
         ...base,
         kind,
@@ -274,6 +276,12 @@ function requireExactLength(
 ): void {
   if (bytes.length !== length) {
     throw new FrameDecodeError(`${name} has an invalid length`);
+  }
+}
+
+function requireWindowCount(value: number): void {
+  if (value < 1 || value > 8) {
+    throw new FrameDecodeError("window count must be between 1 and 8");
   }
 }
 

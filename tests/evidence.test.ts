@@ -1,7 +1,6 @@
-import { open, readFile, type FileHandle } from "node:fs/promises";
+import { mkdtemp, open, readFile, rm, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 
 import { TestArtifacts, type TestManifest } from "../src/evidence.js";

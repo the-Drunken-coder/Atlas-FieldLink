@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "tools" / "fieldlink_tui.py"
@@ -40,6 +41,41 @@ class FieldLinkTuiTests(unittest.TestCase):
             choice.label,
             "/dev/cu.usbserial-4  Silicon Labs | 0001  unverified",
         )
+
+    def test_reports_cli_discovery_timeout(self):
+        with mock.patch.object(
+            TUI.subprocess,
+            "run",
+            side_effect=TUI.subprocess.TimeoutExpired(["fieldlink"], 30),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "within 30 seconds"):
+                TUI.FieldLinkCli().run_json("radios", "list", "--json")
+
+    def test_stop_process_tolerates_an_exit_race(self):
+        process = mock.Mock(pid=123)
+        process.poll.return_value = None
+        with mock.patch.object(
+            TUI.os, "killpg", side_effect=ProcessLookupError
+        ):
+            TUI.stop_process(process)
+
+    def test_tui_stops_and_reaps_the_test_after_an_exception(self):
+        screen = mock.Mock()
+        cli = mock.Mock()
+        process = mock.Mock()
+        process.poll.return_value = None
+        cli.start_test.return_value = process
+        with (
+            mock.patch.object(TUI.curses, "curs_set"),
+            mock.patch.object(TUI, "select_configuration", return_value=self.config()),
+            mock.patch.object(TUI, "run_live", side_effect=KeyboardInterrupt),
+            mock.patch.object(TUI, "stop_process") as stop_process,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                TUI.tui(screen, cli, [], [], [], 1000, Path("results"))
+
+        stop_process.assert_called_once_with(process)
+        process.wait.assert_called_once_with(timeout=TUI.STOP_TIMEOUT_SECONDS)
 
     def test_renders_chunk_progress_and_statistics(self):
         view = TUI.RunView()
@@ -125,10 +161,11 @@ class FieldLinkTuiTests(unittest.TestCase):
     def test_reads_only_complete_jsonl_records(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.jsonl"
-            path.write_text('{"type":"test-passed","data":{}}\n', encoding="utf-8")
+            complete = '{"type":"test-passed","data":{}}\n'
+            path.write_text(complete + '{"type":"partial"', encoding="utf-8")
             offset, records = TUI.read_new_events(path, 0)
-            self.assertGreater(offset, 0)
-            self.assertEqual(records[0]["type"], "test-passed")
+            self.assertEqual(offset, len(complete))
+            self.assertEqual([record["type"] for record in records], ["test-passed"])
 
 
 if __name__ == "__main__":

@@ -95,22 +95,31 @@ export interface FieldLinkNodeOptions {
   readonly now?: () => number;
 }
 
-interface InboundTransfer {
+interface InboundTransferBase {
   readonly source: NodeId;
   readonly messageType: number;
   readonly totalLength: number;
   readonly fragmentCount: number;
   readonly fragmentSize: number;
   readonly digest: Uint8Array;
+  readonly retryStrategy: number;
+  lastActivity: number;
+}
+
+interface ActiveInboundTransfer extends InboundTransferBase {
+  readonly completed: false;
   readonly receiver: TransferReceiverState;
   readonly bytes: Uint8Array;
   readonly received: Uint8Array;
-  readonly retryStrategy: number;
   receivedCount: number;
-  lastActivity: number;
-  completed: boolean;
   snrDb?: number;
 }
+
+interface CompletedInboundTransfer extends InboundTransferBase {
+  readonly completed: true;
+}
+
+type InboundTransfer = ActiveInboundTransfer | CompletedInboundTransfer;
 
 interface ScheduledFrame {
   readonly bytes: Uint8Array;
@@ -161,6 +170,11 @@ export class FieldLinkNode {
     this.#unsubscribeTransport = this.#transport.onDatagram((datagram) => {
       const receive = this.#receive(datagram).finally(() => {
         this.#activeReceives.delete(receive);
+      });
+      void receive.catch((error: unknown) => {
+        this.#protocolError(
+          `Inbound handling failed: ${asError(error).message}`,
+        );
       });
       this.#activeReceives.add(receive);
       return receive;
@@ -602,7 +616,7 @@ export class FieldLinkNode {
       retryStrategy: frame.retryStrategy,
       receivedCount: 0,
       lastActivity: this.#now(),
-      completed: false,
+      completed: false as const,
       ...(snrDb === undefined ? {} : { snrDb }),
     });
     this.#emit({
@@ -637,6 +651,9 @@ export class FieldLinkNode {
       return;
     }
     transfer.lastActivity = this.#now();
+    if (transfer.completed) {
+      return;
+    }
     if (snrDb !== undefined) {
       transfer.snrDb = snrDb;
     }
@@ -703,12 +720,17 @@ export class FieldLinkNode {
       this.#inbound.delete(key);
       return;
     }
-    transfer.completed = true;
-    await this.#submit(
-      responseFrame(frame, FrameKind.completion),
-      "high",
-      undefined,
-    );
+    this.#inbound.set(key, {
+      completed: true,
+      source: transfer.source,
+      messageType: transfer.messageType,
+      totalLength: transfer.totalLength,
+      fragmentCount: transfer.fragmentCount,
+      fragmentSize: transfer.fragmentSize,
+      digest: transfer.digest,
+      retryStrategy: transfer.retryStrategy,
+      lastActivity: transfer.lastActivity,
+    });
     this.#deliverMessage(
       message,
       frame.source,
@@ -716,6 +738,11 @@ export class FieldLinkNode {
       frame.logicalId,
       "transfer",
       transfer.snrDb,
+    );
+    await this.#submit(
+      responseFrame(frame, FrameKind.completion),
+      "high",
+      undefined,
     );
   }
 
@@ -740,11 +767,13 @@ export class FieldLinkNode {
       });
       return;
     }
-    const bitmap = transfer.receiver.receipt(
-      frame.windowStart,
-      frame.windowCount,
-      (index) => transfer.received[index] === 1,
-    );
+    const bitmap = transfer.completed
+      ? (1 << frame.windowCount) - 1
+      : transfer.receiver.receipt(
+          frame.windowStart,
+          frame.windowCount,
+          (index) => transfer.received[index] === 1,
+        );
     await this.#submit(
       {
         ...responseBase(frame),
@@ -929,8 +958,8 @@ export class FieldLinkNode {
       release = resolve;
     });
     await previous;
-    this.#throwIfClosed();
     try {
+      this.#throwIfClosed();
       return await operation();
     } finally {
       release();

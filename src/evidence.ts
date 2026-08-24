@@ -58,18 +58,23 @@ export class TestArtifacts {
       flag: "wx",
     });
     const events = await open(paths.events, "wx");
-    await writeFile(
-      paths.summary,
-      `${stringify(
-        {
-          command: "test",
-          startedAt: manifest.startedAt,
-          status: "running",
-        },
-        2,
-      )}\n`,
-      { encoding: "utf8", flag: "wx" },
-    );
+    try {
+      await writeFile(
+        paths.summary,
+        `${stringify(
+          {
+            command: "test",
+            startedAt: manifest.startedAt,
+            status: "running",
+          },
+          2,
+        )}\n`,
+        { encoding: "utf8", flag: "wx" },
+      );
+    } catch (error: unknown) {
+      await events.close().catch(() => undefined);
+      throw error;
+    }
     return new TestArtifacts(paths, events);
   }
 

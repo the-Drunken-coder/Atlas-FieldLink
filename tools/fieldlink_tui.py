@@ -21,6 +21,8 @@ from typing import Any, TextIO
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 CLI = ("npm", "run", "--silent", "fieldlink", "--")
+DISCOVERY_TIMEOUT_SECONDS = 30
+STOP_TIMEOUT_SECONDS = 10
 
 
 class Cancelled(Exception):
@@ -83,13 +85,19 @@ class RunConfiguration:
 
 class FieldLinkCli:
     def run_json(self, *arguments: str) -> Any:
-        completed = subprocess.run(
-            [*CLI, *arguments],
-            cwd=REPOSITORY,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                [*CLI, *arguments],
+                cwd=REPOSITORY,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=DISCOVERY_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                f"FieldLink CLI did not respond within {DISCOVERY_TIMEOUT_SECONDS} seconds"
+            ) from error
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise RuntimeError(detail or "FieldLink CLI failed")
@@ -483,10 +491,25 @@ def load_summary(path: Path) -> dict[str, Any] | None:
 def stop_process(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
         return
-    if os.name == "posix":
-        os.killpg(process.pid, signal.SIGINT)
-    else:
-        process.send_signal(signal.SIGINT)
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGINT)
+        else:
+            process.send_signal(signal.SIGINT)
+    except ProcessLookupError:
+        return
+
+
+def kill_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except ProcessLookupError:
+        return
 
 
 def run_live(
@@ -510,6 +533,7 @@ def run_live(
     cancelling = False
     screen.timeout(100)
     summary: dict[str, Any] | None = None
+    drained = False
     while True:
         while True:
             try:
@@ -520,7 +544,8 @@ def run_live(
         event_offset, events = read_new_events(config.output / "events.jsonl", event_offset)
         for event in events:
             view.observe(event)
-        if process.poll() is not None:
+        if process.poll() is not None and not drained:
+            drained = True
             for thread in threads:
                 thread.join(timeout=0.2)
             while not output.empty():
@@ -642,7 +667,17 @@ def tui(
     config = select_configuration(
         screen, messages, radios, strategies, timeout_ms, output_root
     )
-    return run_live(screen, cli.start_test(config), config)
+    process = cli.start_test(config)
+    try:
+        return run_live(screen, process, config)
+    finally:
+        if process.poll() is None:
+            stop_process(process)
+            try:
+                process.wait(timeout=STOP_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                kill_process(process)
+                process.wait()
 
 
 def parse_arguments(arguments: list[str]) -> argparse.Namespace:

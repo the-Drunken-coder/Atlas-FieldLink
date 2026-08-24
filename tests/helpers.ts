@@ -3,6 +3,7 @@ import type { FieldLinkTransport, TransportDatagram } from "../src/node.js";
 export class MemoryTransport implements FieldLinkTransport {
   readonly sent: Uint8Array[] = [];
   readonly queueLengths: number[] = [];
+  readonly listenerErrors: Error[] = [];
   readonly #listeners = new Set<
     (datagram: TransportDatagram) => void | Promise<void>
   >();
@@ -64,7 +65,13 @@ export class MemoryTransport implements FieldLinkTransport {
   private queueDelivery(datagram: TransportDatagram): void {
     this.#deliveryTail = this.#deliveryTail.then(async () => {
       for (const listener of this.#listeners) {
-        await listener({ ...datagram, bytes: datagram.bytes.slice() });
+        await Promise.resolve(
+          listener({ ...datagram, bytes: datagram.bytes.slice() }),
+        ).catch((error: unknown) => {
+          this.listenerErrors.push(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+        });
       }
     });
   }

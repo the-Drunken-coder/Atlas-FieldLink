@@ -159,8 +159,8 @@ export async function serveAdapter(
   );
 
   try {
-    await writer.write({ type: "ready", ...runtime.ready });
     await runtime.start?.();
+    await writer.write({ type: "ready", ...runtime.ready });
     for (;;) {
       const requestLine = await nextRequest;
       if (requestLine.done) {
@@ -364,6 +364,7 @@ export class AdapterProcessNode {
   #failure: Error | undefined;
   #closed = false;
   #exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  #readerDone: Promise<void> = Promise.resolve();
 
   private constructor(
     child: ChildProcessWithoutNullStreams,
@@ -407,13 +408,13 @@ export class AdapterProcessNode {
         resolve({ code, signal });
       });
     });
-    const stdoutDrained = new Promise<void>((resolve) => {
-      child.stdout.once("end", resolve);
-    });
+    let rejectSpawnError: ((error: Error) => void) | undefined;
+    const onSpawnError = (error: unknown): void => {
+      rejectSpawnError?.(asError(error));
+    };
     const spawnError = new Promise<never>((_resolve, reject) => {
-      child.once("error", (error) => {
-        reject(asError(error));
-      });
+      rejectSpawnError = reject;
+      child.once("error", onSpawnError);
     });
     const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
     const iterator = lines[Symbol.asyncIterator]();
@@ -421,9 +422,32 @@ export class AdapterProcessNode {
       child.kill("SIGTERM");
     };
     options.signal?.addEventListener("abort", abort, { once: true });
-    let first: IteratorResult<string>;
+    let ready: ({ readonly type: "ready" } & AdapterReady) | undefined;
     try {
-      first = await Promise.race([iterator.next(), spawnError]);
+      while (ready === undefined) {
+        const first = await Promise.race([iterator.next(), spawnError]);
+        if (first.done) {
+          throw new Error("Adapter stdout ended before ready");
+        }
+        const message = parseAdapterMessage(first.value);
+        switch (message.type) {
+          case "ready":
+            ready = message;
+            break;
+          case "inbox-message":
+            await options.onInboxMessage?.(message.message);
+            break;
+          case "listener-error":
+            await options.onListenerError?.(new Error(message.error));
+            break;
+          case "event":
+          case "message":
+            // Initial inbox traffic is evidence, not part of the new run.
+            break;
+          case "response":
+            throw new Error("Adapter sent response before ready");
+        }
+      }
     } catch (error: unknown) {
       lines.close();
       child.kill("SIGTERM");
@@ -431,17 +455,14 @@ export class AdapterProcessNode {
     } finally {
       options.signal?.removeEventListener("abort", abort);
     }
-    if (first.done) {
-      throw new Error("Adapter stdout ended before ready");
-    }
-    const message = parseAdapterMessage(first.value);
-    if (message.type !== "ready") {
-      throw new Error(`Adapter sent ${message.type} before ready`);
-    }
-    const node = new AdapterProcessNode(child, message, options, exit);
-    node.#read(iterator, lines, options);
+    child.off("error", onSpawnError);
+    const node = new AdapterProcessNode(child, ready, options, exit);
+    child.on("error", (error) => {
+      node.#fail(asError(error));
+    });
+    node.#readerDone = node.#read(iterator, lines, options);
     void exit.then(async ({ code, signal }) => {
-      await stdoutDrained;
+      await node.#readerDone;
       if (!node.#closed || code !== 0) {
         node.#fail(
           new Error(
@@ -495,7 +516,7 @@ export class AdapterProcessNode {
 
   async close(): Promise<void> {
     if (this.#closed) {
-      await this.#exit;
+      await Promise.all([this.#exit, this.#readerDone]);
       return;
     }
     this.#closed = true;
@@ -507,7 +528,11 @@ export class AdapterProcessNode {
     }
     this.#child.stdin.end();
     try {
-      await withTimeout(this.#exit, EXIT_TIMEOUT_MS, "adapter process exit");
+      await withTimeout(
+        Promise.all([this.#exit, this.#readerDone]),
+        EXIT_TIMEOUT_MS,
+        "adapter process exit and stdout drain",
+      );
     } catch (error: unknown) {
       this.#child.kill("SIGTERM");
       closeError ??= asError(error);
@@ -570,8 +595,8 @@ export class AdapterProcessNode {
     iterator: AsyncIterator<string>,
     lines: ReturnType<typeof createInterface>,
     options: StartAdapterProcessOptions,
-  ): void {
-    void (async () => {
+  ): Promise<void> {
+    return (async () => {
       try {
         for (;;) {
           const next = await iterator.next();
@@ -785,7 +810,7 @@ function isAdapterReady(value: unknown): value is {
     Array.isArray(value.retryStrategies) &&
     value.retryStrategies.every(isRetryStrategyMetadata) &&
     isRecord(value.delivery) &&
-    value.delivery.meshCoreDataType === 0xffff &&
+    value.delivery.meshCoreDataType === FIELDLINK_DATA_TYPE &&
     value.delivery.meshCoreMode === "flood" &&
     value.delivery.maximumChannelDatagramBytes === 163
   );
@@ -852,7 +877,7 @@ function isSafeChannel(value: unknown): value is SafeChannelConfiguration {
     typeof value.index === "number" &&
     Number.isInteger(value.index) &&
     value.index >= 0 &&
-    value.index <= 7 &&
+    value.index <= 0xff &&
     typeof value.name === "string" &&
     typeof value.configured === "boolean" &&
     typeof value.keyFingerprint === "string"

@@ -89,7 +89,7 @@ describe("CLI arguments", () => {
       "selective-window",
     );
     expect(() => parseCommand([...base, "--message", "missing"])).toThrow(
-      "test",
+      "--message must be one of: test",
     );
   });
 

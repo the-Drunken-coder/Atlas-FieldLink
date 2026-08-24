@@ -412,6 +412,7 @@ export class MeshCoreTransport implements FieldLinkTransport {
   }
 
   async flushInbox(): Promise<void> {
+    this.#drainRequestSequence += 1;
     await this.#startDrain();
   }
 

@@ -72,7 +72,10 @@ describe("FieldLink frames", () => {
       windowCount: 2,
       bitmap: 3,
     },
+    { ...base, kind: FrameKind.transferReady, logicalId: 2n },
     { ...base, kind: FrameKind.completion, logicalId: 2n },
+    { ...base, kind: FrameKind.rejection, logicalId: 2n, code: 3 },
+    { ...base, kind: FrameKind.cancellation, logicalId: 2n, code: 4 },
   ])("round-trips kind $kind", (frame) => {
     expect(decodeFrame(encodeFrame(frame))).toEqual(frame);
   });
@@ -114,5 +117,33 @@ describe("FieldLink frames", () => {
         body: new Uint8Array(COMPLETE_MESSAGE_BODY_BYTES + 1),
       }),
     ).toThrow("does not fit");
+  });
+
+  it("rejects invalid receipt window counts", () => {
+    const frames: FieldLinkFrame[] = [
+      {
+        ...base,
+        kind: FrameKind.receiptRequest,
+        logicalId: 2n,
+        windowStart: 0,
+        windowCount: 1,
+      },
+      {
+        ...base,
+        kind: FrameKind.receipt,
+        logicalId: 2n,
+        windowStart: 0,
+        windowCount: 1,
+        bitmap: 1,
+      },
+    ];
+    for (const frame of frames) {
+      const encoded = encodeFrame(frame);
+      encoded[FIELDLINK_FRAME_HEADER_BYTES + 2] = 0;
+
+      expect(() => decodeFrame(encoded)).toThrow(
+        "window count must be between 1 and 8",
+      );
+    }
   });
 });

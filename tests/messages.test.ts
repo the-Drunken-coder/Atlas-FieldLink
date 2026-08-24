@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { FIELDLINK_MAX_MESSAGE_BYTES } from "../src/frame.js";
 import {
   definitionForType,
   messageRegistry,
@@ -26,12 +27,13 @@ describe("message registry contracts", () => {
     for (const definition of messageRegistry) {
       for (const payloadBytes of [
         definition.exercise.defaultPayloadBytes,
+        definition.exercise.maximumPayloadBytes,
         ...definition.exercise.payloadPresets,
       ]) {
         const message = definition.exercise.create(payloadBytes);
         expect(definition.validate(message)).toBe(true);
         expect(definition.encode(message).length).toBeLessThanOrEqual(
-          1024 * 1024,
+          FIELDLINK_MAX_MESSAGE_BYTES,
         );
       }
     }

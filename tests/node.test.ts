@@ -221,6 +221,48 @@ describe("FieldLinkNode delivery", () => {
     await Promise.all([a.close(), b.close()]);
   });
 
+  it("delivers a validated transfer before retrying a lost completion", async () => {
+    const transportA = new MemoryTransport();
+    const transportB = new FailsFirstCompletionTransport();
+    transportA.peer = transportB;
+    transportB.peer = transportA;
+    const a = new FieldLinkNode({
+      nodeId: nodeA,
+      transport: transportA,
+      retryTimeoutMs: 10,
+    });
+    const b = new FieldLinkNode({
+      nodeId: nodeB,
+      transport: transportB,
+      retryTimeoutMs: 10,
+    });
+    const received: ReceivedMessage[] = [];
+    const events: FieldLinkEvent[] = [];
+    b.onMessage((message) => {
+      received.push(message);
+    });
+    b.onEvent((event) => {
+      events.push(event);
+    });
+
+    await expect(
+      a.send(test("response", 200), { destination: nodeB }),
+    ).resolves.toMatchObject({ delivery: "transfer" });
+    expect(received).toHaveLength(1);
+    expect(transportB.failedCompletion).toBe(true);
+    expect(transportB.listenerErrors[0]?.message).toBe(
+      "completion send failed",
+    );
+    expect(
+      events.some(
+        (event) =>
+          event.type === "protocol-error" &&
+          String(event.message).includes("Inbound handling failed"),
+      ),
+    ).toBe(true);
+    await Promise.all([a.close(), b.close()]);
+  });
+
   it("lets a high-priority complete message preempt a bulk repair", async () => {
     const [transportA, transportB] = memoryTransportPair();
     let droppedReceipt = false;
@@ -508,7 +550,39 @@ describe("inbound transfer validation", () => {
     await Promise.all(pending);
     await node.close();
   });
+
+  it("releases every queued transfer when close interrupts the first", async () => {
+    const transport = new MemoryTransport();
+    transport.queueLength = 1;
+    const node = new FieldLinkNode({ nodeId: nodeA, transport });
+    const sends = Array.from({ length: 3 }, () =>
+      node.send(test("response", 300), { destination: nodeB }).then(
+        () => undefined,
+        (error: unknown) => error,
+      ),
+    );
+    await eventually(() => transport.queueLengths.length > 0);
+
+    await node.close();
+    const results = await Promise.all(sends);
+    expect(results.every((result) => result instanceof Error)).toBe(true);
+  });
 });
+
+class FailsFirstCompletionTransport extends MemoryTransport {
+  failedCompletion = false;
+
+  override send(bytes: Uint8Array): Promise<void> {
+    if (
+      !this.failedCompletion &&
+      decodeFrame(bytes).kind === FrameKind.completion
+    ) {
+      this.failedCompletion = true;
+      return Promise.reject(new Error("completion send failed"));
+    }
+    return super.send(bytes);
+  }
+}
 
 function test(
   kind: "request" | "response",

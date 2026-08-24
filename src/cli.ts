@@ -93,13 +93,21 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
     },
     command.output,
   );
+  const controller = new AbortController();
   let artifactError: Error | undefined;
   const record = (type: string, data: unknown): void => {
     void artifacts.record(type, data).catch((error: unknown) => {
-      artifactError ??= asError(error);
+      const failure = asError(error);
+      artifactError ??= failure;
+      if (!controller.signal.aborted) {
+        controller.abort(
+          new Error(`Could not preserve test evidence: ${failure.message}`, {
+            cause: failure,
+          }),
+        );
+      }
     });
   };
-  const controller = new AbortController();
   let interruptedBy: "SIGINT" | "SIGTERM" | undefined;
   let finalizing = false;
   const interrupt = (signal: "SIGINT" | "SIGTERM"): void => {
@@ -549,6 +557,7 @@ export function waitForExerciseCompletion(
     const subscriptions: (() => void)[] = [];
     const completedTransfers = new Set<string>();
     const failedTransfers = new Map<string, Error>();
+    const echoTransfers = new Set<string>();
     let matched: ExerciseCompletion | undefined;
     let settled = false;
 
@@ -617,6 +626,15 @@ export function waitForExerciseCompletion(
       subscriptions.push(
         node.onEvent((event: FieldLinkEvent) => {
           if (
+            node === destinationNode &&
+            event.type === "transfer-started" &&
+            typeof event.logicalId === "string" &&
+            event.destination === sourceNode.nodeId
+          ) {
+            echoTransfers.add(transferKey(node.nodeId, event.logicalId));
+            return;
+          }
+          if (
             (event.type !== "transfer-completed" &&
               event.type !== "transfer-failed") ||
             typeof event.logicalId !== "string"
@@ -629,10 +647,14 @@ export function waitForExerciseCompletion(
           } else {
             const message =
               typeof event.error === "string" ? event.error : "unknown error";
-            failedTransfers.set(
-              key,
-              new Error(`Echo transfer failed: ${message}`),
-            );
+            const failure = new Error(`Echo transfer failed: ${message}`);
+            failedTransfers.set(key, failure);
+            if (matched === undefined && echoTransfers.has(key)) {
+              settled = true;
+              cleanup();
+              reject(failure);
+              return;
+            }
           }
           if (
             matched !== undefined &&
