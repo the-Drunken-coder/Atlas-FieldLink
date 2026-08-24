@@ -31,6 +31,7 @@ import {
 
 const REQUEST_TIMEOUT_MS = 31 * 60 * 1000;
 const EXIT_TIMEOUT_MS = 5_000;
+const STDOUT_EXIT_GRACE_MS = 25;
 const BYTES_MARKER = "$fieldlinkBytes";
 const CONTROLLER_OPTIONS_WITH_VALUES = new Set([
   "--inspect-port",
@@ -425,6 +426,13 @@ export class AdapterProcessNode {
   static async start(
     options: StartAdapterProcessOptions,
   ): Promise<AdapterProcessNode> {
+    // JavaScript callers are not protected by the literal TypeScript type.
+    const allowInboxDrain: unknown = options.allowInboxDrain;
+    if (allowInboxDrain !== true) {
+      throw new Error(
+        "Adapter process startup requires explicit inbox-drain acknowledgement",
+      );
+    }
     const program = options.program ?? defaultAdapterProgram(options);
     const child = spawn(program.executable, [...program.arguments], {
       stdio: ["pipe", "pipe", "pipe"],
@@ -710,6 +718,29 @@ export class AdapterProcessNode {
         for (;;) {
           const next = await iterator.next();
           if (next.done) {
+            if (
+              !this.#closed &&
+              this.#child.exitCode === null &&
+              this.#child.signalCode === null
+            ) {
+              // Stdio EOF can arrive just before a real child exit is reported.
+              const exitState = await Promise.race([
+                this.#exit.then(() => "exited" as const),
+                new Promise<"open">((resolve) => {
+                  setTimeout(() => {
+                    resolve("open");
+                  }, STDOUT_EXIT_GRACE_MS);
+                }),
+              ]);
+              if (exitState === "open") {
+                this.#fail(new Error("Adapter stdout ended unexpectedly"));
+                await terminateAndReapAdapter(
+                  this.#child,
+                  this.#exit,
+                  this.#exitTimeoutMs,
+                );
+              }
+            }
             return;
           }
           const message = parseAdapterMessage(next.value);

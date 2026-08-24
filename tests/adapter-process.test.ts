@@ -6,6 +6,7 @@ import {
   AdapterProcessNode,
   filteredExecArguments,
   serveAdapter,
+  type StartAdapterProcessOptions,
 } from "../src/adapter-process.js";
 import { encodeFrame, FrameKind } from "../src/frame.js";
 import { testMessage } from "../src/messages/test.js";
@@ -151,6 +152,19 @@ describe("NDJSON adapter server", () => {
 });
 
 describe("adapter process proxy", () => {
+  it("requires runtime inbox-drain acknowledgement before spawning", async () => {
+    const options = {
+      path: "test",
+      channel: 1,
+      allowInboxDrain: false,
+      program: nodeScript(cooperativeChildScript()),
+    } as unknown as StartAdapterProcessOptions;
+
+    await expect(AdapterProcessNode.start(options)).rejects.toThrow(
+      "explicit inbox-drain acknowledgement",
+    );
+  });
+
   it("sends typed messages and closes cooperatively", async () => {
     const adapter = await AdapterProcessNode.start({
       path: "test",
@@ -289,6 +303,22 @@ describe("adapter process proxy", () => {
         { destination: nodeB },
       ),
     ).rejects.toThrow("code 7");
+  });
+
+  it("fails and reaps an adapter whose stdout closes unexpectedly", async () => {
+    const adapter = await AdapterProcessNode.start({
+      path: "test",
+      channel: 1,
+      allowInboxDrain: true,
+      requestTimeoutMs: 10_000,
+      exitTimeoutMs: 100,
+      program: nodeScript(closedStdoutChildScript()),
+    });
+
+    await expect(adapter.activate()).rejects.toThrow(
+      "Adapter stdout ended unexpectedly",
+    );
+    await expect(adapter.close()).rejects.toThrow();
   });
 
   it("drains the final response before treating child exit as failure", async () => {
@@ -540,6 +570,13 @@ function cooperativeChildScript(): string {
 let pending="";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="activate"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n");}else if(request.type==="send"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true,result:{logicalId:"0000000000000001",messageType:1,messageName:"test",destination:request.destination,priority:"normal",delivery:"complete",encodedBytes:7,fragments:1,retransmissions:0,receipts:0,durationMs:1}})+"\\n");}else if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}}});`;
+}
+
+function closedStdoutChildScript(): string {
+  return `${writeReady()}
+process.on("SIGTERM",()=>process.exit(0));
+process.stdout.end();
+setInterval(()=>{},1000);`;
 }
 
 function abortChildScript(): string {

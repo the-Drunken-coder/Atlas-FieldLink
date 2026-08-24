@@ -80,6 +80,60 @@ export async function main(arguments_: readonly string[]): Promise<number> {
 
 async function runHardwareTest(command: TestCommand): Promise<number> {
   const startedAt = new Date().toISOString();
+  const controller = new AbortController();
+  let artifactSink: TestArtifacts | undefined = undefined;
+  let artifactError: Error | undefined;
+  const record = (type: string, data: unknown): void => {
+    const sink = artifactSink;
+    if (sink === undefined) {
+      return;
+    }
+    void sink.record(type, data).catch((error: unknown) => {
+      const failure = asError(error);
+      artifactError ??= failure;
+      if (!controller.signal.aborted) {
+        controller.abort(
+          new Error(`Could not preserve test evidence: ${failure.message}`, {
+            cause: failure,
+          }),
+        );
+      }
+    });
+  };
+  let interruptedBy: "SIGINT" | "SIGTERM" | undefined;
+  let interruptionRecorded = false;
+  let finalizing = false;
+  const recordInterruption = (): void => {
+    if (
+      interruptionRecorded ||
+      interruptedBy === undefined ||
+      artifactSink === undefined
+    ) {
+      return;
+    }
+    interruptionRecorded = true;
+    record("interrupted", { signal: interruptedBy });
+  };
+  const interrupt = (signal: "SIGINT" | "SIGTERM"): void => {
+    if (finalizing) {
+      process.stderr.write(
+        `\n${signal}: artifact finalization already in progress\n`,
+      );
+      return;
+    }
+    interruptedBy ??= signal;
+    recordInterruption();
+    controller.abort(new Error(`Test interrupted by ${signal}`));
+  };
+  const onSigint = (): void => {
+    interrupt("SIGINT");
+  };
+  const onSigterm = (): void => {
+    interrupt("SIGTERM");
+  };
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigterm);
+
   const artifacts = await TestArtifacts.create(
     {
       command: "test",
@@ -94,43 +148,13 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
       execution: { adapterProcesses: 2, radiosPerAdapter: 1 },
     },
     command.output,
-  );
-  const controller = new AbortController();
-  let artifactError: Error | undefined;
-  const record = (type: string, data: unknown): void => {
-    void artifacts.record(type, data).catch((error: unknown) => {
-      const failure = asError(error);
-      artifactError ??= failure;
-      if (!controller.signal.aborted) {
-        controller.abort(
-          new Error(`Could not preserve test evidence: ${failure.message}`, {
-            cause: failure,
-          }),
-        );
-      }
-    });
-  };
-  let interruptedBy: "SIGINT" | "SIGTERM" | undefined;
-  let finalizing = false;
-  const interrupt = (signal: "SIGINT" | "SIGTERM"): void => {
-    if (finalizing) {
-      process.stderr.write(
-        `\n${signal}: artifact finalization already in progress\n`,
-      );
-      return;
-    }
-    interruptedBy ??= signal;
-    record("interrupted", { signal });
-    controller.abort(new Error(`Test interrupted by ${signal}`));
-  };
-  const onSigint = (): void => {
-    interrupt("SIGINT");
-  };
-  const onSigterm = (): void => {
-    interrupt("SIGTERM");
-  };
-  process.on("SIGINT", onSigint);
-  process.on("SIGTERM", onSigterm);
+  ).catch((error: unknown) => {
+    process.removeListener("SIGINT", onSigint);
+    process.removeListener("SIGTERM", onSigterm);
+    throw error;
+  });
+  artifactSink = artifacts;
+  recordInterruption();
   const timeout = setTimeout(() => {
     controller.abort(
       new Error(`Test exceeded the ${command.timeoutMs} ms overall timeout`),
@@ -154,6 +178,7 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
   let selectedChannel: number | undefined;
   const cleanupErrors: string[] = [];
   try {
+    throwIfAborted(controller.signal);
     selectedChannel = await resolveTestChannel(
       command,
       controller.signal,
@@ -239,12 +264,12 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
     }
   }
 
+  finalizing = true;
   try {
     await artifacts.flush();
   } catch (error: unknown) {
     artifactError ??= asError(error);
   }
-  finalizing = true;
   const interrupted = interruptedBy !== undefined;
   const failed =
     runError !== undefined ||

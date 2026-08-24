@@ -1,10 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   buildMessageCatalog,
+  main,
   waitForExerciseCompletion,
   type ExerciseNode,
 } from "../src/cli.js";
+import { TestArtifacts } from "../src/evidence.js";
 import {
   COMPLETE_MESSAGE_BODY_BYTES,
   FIELDLINK_MAX_MESSAGE_BYTES,
@@ -66,6 +68,68 @@ describe("CLI message catalog", () => {
 });
 
 describe("CLI message exercise", () => {
+  it("handles interruption while artifacts are being created", async () => {
+    const initialListeners = process.listeners("SIGINT");
+    const records: { readonly type: string; readonly data: unknown }[] = [];
+    let finishedSummary: unknown;
+    const artifacts = {
+      paths: {
+        directory: "test-artifacts",
+        manifest: "test-artifacts/manifest.json",
+        events: "test-artifacts/events.jsonl",
+        summary: "test-artifacts/summary.json",
+      },
+      record(type: string, data: unknown): Promise<void> {
+        records.push({ type, data });
+        return Promise.resolve();
+      },
+      flush(): Promise<void> {
+        return Promise.resolve();
+      },
+      finish(summary: unknown): Promise<void> {
+        finishedSummary = summary;
+        return Promise.resolve();
+      },
+    } as unknown as TestArtifacts;
+    const create = vi.spyOn(TestArtifacts, "create").mockImplementation(() => {
+      const interrupt = process
+        .listeners("SIGINT")
+        .find((listener) => !initialListeners.includes(listener));
+      expect(interrupt).toBeDefined();
+      interrupt?.("SIGINT");
+      return Promise.resolve(artifacts);
+    });
+    try {
+      await expect(
+        main([
+          "test",
+          "--a",
+          "/dev/cu.a",
+          "--b",
+          "/dev/cu.b",
+          "--channel",
+          "1",
+          "--timeout-ms",
+          "1000",
+          "--allow-inbox-drain",
+        ]),
+      ).resolves.toBe(130);
+      expect(records).toContainEqual({
+        type: "interrupted",
+        data: { signal: "SIGINT" },
+      });
+      expect(finishedSummary).toMatchObject({
+        status: "interrupted",
+        interrupted: true,
+        interruptedBy: "SIGINT",
+        partial: true,
+      });
+      expect(process.listeners("SIGINT")).toEqual(initialListeners);
+    } finally {
+      create.mockRestore();
+    }
+  });
+
   it("waits for the echoed transfer handshake before shutdown", async () => {
     const [transportA, transportB] = memoryTransportPair();
     const a = new FieldLinkNode({

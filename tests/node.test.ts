@@ -680,6 +680,62 @@ describe("inbound transfer validation", () => {
     await node.close();
   });
 
+  it("does not refresh a completed tombstone for an invalid fragment", async () => {
+    let now = 0;
+    const transport = new MemoryTransport();
+    const node = new FieldLinkNode({
+      nodeId: nodeB,
+      transport,
+      inboundTransferIdleMs: 10,
+      now: () => now,
+    });
+    const events: FieldLinkEvent[] = [];
+    node.onEvent((event) => {
+      events.push(event);
+    });
+    const transfer = transferFrames(
+      53n,
+      testMessage.encode(test("response", 200)),
+      1,
+    );
+    transport.inject({ bytes: encodeFrame(transfer.start) });
+    for (const fragment of transfer.fragments) {
+      transport.inject({ bytes: encodeFrame(fragment) });
+    }
+    await transport.settle();
+
+    now = 9;
+    transport.inject({
+      bytes: encodeFrame({
+        transmissionId: 99,
+        kind: FrameKind.fragment,
+        source: nodeA,
+        destination: nodeB,
+        logicalId: 53n,
+        fragmentIndex: transfer.fragments.length,
+        body: Uint8Array.of(1),
+      }),
+    });
+    transport.inject({
+      bytes: encodeFrame({
+        transmissionId: 100,
+        kind: FrameKind.fragment,
+        source: nodeA,
+        destination: nodeB,
+        logicalId: 53n,
+        fragmentIndex: 0,
+        body: Uint8Array.of(1),
+      }),
+    });
+    await transport.settle();
+    now = 15;
+
+    await eventually(() =>
+      events.some((event) => event.type === "transfer-expired"),
+    );
+    await node.close();
+  });
+
   it("does not refresh inbound activity for an invalid receipt window", async () => {
     let now = 0;
     const transport = new MemoryTransport();

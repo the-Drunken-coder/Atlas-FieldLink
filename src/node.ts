@@ -666,10 +666,6 @@ export class FieldLinkNode {
       );
       return;
     }
-    if (transfer.completed) {
-      transfer.lastActivity = this.#now();
-      return;
-    }
     if (frame.fragmentIndex >= transfer.fragmentCount) {
       this.#protocolError(
         `Fragment index ${frame.fragmentIndex} is out of range`,
@@ -689,6 +685,10 @@ export class FieldLinkNode {
         `Fragment ${frame.fragmentIndex} has ${frame.body.length} bytes; expected ${expectedLength}`,
         { logicalId: key },
       );
+      return;
+    }
+    if (transfer.completed) {
+      transfer.lastActivity = this.#now();
       return;
     }
     transfer.lastActivity = this.#now();
