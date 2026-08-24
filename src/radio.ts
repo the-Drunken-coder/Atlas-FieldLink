@@ -204,11 +204,11 @@ export class MeshCoreTransport implements FieldLinkTransport {
     };
     this.#disconnectedListener = () => {
       if (this.#open && !this.#closing) {
-        this.#makeFatal(new Error(`${this.#path} disconnected`));
+        this.#reportFatal(new Error(`${this.#path} disconnected`));
       }
     };
     this.#transportErrorListener = (error: unknown) => {
-      this.#makeFatal(asError(error));
+      this.#reportFatal(asError(error));
     };
   }
 
@@ -451,11 +451,8 @@ export class MeshCoreTransport implements FieldLinkTransport {
 
   #requestDrain(): void {
     this.#drainRequestSequence += 1;
-    void this.#startDrain().catch(async (error: unknown) => {
-      const fatalError = asError(error);
-      if (this.#makeFatal(fatalError)) {
-        await this.#notifyFatalError(fatalError);
-      }
+    void this.#startDrain().catch((error: unknown) => {
+      this.#reportFatal(asError(error));
     });
   }
 
@@ -476,6 +473,9 @@ export class MeshCoreTransport implements FieldLinkTransport {
     for (;;) {
       const observedRequestSequence = this.#drainRequestSequence;
       for (;;) {
+        if (!this.#open) {
+          return;
+        }
         const waitingMessage = await this.#runTimedCommand(
           () => this.#connection.syncNextMessage(),
           `reading messages from ${this.#path}`,
@@ -508,10 +508,7 @@ export class MeshCoreTransport implements FieldLinkTransport {
           }
         }
       }
-      if (
-        !this.#open ||
-        observedRequestSequence === this.#drainRequestSequence
-      ) {
+      if (observedRequestSequence === this.#drainRequestSequence) {
         return;
       }
     }
@@ -562,9 +559,15 @@ export class MeshCoreTransport implements FieldLinkTransport {
     } catch (error: unknown) {
       const commandError = asError(error);
       if (commandError instanceof OperationTimeoutError) {
-        this.#makeFatal(commandError);
+        this.#reportFatal(commandError);
       }
       throw commandError;
+    }
+  }
+
+  #reportFatal(error: Error): void {
+    if (this.#makeFatal(error)) {
+      void this.#notifyFatalError(error);
     }
   }
 

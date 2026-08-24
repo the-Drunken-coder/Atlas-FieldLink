@@ -181,6 +181,9 @@ export async function serveAdapter(
   let closing = false;
   const stopReading = (): void => {
     lines.close();
+    if (isAborted(signal)) {
+      void runtime.node.close().catch(() => undefined);
+    }
   };
   stopForRuntimeFailure = stopReading;
   if (runtimeFailure !== undefined) {
@@ -202,6 +205,9 @@ export async function serveAdapter(
       throw abortError(options.signal);
     }
     await runtime.start?.();
+    if (isAborted(signal)) {
+      throw abortError(signal);
+    }
     await writer.write({ type: "ready", ...runtime.ready });
     for (;;) {
       const requestLine = await nextRequest;
@@ -217,6 +223,9 @@ export async function serveAdapter(
       if (request.type === "activate") {
         try {
           await runtime.activate?.();
+          if (isAborted(signal)) {
+            throw abortError(signal);
+          }
           activated = true;
           await writer.write({ type: "response", id: request.id, ok: true });
         } catch (error: unknown) {
@@ -383,19 +392,25 @@ export async function runAdapterProcess(
     }
     if (!controller.signal.aborted) {
       const adapterEvidence = evidence;
-      await serveAdapter({
-        path: command.radio,
-        channel: command.channel,
-        input: process.stdin,
-        output: process.stdout,
-        signal: controller.signal,
-        ...(adapterEvidence === undefined
-          ? {}
-          : {
-              onInboxMessage: (message: InboxMessage) =>
-                adapterEvidence.record("inbox-message", { message }),
-            }),
-      });
+      try {
+        await serveAdapter({
+          path: command.radio,
+          channel: command.channel,
+          input: process.stdin,
+          output: process.stdout,
+          signal: controller.signal,
+          ...(adapterEvidence === undefined
+            ? {}
+            : {
+                onInboxMessage: (message: InboxMessage) =>
+                  adapterEvidence.record("inbox-message", { message }),
+              }),
+        });
+      } catch (error: unknown) {
+        if (!isAborted(controller.signal)) {
+          throw error;
+        }
+      }
     }
     return controller.signal.aborted ? 130 : 0;
   } finally {

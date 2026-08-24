@@ -89,6 +89,56 @@ describe("NDJSON adapter server", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
+  it("closes the runtime to interrupt startup work", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const controller = new AbortController();
+    const node = new FieldLinkNode({
+      nodeId: nodeB,
+      transport: new MemoryTransport(),
+    });
+    let releaseStart = (): void => undefined;
+    const startReleased = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+    let reportStart = (): void => undefined;
+    const startEntered = new Promise<void>((resolve) => {
+      reportStart = resolve;
+    });
+    const originalClose = node.close.bind(node);
+    const close = vi.spyOn(node, "close").mockImplementation(() => {
+      releaseStart();
+      return originalClose();
+    });
+    const safetyRelease = setTimeout(releaseStart, 100);
+    const serving = serveAdapter({
+      path: "test",
+      channel: 1,
+      input,
+      output,
+      signal: controller.signal,
+      createRuntime: () =>
+        Promise.resolve({
+          node,
+          start: async () => {
+            reportStart();
+            await startReleased;
+          },
+          ready: ready(1),
+        }),
+    });
+    await startEntered;
+
+    controller.abort(new Error("startup cancelled"));
+
+    try {
+      await expect(serving).rejects.toThrow("startup cancelled");
+      expect(close).toHaveBeenCalled();
+    } finally {
+      clearTimeout(safetyRelease);
+    }
+  });
+
   it("reports safe ready metadata and carries typed bytes as base64", async () => {
     const input = new PassThrough();
     const output = new PassThrough();

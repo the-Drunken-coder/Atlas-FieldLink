@@ -486,15 +486,22 @@ describe("MeshCore transport", () => {
   it("fails preflight on unsupported firmware and reports disconnects", async () => {
     const connection = new FakeConnection();
     connection.firmwareCode = 11;
+    const onFatalError = vi.fn();
     const transport = new MeshCoreTransport("/dev/cu.test", {
       channel: 2,
       connection,
+      onFatalError,
     });
     await transport.open();
     await expect(transport.getIdentity()).rejects.toThrow(
       "require 12 or newer",
     );
     connection.emit("disconnected");
+    await vi.waitFor(() => {
+      expect(onFatalError).toHaveBeenCalledWith(
+        expect.objectContaining({ message: "/dev/cu.test disconnected" }),
+      );
+    });
     await expect(transport.getQueueLength()).rejects.toThrow("unavailable");
     await expect(transport.close()).rejects.toThrow("Could not cleanly close");
   });
