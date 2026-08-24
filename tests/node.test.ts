@@ -288,12 +288,104 @@ describe("FieldLinkNode delivery", () => {
       destination: nodeB,
       signal: controller.signal,
     });
+    const rejected = expect(sending).rejects.toThrow(
+      "completion wait cancelled",
+    );
     await eventually(() => completionDropped);
 
     controller.abort(new Error("completion wait cancelled"));
 
-    await expect(sending).rejects.toThrow("completion wait cancelled");
+    await rejected;
     await Promise.all([a.close(), b.close()]);
+  });
+
+  it("does not let an aborted cancellation wait on the MeshCore queue", async () => {
+    const transport = new MemoryTransport();
+    transport.queueLength = 1;
+    const node = new FieldLinkNode({ nodeId: nodeA, transport });
+    const controller = new AbortController();
+    const sending = node.send(test("response", 200), {
+      destination: nodeB,
+      signal: controller.signal,
+    });
+    const rejected = expect(sending).rejects.toThrow("queue wait cancelled");
+    await eventually(() => transport.queueLengths.length > 0);
+
+    controller.abort(new Error("queue wait cancelled"));
+
+    await rejected;
+    await node.close();
+  });
+
+  it("isolates synchronous message and event listener failures", async () => {
+    const [transportA, transportB] = memoryTransportPair();
+    const a = new FieldLinkNode({
+      nodeId: nodeA,
+      transport: transportA,
+      retryTimeoutMs: 20,
+    });
+    const b = new FieldLinkNode({
+      nodeId: nodeB,
+      transport: transportB,
+      retryTimeoutMs: 20,
+    });
+    a.onEvent(() => {
+      throw new Error("event listener failed");
+    });
+    b.onMessage(() => {
+      throw new Error("message listener failed");
+    });
+
+    await expect(
+      a.send(test("response", 200), { destination: nodeB }),
+    ).resolves.toMatchObject({ delivery: "transfer" });
+    await Promise.all([a.close(), b.close()]);
+  });
+
+  it("ignores transfer control from a node other than the destination", async () => {
+    const transport = new MemoryTransport();
+    const node = new FieldLinkNode({
+      nodeId: nodeA,
+      transport,
+      retryTimeoutMs: 1000,
+    });
+    const controller = new AbortController();
+    const sending = node
+      .send(test("response", 200), {
+        destination: nodeB,
+        signal: controller.signal,
+      })
+      .catch(() => undefined);
+    await eventually(() => transport.sent.length > 0);
+    const startBytes = transport.sent[0];
+    if (startBytes === undefined) {
+      throw new Error("Expected transfer start bytes");
+    }
+    const start = decodeFrame(startBytes);
+    if (start.kind !== FrameKind.transferStart) {
+      throw new Error("Expected transfer start");
+    }
+
+    transport.inject({
+      bytes: encodeFrame({
+        transmissionId: 99,
+        kind: FrameKind.transferReady,
+        source: elsewhere,
+        destination: nodeA,
+        logicalId: start.logicalId,
+      }),
+    });
+    await transport.settle();
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+
+    expect(
+      transport.sent.some(
+        (bytes) => decodeFrame(bytes).kind === FrameKind.fragment,
+      ),
+    ).toBe(false);
+    controller.abort(new Error("done"));
+    await sending;
+    await node.close();
   });
 
   it("lets a high-priority complete message preempt a bulk repair", async () => {

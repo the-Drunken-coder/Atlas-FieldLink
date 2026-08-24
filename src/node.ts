@@ -360,7 +360,7 @@ export class FieldLinkNode {
     );
     const digest = createHash("sha256").update(options.body).digest();
     const key = logicalIdHex(options.logicalId);
-    const signals = new OutboundSignals();
+    const signals = new OutboundSignals(options.destination);
     this.#outbound.set(key, signals);
     const base = {
       source: this.nodeId,
@@ -462,7 +462,7 @@ export class FieldLinkNode {
         await this.#submit(
           { ...base, kind: FrameKind.cancellation, code: 1 },
           "high",
-          undefined,
+          options.signal,
         ).catch(() => undefined);
       }
       throw failure;
@@ -833,7 +833,7 @@ export class FieldLinkNode {
   ): void {
     const key = logicalIdHex(frame.logicalId);
     const signals = this.#outbound.get(key);
-    if (signals === undefined || frame.source === this.nodeId) {
+    if (signals === undefined || frame.source !== signals.expectedSource) {
       return;
     }
     switch (frame.kind) {
@@ -890,11 +890,13 @@ export class FieldLinkNode {
       ...(snrDb === undefined ? {} : { snrDb }),
     };
     for (const listener of this.#messageListeners) {
-      void Promise.resolve(listener(received)).catch((error: unknown) => {
-        this.#protocolError(
-          `Message listener failed: ${asError(error).message}`,
-        );
-      });
+      void Promise.resolve()
+        .then(() => listener(received))
+        .catch((error: unknown) => {
+          this.#protocolError(
+            `Message listener failed: ${asError(error).message}`,
+          );
+        });
     }
     this.#emit({
       type: "message-received",
@@ -907,26 +909,28 @@ export class FieldLinkNode {
       ...(snrDb === undefined ? {} : { snrDb }),
     });
     if (definition.onMessage !== undefined) {
-      void Promise.resolve(
-        definition.onMessage(message, {
-          source,
-          destination,
-          receivedAt,
-          reply: async (reply, priority) => {
-            await this.send(reply as SupportedMessage, {
-              destination: source,
-              ...(priority === undefined ? {} : { priority }),
-            });
-          },
-        }),
-      ).catch((error: unknown) => {
-        this.#protocolError(
-          `Message handler failed: ${asError(error).message}`,
-          {
-            logicalId: received.logicalId,
-          },
-        );
-      });
+      void Promise.resolve()
+        .then(() =>
+          definition.onMessage?.(message, {
+            source,
+            destination,
+            receivedAt,
+            reply: async (reply, priority) => {
+              await this.send(reply as SupportedMessage, {
+                destination: source,
+                ...(priority === undefined ? {} : { priority }),
+              });
+            },
+          }),
+        )
+        .catch((error: unknown) => {
+          this.#protocolError(
+            `Message handler failed: ${asError(error).message}`,
+            {
+              logicalId: received.logicalId,
+            },
+          );
+        });
     }
   }
 
@@ -985,7 +989,9 @@ export class FieldLinkNode {
 
   #emit(event: FieldLinkEvent): void {
     for (const listener of this.#eventListeners) {
-      void Promise.resolve(listener(event)).catch(() => undefined);
+      void Promise.resolve()
+        .then(() => listener(event))
+        .catch(() => undefined);
     }
   }
 
@@ -1148,12 +1154,17 @@ class FrameScheduler {
 }
 
 class OutboundSignals {
+  readonly expectedSource: NodeId;
   #ready = false;
   #completed = false;
   #failure: Error | undefined;
   readonly #receiptSequences = new Map<number, number>();
   readonly #receiptBitmaps = new Map<number, number>();
   readonly #waiters = new Set<() => void>();
+
+  constructor(expectedSource: NodeId) {
+    this.expectedSource = expectedSource;
+  }
 
   ready(): void {
     this.#ready = true;

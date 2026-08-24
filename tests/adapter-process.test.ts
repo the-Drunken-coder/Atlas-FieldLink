@@ -248,6 +248,28 @@ describe("adapter process proxy", () => {
     await adapter.close();
   });
 
+  it("isolates a synchronous proxy listener failure", async () => {
+    const listenerErrors: Error[] = [];
+    const adapter = await AdapterProcessNode.start({
+      path: "test",
+      channel: 1,
+      allowInboxDrain: true,
+      onListenerError: (error) => {
+        listenerErrors.push(error);
+      },
+      program: nodeScript(listenerFailureChildScript()),
+    });
+    adapter.onEvent(() => {
+      throw new Error("proxy listener failed");
+    });
+
+    await adapter.activate();
+    await eventually(() => listenerErrors.length === 1);
+
+    expect(listenerErrors[0]?.message).toBe("proxy listener failed");
+    await expect(adapter.close()).resolves.toBeUndefined();
+  });
+
   it("reaps an adapter that fails before readiness", async () => {
     await expect(
       AdapterProcessNode.start({
@@ -619,6 +641,13 @@ function cooperativeChildScript(): string {
 let pending="";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="activate"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n");}else if(request.type==="send"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true,result:{logicalId:"0000000000000001",messageType:1,messageName:"test",destination:request.destination,priority:"normal",delivery:"complete",encodedBytes:7,fragments:1,retransmissions:0,receipts:0,durationMs:1}})+"\\n");}else if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}}});`;
+}
+
+function listenerFailureChildScript(): string {
+  return `${writeReady()}
+let pending="";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="activate"){const response=JSON.stringify({type:"response",id:request.id,ok:true});const event=JSON.stringify({type:"event",event:{type:"protocol-error",at:"2026-08-24T12:00:00.000Z",message:"test"}});process.stdout.write(response+"\\n"+event+"\\n");}else if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}}});`;
 }
 
 function closedStdoutChildScript(): string {

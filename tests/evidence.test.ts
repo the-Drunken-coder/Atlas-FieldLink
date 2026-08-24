@@ -111,6 +111,33 @@ describe("test evidence", () => {
     }
   });
 
+  it("keeps the running summary when its atomic replacement fails", async () => {
+    const temporary = await mkdtemp(join(tmpdir(), "fieldlink-evidence-"));
+    const probe = await open(join(temporary, "probe"), "w");
+    const prototype = Object.getPrototypeOf(probe) as {
+      writeFile: FileHandle["writeFile"];
+    };
+    await probe.close();
+    const writeFile = vi
+      .spyOn(prototype, "writeFile")
+      .mockRejectedValueOnce(new Error("disk full"));
+    try {
+      const artifacts = await TestArtifacts.create(
+        manifest,
+        join(temporary, "run"),
+      );
+      await expect(artifacts.finish({ status: "failed" })).rejects.toThrow(
+        "Could not finish test artifacts",
+      );
+      expect(
+        JSON.parse(await readFile(artifacts.paths.summary, "utf8")),
+      ).toMatchObject({ status: "running" });
+    } finally {
+      writeFile.mockRestore();
+      await rm(temporary, { recursive: true });
+    }
+  });
+
   it("downgrades a passing summary when event finalization fails", async () => {
     const temporary = await mkdtemp(join(tmpdir(), "fieldlink-evidence-"));
     const probe = await open(join(temporary, "probe"), "w");

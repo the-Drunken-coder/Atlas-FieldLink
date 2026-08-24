@@ -798,21 +798,21 @@ export class AdapterProcessNode {
                 receivedAt: new Date(message.message.receivedAt),
               };
               for (const listener of this.#messageListeners) {
-                void Promise.resolve(listener(received)).catch(
-                  async (error: unknown) => {
+                void Promise.resolve()
+                  .then(() => listener(received))
+                  .catch(async (error: unknown) => {
                     await options.onListenerError?.(asError(error));
-                  },
-                );
+                  });
               }
               break;
             }
             case "event":
               for (const listener of this.#eventListeners) {
-                void Promise.resolve(listener(message.event)).catch(
-                  async (error: unknown) => {
+                void Promise.resolve()
+                  .then(() => listener(message.event))
+                  .catch(async (error: unknown) => {
                     await options.onListenerError?.(asError(error));
-                  },
-                );
+                  });
               }
               break;
             case "inbox-message":

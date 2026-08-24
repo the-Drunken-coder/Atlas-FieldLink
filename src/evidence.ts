@@ -1,4 +1,11 @@
-import { mkdir, open, writeFile, type FileHandle } from "node:fs/promises";
+import {
+  mkdir,
+  open,
+  rename,
+  unlink,
+  writeFile,
+  type FileHandle,
+} from "node:fs/promises";
 import { resolve } from "node:path";
 
 import type { TestCommand } from "./args.js";
@@ -206,16 +213,34 @@ export class TestArtifacts {
         errors.length === 0
           ? summary
           : failedFinalizationSummary(summary, errors);
-      await writeFile(this.paths.summary, `${stringify(finalSummary, 2)}\n`, {
-        encoding: "utf8",
-        flag: "w",
-      });
+      await replaceFileAtomically(
+        this.paths.summary,
+        `${stringify(finalSummary, 2)}\n`,
+      );
     } catch (error: unknown) {
       errors.push(asError(error));
     }
     if (errors.length > 0) {
       throw new AggregateError(errors, "Could not finish test artifacts");
     }
+  }
+}
+
+async function replaceFileAtomically(
+  path: string,
+  contents: string,
+): Promise<void> {
+  const temporary = `${path}.tmp`;
+  const handle = await open(temporary, "wx");
+  try {
+    await handle.writeFile(contents, "utf8");
+    await handle.sync();
+    await handle.close();
+    await rename(temporary, path);
+  } catch (error: unknown) {
+    await handle.close().catch(() => undefined);
+    await unlink(temporary).catch(() => undefined);
+    throw error;
   }
 }
 
