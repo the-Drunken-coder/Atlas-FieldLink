@@ -22,6 +22,7 @@ describe("NDJSON adapter server", () => {
     const transport = new MemoryTransport();
     const node = new FieldLinkNode({ nodeId: nodeB, transport });
     let started = false;
+    let activated = false;
     const reader = lineReader(output);
     const serving = serveAdapter({
       path: "/dev/cu.test",
@@ -34,6 +35,10 @@ describe("NDJSON adapter server", () => {
           node,
           start: () => {
             started = true;
+            return Promise.resolve();
+          },
+          activate: () => {
+            activated = true;
             return Promise.resolve();
           },
           ready: ready(123),
@@ -49,6 +54,17 @@ describe("NDJSON adapter server", () => {
     input.write(
       `${JSON.stringify({
         id: 1,
+        type: "activate",
+      })}\n`,
+    );
+    expect(await reader.nextType("response")).toMatchObject({
+      id: 1,
+      ok: true,
+    });
+    expect(activated).toBe(true);
+    input.write(
+      `${JSON.stringify({
+        id: 2,
         type: "send",
         message: {
           type: "test",
@@ -60,7 +76,7 @@ describe("NDJSON adapter server", () => {
       })}\n`,
     );
     expect(await reader.nextType("response")).toMatchObject({
-      id: 1,
+      id: 2,
       ok: true,
       result: { delivery: "complete", encodedBytes: 7 },
     });
@@ -92,9 +108,9 @@ describe("NDJSON adapter server", () => {
         },
       },
     });
-    input.write(`${JSON.stringify({ id: 2, type: "close" })}\n`);
+    input.write(`${JSON.stringify({ id: 3, type: "close" })}\n`);
     expect(await reader.nextType("response")).toMatchObject({
-      id: 2,
+      id: 3,
       ok: true,
     });
     input.end();
@@ -142,6 +158,7 @@ describe("adapter process proxy", () => {
       allowInboxDrain: true,
       program: nodeScript(cooperativeChildScript()),
     });
+    await adapter.activate();
     const result = await adapter.send(
       {
         type: "test",
@@ -170,6 +187,7 @@ describe("adapter process proxy", () => {
     adapter.onMessage((message) => {
       messages.push(message);
     });
+    await adapter.activate();
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     expect(adapter.channel.index).toBe(39);
@@ -212,9 +230,10 @@ describe("adapter process proxy", () => {
       channel: 1,
       allowInboxDrain: true,
       program: nodeScript(
-        `${writeReady()} process.stdin.once("data",()=>process.exit(7));`,
+        `${writeReady()} ${activateThen("process.exit(7);")}`,
       ),
     });
+    await adapter.activate();
     await expect(
       adapter.send(
         {
@@ -230,13 +249,14 @@ describe("adapter process proxy", () => {
 
   it("drains the final response before treating child exit as failure", async () => {
     const script = `${writeReady()}
-process.stdin.once("data",chunk=>{const request=JSON.parse(String(chunk).trim());const response={type:"response",id:request.id,ok:true,result:{logicalId:"0000000000000001",messageType:1,messageName:"test",destination:request.destination,priority:"normal",delivery:"complete",encodedBytes:5,fragments:1,retransmissions:0,receipts:0,durationMs:1}};process.stdout.write(JSON.stringify(response)+"\\n",()=>process.exit(0));});`;
+${activateThen('const response={type:"response",id:request.id,ok:true,result:{logicalId:"0000000000000001",messageType:1,messageName:"test",destination:request.destination,priority:"normal",delivery:"complete",encodedBytes:5,fragments:1,retransmissions:0,receipts:0,durationMs:1}};process.stdout.write(JSON.stringify(response)+"\\n",()=>process.exit(0));')}`;
     const adapter = await AdapterProcessNode.start({
       path: "test",
       channel: 1,
       allowInboxDrain: true,
       program: nodeScript(script),
     });
+    await adapter.activate();
     await expect(
       adapter.send(
         {
@@ -257,6 +277,7 @@ process.stdin.once("data",chunk=>{const request=JSON.parse(String(chunk).trim())
       allowInboxDrain: true,
       program: nodeScript(abortChildScript()),
     });
+    await aborting.activate();
     const controller = new AbortController();
     const send = aborting.send(
       {
@@ -277,9 +298,10 @@ process.stdin.once("data",chunk=>{const request=JSON.parse(String(chunk).trim())
       allowInboxDrain: true,
       requestTimeoutMs: 10,
       program: nodeScript(
-        `${writeReady()} process.stdin.on("end",()=>process.exit(0)); process.stdin.resume();`,
+        `${writeReady()} ${activateThen("")} process.stdin.on("end",()=>process.exit(0)); process.stdin.resume();`,
       ),
     });
+    await timingOut.activate();
     await expect(
       timingOut.send(
         {
@@ -292,6 +314,21 @@ process.stdin.once("data",chunk=>{const request=JSON.parse(String(chunk).trim())
       ),
     ).rejects.toThrow("timed out");
     await expect(timingOut.close()).rejects.toThrow("timed out");
+  });
+
+  it("force-stops and reaps an adapter that ignores termination", async () => {
+    const adapter = await AdapterProcessNode.start({
+      path: "test",
+      channel: 1,
+      allowInboxDrain: true,
+      exitTimeoutMs: 10,
+      program: nodeScript(uncooperativeCloseChildScript()),
+    });
+    await adapter.activate();
+
+    await expect(adapter.close()).rejects.toThrow(
+      "adapter process exit and stdout drain",
+    );
   });
 
   it("removes controller-only execution flags from child arguments", () => {
@@ -408,7 +445,7 @@ function preReadyEvidenceChildScript(): string {
     },
   };
   return `process.stdout.write(${JSON.stringify(`${JSON.stringify(inbox)}\n${JSON.stringify(stale)}\n${JSON.stringify({ type: "ready", ...ready(999, 39) })}\n`)});
-process.stdin.on("data",chunk=>{const request=JSON.parse(String(chunk).trim());if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}});`;
+${activateThen('if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}')}`;
 }
 
 function closeWithBufferedInboxChildScript(): string {
@@ -432,12 +469,25 @@ function cooperativeChildScript(): string {
   return `${writeReady()}
 let pending="";
 process.stdin.setEncoding("utf8");
-process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="send"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true,result:{logicalId:"0000000000000001",messageType:1,messageName:"test",destination:request.destination,priority:"normal",delivery:"complete",encodedBytes:7,fragments:1,retransmissions:0,receipts:0,durationMs:1}})+"\\n");}else if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}}});`;
+process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="activate"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n");}else if(request.type==="send"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true,result:{logicalId:"0000000000000001",messageType:1,messageName:"test",destination:request.destination,priority:"normal",delivery:"complete",encodedBytes:7,fragments:1,retransmissions:0,receipts:0,durationMs:1}})+"\\n");}else if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}}});`;
 }
 
 function abortChildScript(): string {
   return `${writeReady()}
 let pending="",sendId;
 process.stdin.setEncoding("utf8");
-process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="send"){sendId=request.id;}else if(request.type==="abort"){process.stdout.write(JSON.stringify({type:"response",id:sendId,ok:false,error:"Adapter request aborted"})+"\\n");}else if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}}});`;
+process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="activate"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n");}else if(request.type==="send"){sendId=request.id;}else if(request.type==="abort"){process.stdout.write(JSON.stringify({type:"response",id:sendId,ok:false,error:"Adapter request aborted"})+"\\n");}else if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}}});`;
+}
+
+function activateThen(next: string): string {
+  return `let pending="";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="activate"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n");}else{${next}}}});`;
+}
+
+function uncooperativeCloseChildScript(): string {
+  return `${writeReady()}
+${activateThen('if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n");}')}
+process.on("SIGTERM",()=>{});
+setInterval(()=>{},1000);`;
 }

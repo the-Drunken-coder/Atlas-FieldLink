@@ -528,6 +528,47 @@ describe("inbound transfer validation", () => {
     await node.close();
   });
 
+  it("releases invalid inbound state before a rejection send can fail", async () => {
+    const transport = new FailsRejectionTransport();
+    const node = new FieldLinkNode({ nodeId: nodeB, transport });
+    const messages: ReceivedMessage[] = [];
+    node.onMessage((message) => {
+      messages.push(message);
+    });
+
+    for (let id = 30n; id < 34n; id += 1n) {
+      const invalid = transferFrames(
+        id,
+        testMessage.encode(test("response", 200)),
+        1,
+      );
+      transport.inject({
+        bytes: encodeFrame({
+          ...invalid.start,
+          digest: new Uint8Array(32),
+        }),
+      });
+      for (const fragment of invalid.fragments) {
+        transport.inject({ bytes: encodeFrame(fragment) });
+      }
+    }
+    const valid = transferFrames(
+      40n,
+      testMessage.encode(test("response", 200)),
+      1,
+    );
+    transport.inject({ bytes: encodeFrame(valid.start) });
+    for (const fragment of valid.fragments) {
+      transport.inject({ bytes: encodeFrame(fragment) });
+    }
+
+    await transport.settle();
+    await eventually(() => messages.length === 1);
+    expect(transport.rejectionFailures).toBe(4);
+    expect(messages[0]?.message).toEqual(test("response", 200));
+    await node.close();
+  });
+
   it("bounds pending sends at 64", async () => {
     const transport = new MemoryTransport();
     transport.queueLength = 1;
@@ -579,6 +620,18 @@ class FailsFirstCompletionTransport extends MemoryTransport {
     ) {
       this.failedCompletion = true;
       return Promise.reject(new Error("completion send failed"));
+    }
+    return super.send(bytes);
+  }
+}
+
+class FailsRejectionTransport extends MemoryTransport {
+  rejectionFailures = 0;
+
+  override send(bytes: Uint8Array): Promise<void> {
+    if (decodeFrame(bytes).kind === FrameKind.rejection) {
+      this.rejectionFailures += 1;
+      return Promise.reject(new Error("rejection send failed"));
     }
     return super.send(bytes);
   }

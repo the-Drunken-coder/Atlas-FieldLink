@@ -691,8 +691,8 @@ export class FieldLinkNode {
     } else {
       const existing = transfer.bytes.slice(offset, offset + expectedLength);
       if (!Buffer.from(existing).equals(frame.body)) {
-        await this.#reject(frame, 6, "Duplicate fragment bytes differ");
         this.#inbound.delete(key);
+        await this.#reject(frame, 6, "Duplicate fragment bytes differ");
       }
       return;
     }
@@ -702,22 +702,22 @@ export class FieldLinkNode {
 
     const digest = createHash("sha256").update(transfer.bytes).digest();
     if (!Buffer.from(digest).equals(transfer.digest)) {
-      await this.#reject(frame, 5, "Transfer digest does not match");
       this.#inbound.delete(key);
+      await this.#reject(frame, 5, "Transfer digest does not match");
       return;
     }
     const definition = definitionForType(transfer.messageType);
     if (definition === undefined) {
-      await this.#reject(frame, 1, "Message type disappeared from registry");
       this.#inbound.delete(key);
+      await this.#reject(frame, 1, "Message type disappeared from registry");
       return;
     }
     let message: SupportedMessage;
     try {
       message = definition.decode(transfer.bytes);
     } catch (error: unknown) {
-      await this.#reject(frame, 7, asError(error).message);
       this.#inbound.delete(key);
+      await this.#reject(frame, 7, asError(error).message);
       return;
     }
     this.#inbound.set(key, {

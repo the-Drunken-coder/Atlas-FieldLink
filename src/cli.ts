@@ -164,6 +164,7 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
       record,
     );
     verifyPreflight(a, b);
+    await Promise.all([a.activate(), b.activate()]);
     record("ready", {
       a: adapterEvidence(a, command.a),
       b: adapterEvidence(b, command.b),

@@ -64,6 +64,7 @@ interface AdapterRuntime {
   readonly node: FieldLinkNode;
   readonly ready: AdapterReady;
   readonly start?: () => Promise<void>;
+  readonly activate?: () => Promise<void>;
 }
 
 interface RuntimeFactoryOptions {
@@ -87,6 +88,7 @@ type AdapterRequest =
       readonly priority?: Priority;
       readonly retryStrategy?: RetryStrategyName;
     }
+  | { readonly id: number; readonly type: "activate" }
   | { readonly id: number; readonly type: "abort"; readonly targetId: number }
   | { readonly id: number; readonly type: "close" };
 
@@ -143,6 +145,7 @@ export async function serveAdapter(
   let nextRequest = requests.next();
   const active = new Map<number, AbortController>();
   const activeOperations = new Map<number, Promise<void>>();
+  let activated = false;
   let closing = false;
   const stopReading = (): void => {
     lines.close();
@@ -172,6 +175,21 @@ export async function serveAdapter(
         continue;
       }
       const request = parseAdapterRequest(line);
+      if (request.type === "activate") {
+        try {
+          await runtime.activate?.();
+          activated = true;
+          await writer.write({ type: "response", id: request.id, ok: true });
+        } catch (error: unknown) {
+          await writer.write({
+            type: "response",
+            id: request.id,
+            ok: false,
+            error: asError(error).message,
+          });
+        }
+        continue;
+      }
       if (request.type === "abort") {
         active
           .get(request.targetId)
@@ -188,6 +206,15 @@ export async function serveAdapter(
         await runtime.node.close();
         await writer.write({ type: "response", id: request.id, ok: true });
         break;
+      }
+      if (!activated) {
+        await writer.write({
+          type: "response",
+          id: request.id,
+          ok: false,
+          error: "Adapter is not activated",
+        });
+        continue;
       }
 
       const controller = new AbortController();
@@ -265,7 +292,8 @@ async function createDefaultRuntime(
     });
     return {
       node,
-      start: () => transport.startInbox(),
+      start: () => transport.startInbox({ deliverDatagrams: false }),
+      activate: () => transport.enableDatagramDelivery(),
       ready: {
         processId: options.processId,
         identity: safeRadioIdentity(identity),
@@ -333,6 +361,7 @@ export interface StartAdapterProcessOptions {
   readonly onStderr?: (message: string) => void;
   readonly onStderrEnd?: () => void;
   readonly requestTimeoutMs?: number;
+  readonly exitTimeoutMs?: number;
 }
 
 interface PendingRequest {
@@ -353,6 +382,7 @@ export class AdapterProcessNode {
   readonly delivery: AdapterReady["delivery"];
   readonly #child: ChildProcessWithoutNullStreams;
   readonly #requestTimeoutMs: number;
+  readonly #exitTimeoutMs: number;
   readonly #pending = new Map<number, PendingRequest>();
   readonly #messageListeners = new Set<
     (message: ReceivedMessage) => void | Promise<void>
@@ -362,6 +392,8 @@ export class AdapterProcessNode {
   >();
   #nextRequestId = 1;
   #failure: Error | undefined;
+  #activation: Promise<void> | undefined;
+  #activated = false;
   #closed = false;
   #exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   #readerDone: Promise<void> = Promise.resolve();
@@ -374,6 +406,7 @@ export class AdapterProcessNode {
   ) {
     this.#child = child;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+    this.#exitTimeoutMs = options.exitTimeoutMs ?? EXIT_TIMEOUT_MS;
     this.#exit = exit;
     this.processId = ready.processId;
     this.identity = ready.identity;
@@ -474,7 +507,22 @@ export class AdapterProcessNode {
     return node;
   }
 
+  activate(): Promise<void> {
+    if (this.#activation !== undefined) {
+      return this.#activation;
+    }
+    this.#activation = this.#request({ type: "activate" }, undefined).then(
+      () => {
+        this.#activated = true;
+      },
+    );
+    return this.#activation;
+  }
+
   send(message: SupportedMessage, options: SendOptions): Promise<SendResult> {
+    if (!this.#activated) {
+      return Promise.reject(new Error("Adapter is not activated"));
+    }
     return this.#request(
       {
         type: "send",
@@ -520,31 +568,55 @@ export class AdapterProcessNode {
       return;
     }
     this.#closed = true;
-    let closeError: Error | undefined;
+    const closeErrors: Error[] = [];
     try {
       await this.#request({ type: "close" }, undefined);
     } catch (error: unknown) {
-      closeError = asError(error);
+      closeErrors.push(asError(error));
     }
     this.#child.stdin.end();
+    const reaped = Promise.all([this.#exit, this.#readerDone]);
     try {
       await withTimeout(
-        Promise.all([this.#exit, this.#readerDone]),
-        EXIT_TIMEOUT_MS,
+        reaped,
+        this.#exitTimeoutMs,
         "adapter process exit and stdout drain",
       );
     } catch (error: unknown) {
+      closeErrors.push(asError(error));
       this.#child.kill("SIGTERM");
-      closeError ??= asError(error);
+      try {
+        await withTimeout(
+          reaped,
+          this.#exitTimeoutMs,
+          "adapter process termination",
+        );
+      } catch {
+        this.#child.kill("SIGKILL");
+        try {
+          await withTimeout(
+            reaped,
+            this.#exitTimeoutMs,
+            "adapter process kill",
+          );
+        } catch (killError: unknown) {
+          closeErrors.push(asError(killError));
+        }
+      }
+    }
+    const [closeError] = closeErrors;
+    if (closeError !== undefined && closeErrors.length === 1) {
+      throw closeError;
     }
     if (closeError !== undefined) {
-      throw closeError;
+      throw new AggregateError(closeErrors, "Could not close adapter process");
     }
   }
 
   #request(
     operation:
       | Omit<Extract<AdapterRequest, { type: "send" }>, "id">
+      | Omit<Extract<AdapterRequest, { type: "activate" }>, "id">
       | Omit<Extract<AdapterRequest, { type: "close" }>, "id">
       | Omit<Extract<AdapterRequest, { type: "abort" }>, "id">,
     signal: AbortSignal | undefined,
@@ -721,6 +793,9 @@ function parseAdapterRequest(line: string): AdapterRequest {
   }
   if (value.type === "close") {
     return { type: "close", id: value.id };
+  }
+  if (value.type === "activate") {
+    return { type: "activate", id: value.id };
   }
   if (value.type === "abort" && isRequestId(value.targetId)) {
     return { type: "abort", id: value.id, targetId: value.targetId };

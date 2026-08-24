@@ -81,9 +81,44 @@ describe("test evidence", () => {
       ).rejects.toThrow("Could not finish test artifacts");
       expect(
         JSON.parse(await readFile(artifacts.paths.summary, "utf8")),
-      ).toEqual({ status: "failed", artifactError: "disk full" });
+      ).toEqual({
+        status: "failed",
+        artifactError: "disk full",
+        partial: true,
+      });
     } finally {
       appendFile.mockRestore();
+      await rm(temporary, { recursive: true });
+    }
+  });
+
+  it("downgrades a passing summary when event finalization fails", async () => {
+    const temporary = await mkdtemp(join(tmpdir(), "fieldlink-evidence-"));
+    const probe = await open(join(temporary, "probe"), "w");
+    const prototype = Object.getPrototypeOf(probe) as {
+      sync: FileHandle["sync"];
+    };
+    await probe.close();
+    const sync = vi
+      .spyOn(prototype, "sync")
+      .mockRejectedValueOnce(new Error("sync failed"));
+    try {
+      const artifacts = await TestArtifacts.create(
+        manifest,
+        join(temporary, "run"),
+      );
+      await expect(artifacts.finish({ status: "passed" })).rejects.toThrow(
+        "Could not finish test artifacts",
+      );
+      expect(
+        JSON.parse(await readFile(artifacts.paths.summary, "utf8")),
+      ).toEqual({
+        status: "failed",
+        partial: true,
+        artifactError: "sync failed",
+      });
+    } finally {
+      sync.mockRestore();
       await rm(temporary, { recursive: true });
     }
   });

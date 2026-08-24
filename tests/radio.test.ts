@@ -368,6 +368,47 @@ describe("MeshCore transport", () => {
     await transport.close();
   });
 
+  it("quarantines startup datagrams until delivery is explicitly enabled", async () => {
+    const connection = new FakeConnection();
+    const datagram = (byte: number): InboxMessage => ({
+      channelData: {
+        channelIdx: 2,
+        dataType: FIELDLINK_DATA_TYPE,
+        snr: -4,
+        pathLen: 3,
+        dataLen: 1,
+        data: Uint8Array.of(byte),
+      },
+    });
+    const startup = datagram(1);
+    const live = datagram(2);
+    connection.messages.push(startup, null);
+    const consumed: InboxMessage[] = [];
+    const delivered: Uint8Array[] = [];
+    const transport = new MeshCoreTransport("/dev/cu.test", {
+      channel: 2,
+      connection,
+      onInboxMessage: (message) => {
+        consumed.push(message);
+      },
+    });
+    await transport.open();
+    transport.onDatagram((message) => {
+      delivered.push(message.bytes);
+    });
+
+    await transport.startInbox({ deliverDatagrams: false });
+    expect(consumed).toEqual([startup]);
+    expect(delivered).toEqual([]);
+    await transport.enableDatagramDelivery();
+    connection.messages.push(live, null);
+    await transport.flushInbox();
+
+    expect(consumed).toEqual([startup, live]);
+    expect(delivered).toEqual([Uint8Array.of(2)]);
+    await transport.close();
+  });
+
   it("forces another drain pass when an explicit flush joins an active drain", async () => {
     const connection = new FakeConnection();
     let releaseFirst: ((message: InboxMessage | null) => void) | undefined;

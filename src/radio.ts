@@ -181,6 +181,7 @@ export class MeshCoreTransport implements FieldLinkTransport {
   #drainRequestSequence = 0;
   #open = false;
   #inboxActive = false;
+  #datagramDeliveryEnabled = true;
   #closing = false;
   #lifecycleGeneration = 0;
   #pollTimer: ReturnType<typeof setInterval> | undefined;
@@ -239,11 +240,14 @@ export class MeshCoreTransport implements FieldLinkTransport {
     this.#connection.on("error", this.#transportErrorListener);
   }
 
-  async startInbox(): Promise<void> {
+  async startInbox(options?: {
+    readonly deliverDatagrams?: boolean;
+  }): Promise<void> {
     this.#throwIfUnavailable();
     if (this.#inboxActive) {
       return;
     }
+    this.#datagramDeliveryEnabled = options?.deliverDatagrams ?? true;
     this.#inboxActive = true;
     this.#connection.on(
       Constants.PushCodes.MsgWaiting,
@@ -254,6 +258,15 @@ export class MeshCoreTransport implements FieldLinkTransport {
     }, INBOX_POLL_INTERVAL_MS);
     this.#pollTimer.unref();
     await this.flushInbox();
+  }
+
+  async enableDatagramDelivery(): Promise<void> {
+    this.#throwIfUnavailable();
+    if (!this.#inboxActive) {
+      throw new Error(`${this.#path} inbox is not active`);
+    }
+    await this.flushInbox();
+    this.#datagramDeliveryEnabled = true;
   }
 
   async close(): Promise<void> {
@@ -470,7 +483,8 @@ export class MeshCoreTransport implements FieldLinkTransport {
         const data = waitingMessage.channelData;
         if (
           data.channelIdx !== this.#channel ||
-          data.dataType !== FIELDLINK_DATA_TYPE
+          data.dataType !== FIELDLINK_DATA_TYPE ||
+          !this.#datagramDeliveryEnabled
         ) {
           continue;
         }

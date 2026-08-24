@@ -128,7 +128,11 @@ export class TestArtifacts {
       errors.push(asError(error));
     }
     try {
-      await writeFile(this.paths.summary, `${stringify(summary, 2)}\n`, {
+      const finalSummary =
+        errors.length === 0
+          ? summary
+          : failedFinalizationSummary(summary, errors);
+      await writeFile(this.paths.summary, `${stringify(finalSummary, 2)}\n`, {
         encoding: "utf8",
         flag: "w",
       });
@@ -139,6 +143,25 @@ export class TestArtifacts {
       throw new AggregateError(errors, "Could not finish test artifacts");
     }
   }
+}
+
+function failedFinalizationSummary(
+  summary: unknown,
+  errors: readonly Error[],
+): Record<string, unknown> {
+  const base = isRecord(summary) ? summary : { summary };
+  const artifactError = [
+    ...(typeof base.artifactError === "string" ? [base.artifactError] : []),
+    ...errors.map((error) => error.message),
+  ]
+    .filter((message, index, messages) => messages.indexOf(message) === index)
+    .join("; ");
+  return {
+    ...base,
+    status: "failed",
+    partial: true,
+    artifactError,
+  };
 }
 
 function stringify(value: unknown, spaces?: number): string {
@@ -159,4 +182,8 @@ function stringify(value: unknown, spaces?: number): string {
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
