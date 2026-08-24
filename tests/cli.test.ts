@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { AdapterProcessNode } from "../src/adapter-process.js";
 import {
   buildMessageCatalog,
   main,
@@ -68,6 +69,63 @@ describe("CLI message catalog", () => {
 });
 
 describe("CLI message exercise", () => {
+  it("cancels sibling startup when one adapter fails", async () => {
+    const artifacts = {
+      paths: {
+        directory: "test-artifacts",
+        manifest: "test-artifacts/manifest.json",
+        events: "test-artifacts/events.jsonl",
+        summary: "test-artifacts/summary.json",
+      },
+      record: () => Promise.resolve(),
+      flush: () => Promise.resolve(),
+      finish: () => Promise.resolve(),
+    } as unknown as TestArtifacts;
+    const create = vi
+      .spyOn(TestArtifacts, "create")
+      .mockResolvedValue(artifacts);
+    let siblingAborted = false;
+    const start = vi.spyOn(AdapterProcessNode, "start");
+    start.mockRejectedValueOnce(new Error("adapter A failed"));
+    start.mockImplementationOnce(
+      (options) =>
+        new Promise<AdapterProcessNode>((_resolve, reject) => {
+          const timeout = setTimeout(() => {
+            reject(new Error("sibling startup was not cancelled"));
+          }, 100);
+          const abort = (): void => {
+            siblingAborted = true;
+            clearTimeout(timeout);
+            reject(new Error("sibling startup cancelled"));
+          };
+          options.signal?.addEventListener("abort", abort, { once: true });
+          if (options.signal?.aborted === true) {
+            abort();
+          }
+        }),
+    );
+    try {
+      await expect(
+        main([
+          "test",
+          "--a",
+          "/dev/cu.a",
+          "--b",
+          "/dev/cu.b",
+          "--channel",
+          "1",
+          "--timeout-ms",
+          "1000",
+          "--allow-inbox-drain",
+        ]),
+      ).resolves.toBe(1);
+      expect(siblingAborted).toBe(true);
+    } finally {
+      start.mockRestore();
+      create.mockRestore();
+    }
+  });
+
   it("handles interruption while artifacts are being created", async () => {
     const initialListeners = process.listeners("SIGINT");
     const records: { readonly type: string; readonly data: unknown }[] = [];

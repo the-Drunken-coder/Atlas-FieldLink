@@ -134,6 +134,10 @@ export async function serveAdapter(
 ): Promise<void> {
   const writer = new WireWriter(options.output);
   const createRuntime = options.createRuntime ?? createDefaultRuntime;
+  const signal = options.signal;
+  if (isAborted(signal)) {
+    throw abortError(signal);
+  }
   const runtime = await createRuntime({
     path: options.path,
     channel: options.channel,
@@ -145,6 +149,18 @@ export async function serveAdapter(
     onListenerError: (error) =>
       writer.write({ type: "listener-error", error: error.message }),
   });
+  if (isAborted(signal)) {
+    const abort = abortError(signal);
+    try {
+      await runtime.node.close();
+    } catch (error: unknown) {
+      throw new AggregateError(
+        [abort, asError(error)],
+        "Adapter startup was aborted and runtime cleanup failed",
+      );
+    }
+    throw abort;
+  }
   const lines = createInterface({ input: options.input, crlfDelay: Infinity });
   const requests = lines[Symbol.asyncIterator]();
   let nextRequest = requests.next();
@@ -167,6 +183,9 @@ export async function serveAdapter(
   );
 
   try {
+    if (options.signal?.aborted === true) {
+      throw abortError(options.signal);
+    }
     await runtime.start?.();
     await writer.write({ type: "ready", ...runtime.ready });
     for (;;) {
@@ -703,6 +722,9 @@ export class AdapterProcessNode {
     if (this.#failure !== undefined) {
       return Promise.reject(this.#failure);
     }
+    if (this.#closed && operation.type !== "close") {
+      return Promise.reject(new Error("Adapter is closed"));
+    }
     if (signal?.aborted === true) {
       return Promise.reject(abortError(signal));
     }
@@ -1167,6 +1189,7 @@ export function filteredExecArguments(
     if (
       option === "--inspect" ||
       option === "--inspect-brk" ||
+      option === "--inspect-wait" ||
       option === "--watch"
     ) {
       continue;
@@ -1239,6 +1262,10 @@ function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error
     ? signal.reason
     : new Error("Operation aborted");
+}
+
+function isAborted(signal: AbortSignal | undefined): signal is AbortSignal {
+  return signal?.aborted === true;
 }
 
 function asError(error: unknown): Error {

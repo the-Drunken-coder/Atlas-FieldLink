@@ -1,6 +1,6 @@
 import { PassThrough } from "node:stream";
 import { createInterface } from "node:readline";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   AdapterProcessNode,
@@ -18,6 +18,42 @@ const nodeA = parseNodeId("aaaaaaaaaaaaaaaa");
 const nodeB = parseNodeId("bbbbbbbbbbbbbbbb");
 
 describe("NDJSON adapter server", () => {
+  it("closes a runtime created after startup cancellation", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const controller = new AbortController();
+    const node = new FieldLinkNode({
+      nodeId: nodeB,
+      transport: new MemoryTransport(),
+    });
+    const close = vi.spyOn(node, "close");
+    const start = vi.fn(() => Promise.resolve());
+    const runtime = { node, start, ready: ready(1) };
+    const runtimeCreated = new Promise<typeof runtime>((resolve) => {
+      controller.signal.addEventListener(
+        "abort",
+        () => {
+          resolve(runtime);
+        },
+        { once: true },
+      );
+    });
+    const serving = serveAdapter({
+      path: "test",
+      channel: 1,
+      input,
+      output,
+      signal: controller.signal,
+      createRuntime: () => runtimeCreated,
+    });
+
+    controller.abort(new Error("startup cancelled"));
+
+    await expect(serving).rejects.toThrow("startup cancelled");
+    expect(start).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
   it("reports safe ready metadata and carries typed bytes as base64", async () => {
     const input = new PassThrough();
     const output = new PassThrough();
@@ -487,7 +523,19 @@ ${activateThen('const response={type:"response",id:request.id,ok:true,result:{lo
     });
     await adapter.activate();
 
-    await expect(adapter.close()).rejects.toThrow("timed out after 10 ms");
+    const closing = adapter.close();
+    await expect(
+      adapter.send(
+        {
+          type: "test",
+          kind: "response",
+          correlationId: 1,
+          payload: new Uint8Array(),
+        },
+        { destination: nodeB },
+      ),
+    ).rejects.toThrow("Adapter is closed");
+    await expect(closing).rejects.toThrow("timed out after 10 ms");
   });
 
   it("returns the same cleanup result to concurrent close callers", async () => {
@@ -537,6 +585,8 @@ ${activateThen('const response={type:"response",id:request.id,ok:true,result:{lo
         "--import",
         "tsx",
         "--inspect=9229",
+        "--inspect-wait",
+        "--inspect-wait=9230",
         "--watch-path",
         "src",
         "--conditions=development",

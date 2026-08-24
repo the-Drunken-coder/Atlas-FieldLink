@@ -361,6 +361,8 @@ async function startAdapterPair(
   signal: AbortSignal,
   record: (type: string, data: unknown) => void,
 ): Promise<readonly [AdapterProcessNode, AdapterProcessNode]> {
+  const startupController = new AbortController();
+  const startupSignal = AbortSignal.any([signal, startupController.signal]);
   const options = (
     label: "A" | "B",
     path: string,
@@ -372,7 +374,7 @@ async function startAdapterPair(
       path,
       channel,
       allowInboxDrain: true,
-      signal,
+      signal: startupSignal,
       requestTimeoutMs: command.timeoutMs + ADAPTER_REQUEST_TIMEOUT_MARGIN_MS,
       onInboxMessage: (message) => {
         record("inbox-message", { radio: label, message });
@@ -389,9 +391,14 @@ async function startAdapterPair(
       },
     };
   };
+  const start = (label: "A" | "B", path: string): Promise<AdapterProcessNode> =>
+    AdapterProcessNode.start(options(label, path)).catch((error: unknown) => {
+      startupController.abort(asError(error));
+      throw error;
+    });
   const settled = await Promise.allSettled([
-    AdapterProcessNode.start(options("A", command.a)),
-    AdapterProcessNode.start(options("B", command.b)),
+    start("A", command.a),
+    start("B", command.b),
   ]);
   const [resultA, resultB] = settled;
   if (resultA.status === "fulfilled" && resultB.status === "fulfilled") {
