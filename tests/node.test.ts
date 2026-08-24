@@ -467,6 +467,22 @@ describe("FieldLinkNode delivery", () => {
     await node.close();
   });
 
+  it("accepts a sent frame before waiting to pace the next one", async () => {
+    const transport = new QueuesAfterSendTransport();
+    const node = new FieldLinkNode({ nodeId: nodeA, transport });
+    const controller = new AbortController();
+    const sending = node.send(test("response", 0), {
+      destination: nodeB,
+      signal: controller.signal,
+    });
+    await eventually(() => transport.sent.length === 1);
+
+    controller.abort(new Error("abort after acceptance"));
+
+    await expect(sending).resolves.toMatchObject({ delivery: "complete" });
+    await node.close();
+  });
+
   it("fails cleanly when every selective-window receipt is lost", async () => {
     const [transportA, transportB] = memoryTransportPair();
     transportB.drop = (bytes) => decodeFrame(bytes).kind === FrameKind.receipt;
@@ -964,6 +980,53 @@ describe("inbound transfer validation", () => {
     await node.close();
   });
 
+  it("releases an aborted send while it waits for the transfer slot", async () => {
+    const transport = new MemoryTransport();
+    transport.queueLength = 1;
+    const node = new FieldLinkNode({ nodeId: nodeA, transport });
+    const first = node
+      .send(test("response", 200), { destination: nodeB })
+      .catch(() => undefined);
+    await eventually(() => transport.queueLengths.length > 0);
+    const controller = new AbortController();
+    const second = node.send(test("response", 200), {
+      destination: nodeB,
+      signal: controller.signal,
+    });
+    const rejected = expect(second).rejects.toThrow("slot wait cancelled");
+
+    controller.abort(new Error("slot wait cancelled"));
+
+    await rejected;
+    await node.close();
+    await first;
+  });
+
+  it("removes an aborted frame queued behind an inbound response", async () => {
+    const transport = new MemoryTransport();
+    transport.queueLength = 1;
+    const node = new FieldLinkNode({ nodeId: nodeB, transport });
+    const transfer = transferFrames(
+      61n,
+      testMessage.encode(test("response", 200)),
+      1,
+    );
+    transport.inject({ bytes: encodeFrame(transfer.start) });
+    await eventually(() => transport.queueLengths.length > 0);
+    const controller = new AbortController();
+    const sending = node.send(test("response", 0), {
+      destination: nodeA,
+      signal: controller.signal,
+    });
+    const rejected = expect(sending).rejects.toThrow("queued frame cancelled");
+
+    controller.abort(new Error("queued frame cancelled"));
+
+    await rejected;
+    await node.close();
+    await transport.settle();
+  });
+
   it("releases every queued transfer when close interrupts the first", async () => {
     const transport = new MemoryTransport();
     transport.queueLength = 1;
@@ -1021,6 +1084,14 @@ class FailsFirstCompletionTransport extends MemoryTransport {
       return Promise.reject(new Error("completion send failed"));
     }
     return super.send(bytes);
+  }
+}
+
+class QueuesAfterSendTransport extends MemoryTransport {
+  override send(bytes: Uint8Array): Promise<void> {
+    const sent = super.send(bytes);
+    this.queueLength = 1;
+    return sent;
   }
 }
 

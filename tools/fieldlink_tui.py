@@ -23,6 +23,7 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 CLI = ("npm", "run", "--silent", "fieldlink", "--")
 DISCOVERY_TIMEOUT_SECONDS = 30
 STOP_TIMEOUT_SECONDS = 30
+MAX_TIMEOUT_MS = 24 * 60 * 60 * 1000
 
 
 class Cancelled(Exception):
@@ -682,16 +683,27 @@ def tui(
 
 def parse_arguments(arguments: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--timeout-ms", type=int, default=30 * 60 * 1000)
+    parser.add_argument(
+        "--timeout-ms", type=timeout_milliseconds, default=30 * 60 * 1000
+    )
     parser.add_argument("--output-root", type=Path, default=REPOSITORY / "results")
     return parser.parse_args(arguments)
 
 
+def timeout_milliseconds(value: str) -> int:
+    try:
+        timeout = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if not 1 <= timeout <= MAX_TIMEOUT_MS:
+        raise argparse.ArgumentTypeError(
+            f"must be between 1 and {MAX_TIMEOUT_MS}"
+        )
+    return timeout
+
+
 def main(arguments: list[str]) -> int:
     options = parse_arguments(arguments)
-    if options.timeout_ms < 1:
-        print("--timeout-ms must be positive", file=sys.stderr)
-        return 2
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print("fieldlink_tui.py requires an interactive terminal", file=sys.stderr)
         return 2

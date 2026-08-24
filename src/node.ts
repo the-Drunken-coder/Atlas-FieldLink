@@ -125,8 +125,10 @@ interface ScheduledFrame {
   readonly bytes: Uint8Array;
   readonly priority: Priority;
   readonly signal?: AbortSignal;
+  readonly onAbort?: () => void;
   readonly resolve: () => void;
   readonly reject: (error: Error) => void;
+  settled: boolean;
 }
 
 type WithoutTransmissionId<Frame> = Frame extends FieldLinkFrame
@@ -248,17 +250,19 @@ export class FieldLinkNode {
       if (strategy === undefined) {
         throw new Error(`Unsupported retry strategy ${retryStrategyName}`);
       }
-      const retry = await this.#withOutboundTransfer(() =>
-        this.#sendTransfer({
-          body,
-          destination,
-          logicalId,
-          messageType: definition.id,
-          exerciseKey: definition.exercise.key(message),
-          priority,
-          strategy,
-          ...(options.signal === undefined ? {} : { signal: options.signal }),
-        }),
+      const retry = await this.#withOutboundTransfer(
+        () =>
+          this.#sendTransfer({
+            body,
+            destination,
+            logicalId,
+            messageType: definition.id,
+            exerciseKey: definition.exercise.key(message),
+            priority,
+            strategy,
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
+          }),
+        options.signal,
       );
       return {
         logicalId: logicalIdHex(logicalId),
@@ -972,15 +976,22 @@ export class FieldLinkNode {
 
   async #withOutboundTransfer<Result>(
     operation: () => Promise<Result>,
+    signal: AbortSignal | undefined,
   ): Promise<Result> {
     const previous = this.#transferTail;
     let release = (): void => undefined;
     this.#transferTail = new Promise<void>((resolve) => {
       release = resolve;
     });
-    await previous;
+    try {
+      await waitForTurn(previous, signal);
+    } catch (error: unknown) {
+      void previous.then(release);
+      throw error;
+    }
     try {
       this.#throwIfClosed();
+      throwIfAborted(signal);
       return await operation();
     } finally {
       release();
@@ -1030,13 +1041,30 @@ class FrameScheduler {
       return Promise.reject(new Error("Frame scheduler is closed"));
     }
     return new Promise<void>((resolve, reject) => {
-      this.#queues[priority].push({
+      const item: ScheduledFrame = {
         bytes,
         priority,
         ...(signal === undefined ? {} : { signal }),
+        ...(signal === undefined
+          ? {}
+          : {
+              onAbort: () => {
+                if (this.#remove(item)) {
+                  this.#reject(item, abortError(signal));
+                }
+              },
+            }),
         resolve,
         reject,
-      });
+        settled: false,
+      };
+      this.#queues[priority].push(item);
+      if (item.onAbort !== undefined) {
+        signal?.addEventListener("abort", item.onAbort, { once: true });
+      }
+      if (signal?.aborted === true && item.onAbort !== undefined) {
+        item.onAbort();
+      }
       this.#ensureRunning();
     });
   }
@@ -1046,7 +1074,9 @@ class FrameScheduler {
     const error = new Error("Frame scheduler closed");
     for (const queue of Object.values(this.#queues)) {
       for (const item of queue.splice(0)) {
-        item.reject(error);
+        if (this.#settle(item)) {
+          item.reject(error);
+        }
       }
     }
     await this.#running;
@@ -1075,14 +1105,13 @@ class FrameScheduler {
       try {
         throwIfAborted(item.signal);
         await this.#transport.send(item.bytes);
-        await this.#waitForShallowQueue(item.signal);
         this.#emit({
           type: "frame-sent",
           at: new Date().toISOString(),
           priority: item.priority,
           bytes: item.bytes.length,
         });
-        item.resolve();
+        this.#resolve(item);
       } catch (error: unknown) {
         this.#reject(item, error);
       }
@@ -1116,15 +1145,26 @@ class FrameScheduler {
     );
   }
 
-  #remove(item: ScheduledFrame): void {
+  #remove(item: ScheduledFrame): boolean {
     const queue = this.#queues[item.priority];
     const index = queue.indexOf(item);
     if (index !== -1) {
       queue.splice(index, 1);
+      return true;
+    }
+    return false;
+  }
+
+  #resolve(item: ScheduledFrame): void {
+    if (this.#settle(item)) {
+      item.resolve();
     }
   }
 
   #reject(item: ScheduledFrame, error: unknown): void {
+    if (!this.#settle(item)) {
+      return;
+    }
     const failure = asError(error);
     this.#emit({
       type: "transport-error",
@@ -1132,6 +1172,17 @@ class FrameScheduler {
       message: failure.message,
     });
     item.reject(failure);
+  }
+
+  #settle(item: ScheduledFrame): boolean {
+    if (item.settled) {
+      return false;
+    }
+    item.settled = true;
+    if (item.onAbort !== undefined) {
+      item.signal?.removeEventListener("abort", item.onAbort);
+    }
+    return true;
   }
 
   #ensureRunning(): void {
@@ -1294,6 +1345,35 @@ function responseBase(frame: FieldLinkFrame): {
     destination: frame.source,
     logicalId: frame.logicalId,
   };
+}
+
+function waitForTurn(
+  turn: Promise<void>,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (signal === undefined) {
+    return turn;
+  }
+  if (signal.aborted) {
+    return Promise.reject(abortError(signal));
+  }
+  return new Promise<void>((resolve, reject) => {
+    const cleanup = (): void => {
+      signal.removeEventListener("abort", abort);
+    };
+    const abort = (): void => {
+      cleanup();
+      reject(abortError(signal));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    void turn.then(() => {
+      cleanup();
+      resolve();
+    });
+    if (signal.aborted) {
+      abort();
+    }
+  });
 }
 
 function responseFrame(

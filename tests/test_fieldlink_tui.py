@@ -51,6 +51,10 @@ class FieldLinkTuiTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "within 30 seconds"):
                 TUI.FieldLinkCli().run_json("radios", "list", "--json")
 
+    def test_rejects_timeout_above_cli_maximum(self):
+        with self.assertRaises(TUI.argparse.ArgumentTypeError):
+            TUI.timeout_milliseconds(str(TUI.MAX_TIMEOUT_MS + 1))
+
     def test_stop_process_tolerates_an_exit_race(self):
         process = mock.Mock(pid=123)
         process.poll.return_value = None
