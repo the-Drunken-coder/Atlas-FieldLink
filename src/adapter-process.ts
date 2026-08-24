@@ -570,14 +570,16 @@ export class AdapterProcessNode {
     this.#closed = true;
     const closeErrors: Error[] = [];
     try {
-      await this.#request({ type: "close" }, undefined);
+      await this.#request({ type: "close" }, undefined, this.#exitTimeoutMs);
     } catch (error: unknown) {
       closeErrors.push(asError(error));
     }
     this.#child.stdin.end();
     const reaped = Promise.all([this.#exit, this.#readerDone]);
+    let exitResult:
+      { code: number | null; signal: NodeJS.Signals | null } | undefined;
     try {
-      await withTimeout(
+      [exitResult] = await withTimeout(
         reaped,
         this.#exitTimeoutMs,
         "adapter process exit and stdout drain",
@@ -586,7 +588,7 @@ export class AdapterProcessNode {
       closeErrors.push(asError(error));
       this.#child.kill("SIGTERM");
       try {
-        await withTimeout(
+        [exitResult] = await withTimeout(
           reaped,
           this.#exitTimeoutMs,
           "adapter process termination",
@@ -594,7 +596,7 @@ export class AdapterProcessNode {
       } catch {
         this.#child.kill("SIGKILL");
         try {
-          await withTimeout(
+          [exitResult] = await withTimeout(
             reaped,
             this.#exitTimeoutMs,
             "adapter process kill",
@@ -603,6 +605,16 @@ export class AdapterProcessNode {
           closeErrors.push(asError(killError));
         }
       }
+    }
+    if (
+      exitResult !== undefined &&
+      (exitResult.code !== 0 || exitResult.signal !== null)
+    ) {
+      closeErrors.push(
+        new Error(
+          `Adapter exited (${exitResult.signal ?? `code ${exitResult.code ?? "unknown"}`})`,
+        ),
+      );
     }
     const [closeError] = closeErrors;
     if (closeError !== undefined && closeErrors.length === 1) {
@@ -620,6 +632,7 @@ export class AdapterProcessNode {
       | Omit<Extract<AdapterRequest, { type: "close" }>, "id">
       | Omit<Extract<AdapterRequest, { type: "abort" }>, "id">,
     signal: AbortSignal | undefined,
+    timeoutMs = this.#requestTimeoutMs,
   ): Promise<SendResult | undefined> {
     if (this.#failure !== undefined) {
       return Promise.reject(this.#failure);
@@ -644,11 +657,11 @@ export class AdapterProcessNode {
         this.#pending.delete(id);
         cleanup();
         const error = new Error(
-          `Adapter request ${id} timed out after ${this.#requestTimeoutMs} ms`,
+          `Adapter request ${id} timed out after ${timeoutMs} ms`,
         );
         this.#fail(error);
         reject(error);
-      }, this.#requestTimeoutMs);
+      }, timeoutMs);
       const pending: PendingRequest = { resolve, reject, timer, cleanup };
       this.#pending.set(id, pending);
       signal?.addEventListener("abort", abort, { once: true });

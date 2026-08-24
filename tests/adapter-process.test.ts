@@ -327,8 +327,34 @@ ${activateThen('const response={type:"response",id:request.id,ok:true,result:{lo
     await adapter.activate();
 
     await expect(adapter.close()).rejects.toThrow(
-      "adapter process exit and stdout drain",
+      "Could not close adapter process",
     );
+  });
+
+  it("bounds an ignored close request with the exit timeout", async () => {
+    const adapter = await AdapterProcessNode.start({
+      path: "test",
+      channel: 1,
+      allowInboxDrain: true,
+      requestTimeoutMs: 500,
+      exitTimeoutMs: 10,
+      program: nodeScript(ignoredCloseChildScript()),
+    });
+    await adapter.activate();
+
+    await expect(adapter.close()).rejects.toThrow("timed out after 10 ms");
+  });
+
+  it("reports a nonzero adapter exit during close", async () => {
+    const adapter = await AdapterProcessNode.start({
+      path: "test",
+      channel: 1,
+      allowInboxDrain: true,
+      program: nodeScript(nonzeroCloseChildScript()),
+    });
+    await adapter.activate();
+
+    await expect(adapter.close()).rejects.toThrow("code 7");
   });
 
   it("removes controller-only execution flags from child arguments", () => {
@@ -490,4 +516,16 @@ function uncooperativeCloseChildScript(): string {
 ${activateThen('if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n");}')}
 process.on("SIGTERM",()=>{});
 setInterval(()=>{},1000);`;
+}
+
+function ignoredCloseChildScript(): string {
+  return `${writeReady()}
+${activateThen("")}
+process.stdin.on("end",()=>process.exit(0));
+process.stdin.resume();`;
+}
+
+function nonzeroCloseChildScript(): string {
+  return `${writeReady()}
+${activateThen('if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(7));}')}`;
 }
