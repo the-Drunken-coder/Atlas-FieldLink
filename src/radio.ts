@@ -94,6 +94,7 @@ export interface MeshCoreTransportOptions {
   readonly connection?: CompanionConnection;
   readonly onInboxMessage?: (message: InboxMessage) => void | Promise<void>;
   readonly onListenerError?: (error: Error) => void | Promise<void>;
+  readonly onFatalError?: (error: Error) => void | Promise<void>;
 }
 
 /** MeshCore's bundled Node adapter does not await serial open or close. */
@@ -173,6 +174,7 @@ export class MeshCoreTransport implements FieldLinkTransport {
   readonly #commandTimeoutMs: number;
   readonly #onInboxMessage: MeshCoreTransportOptions["onInboxMessage"];
   readonly #onListenerError: MeshCoreTransportOptions["onListenerError"];
+  readonly #onFatalError: MeshCoreTransportOptions["onFatalError"];
   readonly #messageWaitingListener: (...arguments_: readonly unknown[]) => void;
   readonly #disconnectedListener: (...arguments_: readonly unknown[]) => void;
   readonly #transportErrorListener: (...arguments_: readonly unknown[]) => void;
@@ -196,6 +198,7 @@ export class MeshCoreTransport implements FieldLinkTransport {
       options.connection ?? new FieldLinkSerialConnection(path);
     this.#onInboxMessage = options.onInboxMessage;
     this.#onListenerError = options.onListenerError;
+    this.#onFatalError = options.onFatalError;
     this.#messageWaitingListener = () => {
       this.#requestDrain();
     };
@@ -425,6 +428,7 @@ export class MeshCoreTransport implements FieldLinkTransport {
   }
 
   async flushInbox(): Promise<void> {
+    this.#throwIfUnavailable();
     this.#drainRequestSequence += 1;
     await this.#startDrain();
   }
@@ -447,13 +451,16 @@ export class MeshCoreTransport implements FieldLinkTransport {
 
   #requestDrain(): void {
     this.#drainRequestSequence += 1;
-    void this.#startDrain().catch((error: unknown) => {
-      this.#makeFatal(asError(error));
+    void this.#startDrain().catch(async (error: unknown) => {
+      const fatalError = asError(error);
+      if (this.#makeFatal(fatalError)) {
+        await this.#notifyFatalError(fatalError);
+      }
     });
   }
 
   #startDrain(): Promise<void> {
-    if (!this.#open) {
+    if (!this.#open || this.#fatalError !== undefined) {
       return Promise.resolve();
     }
     if (this.#drainPromise !== undefined) {
@@ -525,6 +532,14 @@ export class MeshCoreTransport implements FieldLinkTransport {
     }
   }
 
+  async #notifyFatalError(error: Error): Promise<void> {
+    try {
+      await this.#onFatalError?.(error);
+    } catch {
+      // The transport is already fatal and must not resume inbox drains.
+    }
+  }
+
   #runCommand<Result>(operation: () => Promise<Result>): Promise<Result> {
     const result = this.#commandTail.then(operation);
     this.#commandTail = result.then(
@@ -553,9 +568,16 @@ export class MeshCoreTransport implements FieldLinkTransport {
     }
   }
 
-  #makeFatal(error: Error): void {
+  #makeFatal(error: Error): boolean {
+    const firstFailure = this.#fatalError === undefined;
     this.#fatalError ??= error;
+    this.#inboxActive = false;
     this.#stopPolling();
+    this.#connection.off(
+      Constants.PushCodes.MsgWaiting,
+      this.#messageWaitingListener,
+    );
+    return firstFailure;
   }
 
   #stopPolling(): void {

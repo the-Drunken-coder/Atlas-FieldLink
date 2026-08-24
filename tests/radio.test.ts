@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { Constants } from "@liamcottle/meshcore.js";
 
 import { MESHCORE_DATAGRAM_BYTES } from "../src/frame.js";
 import {
@@ -532,5 +533,57 @@ describe("MeshCore transport", () => {
     expect(onInbox).toHaveBeenCalledTimes(1);
     expect(connection.messages).toHaveLength(2);
     await transport.close();
+  });
+
+  it("disables background drains and reports fatal evidence failures", async () => {
+    const connection = new FakeConnection();
+    connection.messages.push(null);
+    const onInbox = vi.fn().mockRejectedValueOnce(new Error("disk full"));
+    const onFatalError = vi.fn();
+    const transport = new MeshCoreTransport("/dev/cu.test", {
+      channel: 2,
+      connection,
+      onInboxMessage: onInbox,
+      onFatalError,
+    });
+    await transport.open();
+    await transport.startInbox();
+    connection.messages.push(
+      {
+        channelMessage: {
+          channelIdx: 2,
+          pathLen: 1,
+          txtType: 0,
+          senderTimestamp: 1,
+          text: "one",
+        },
+      },
+      {
+        channelMessage: {
+          channelIdx: 2,
+          pathLen: 1,
+          txtType: 0,
+          senderTimestamp: 2,
+          text: "two",
+        },
+      },
+      null,
+    );
+
+    connection.emit(Constants.PushCodes.MsgWaiting);
+    await vi.waitFor(() => {
+      expect(onFatalError).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: "disk full",
+        }),
+      );
+    });
+    connection.emit(Constants.PushCodes.MsgWaiting);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(onInbox).toHaveBeenCalledTimes(1);
+    expect(connection.messages).toHaveLength(2);
+    await expect(transport.waitUntilIdle()).rejects.toThrow("disk full");
+    await expect(transport.close()).rejects.toThrow("Could not cleanly close");
   });
 });

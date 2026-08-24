@@ -75,6 +75,7 @@ interface RuntimeFactoryOptions {
   readonly processId: number;
   readonly onInboxMessage: (message: InboxMessage) => void | Promise<void>;
   readonly onListenerError: (error: Error) => void | Promise<void>;
+  readonly onFatalError: (error: Error) => void | Promise<void>;
 }
 
 type RuntimeFactory = (
@@ -134,6 +135,8 @@ export async function serveAdapter(
 ): Promise<void> {
   const writer = new WireWriter(options.output);
   const createRuntime = options.createRuntime ?? createDefaultRuntime;
+  let runtimeFailure: Error | undefined;
+  let stopForRuntimeFailure = (): void => undefined;
   const signal = options.signal;
   if (isAborted(signal)) {
     throw abortError(signal);
@@ -148,6 +151,14 @@ export async function serveAdapter(
     },
     onListenerError: (error) =>
       writer.write({ type: "listener-error", error: error.message }),
+    onFatalError: async (error) => {
+      runtimeFailure ??= error;
+      try {
+        await writer.write({ type: "listener-error", error: error.message });
+      } finally {
+        stopForRuntimeFailure();
+      }
+    },
   });
   if (isAborted(signal)) {
     const abort = abortError(signal);
@@ -171,6 +182,10 @@ export async function serveAdapter(
   const stopReading = (): void => {
     lines.close();
   };
+  stopForRuntimeFailure = stopReading;
+  if (runtimeFailure !== undefined) {
+    stopReading();
+  }
   options.signal?.addEventListener("abort", stopReading, { once: true });
   const unsubscribeMessage = runtime.node.onMessage((received) =>
     writer.write({
@@ -276,6 +291,9 @@ export async function serveAdapter(
         });
       activeOperations.set(request.id, operation);
     }
+    if (runtimeFailure !== undefined) {
+      throw runtimeFailure;
+    }
   } finally {
     options.signal?.removeEventListener("abort", stopReading);
     unsubscribeMessage();
@@ -299,6 +317,7 @@ async function createDefaultRuntime(
     channel: options.channel,
     onInboxMessage: options.onInboxMessage,
     onListenerError: options.onListenerError,
+    onFatalError: options.onFatalError,
   });
   try {
     await transport.open();
@@ -443,6 +462,7 @@ export class AdapterProcessNode {
   #closed = false;
   #closePromise: Promise<void> | undefined;
   #exit: Promise<AdapterExit>;
+  #stdioClosed: Promise<AdapterExit>;
   #readerDone: Promise<void> = Promise.resolve();
 
   private constructor(
@@ -450,11 +470,13 @@ export class AdapterProcessNode {
     ready: AdapterReady,
     options: StartAdapterProcessOptions,
     exit: Promise<AdapterExit>,
+    stdioClosed: Promise<AdapterExit>,
   ) {
     this.#child = child;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
     this.#exitTimeoutMs = options.exitTimeoutMs ?? EXIT_TIMEOUT_MS;
     this.#exit = exit;
+    this.#stdioClosed = stdioClosed;
     this.processId = ready.processId;
     this.identity = ready.identity;
     this.channel = ready.channel;
@@ -571,7 +593,7 @@ export class AdapterProcessNode {
       options.signal?.removeEventListener("abort", abort);
     }
     child.off("error", onSpawnError);
-    const node = new AdapterProcessNode(child, ready, options, exit);
+    const node = new AdapterProcessNode(child, ready, options, exit, closed);
     child.on("error", (error) => {
       node.#fail(asError(error));
     });
@@ -671,13 +693,13 @@ export class AdapterProcessNode {
       closeErrors.push(asError(error));
     }
     this.#child.stdin.end();
-    const reaped = Promise.all([this.#exit, this.#readerDone]);
+    const reaped = Promise.all([this.#stdioClosed, this.#readerDone]);
     let exitResult: AdapterExit | undefined;
     try {
       [exitResult] = await withTimeout(
         reaped,
         this.#exitTimeoutMs,
-        "adapter process exit and stdout drain",
+        "adapter process exit and stdio drain",
       );
     } catch (error: unknown) {
       closeErrors.push(asError(error));
@@ -732,6 +754,14 @@ export class AdapterProcessNode {
     const request = { ...operation, id } as AdapterRequest;
     return new Promise<SendResult | undefined>((resolve, reject) => {
       const abort = (): void => {
+        const pending = this.#pending.get(id);
+        if (pending === undefined || signal === undefined) {
+          return;
+        }
+        this.#pending.delete(id);
+        clearTimeout(pending.timer);
+        pending.cleanup();
+        pending.reject(abortError(signal));
         void this.#write({
           type: "abort",
           id: this.#nextRequestId++,
@@ -753,6 +783,9 @@ export class AdapterProcessNode {
       const pending: PendingRequest = { resolve, reject, timer, cleanup };
       this.#pending.set(id, pending);
       signal?.addEventListener("abort", abort, { once: true });
+      if (isAborted(signal)) {
+        abort();
+      }
       void this.#write(request).catch((error: unknown) => {
         cleanup();
         this.#pending.delete(id);

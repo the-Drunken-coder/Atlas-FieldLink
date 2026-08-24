@@ -18,6 +18,41 @@ const nodeA = parseNodeId("aaaaaaaaaaaaaaaa");
 const nodeB = parseNodeId("bbbbbbbbbbbbbbbb");
 
 describe("NDJSON adapter server", () => {
+  it("stops the adapter after a fatal runtime failure", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const node = new FieldLinkNode({
+      nodeId: nodeB,
+      transport: new MemoryTransport(),
+    });
+    const close = vi.spyOn(node, "close");
+    let reportFatal: ((error: Error) => void | Promise<void>) | undefined;
+    const reader = lineReader(output);
+    const serving = serveAdapter({
+      path: "test",
+      channel: 1,
+      input,
+      output,
+      createRuntime: (options) => {
+        reportFatal = options.onFatalError;
+        return Promise.resolve({ node, ready: ready(1) });
+      },
+    });
+    await reader.nextType("ready");
+    if (reportFatal === undefined) {
+      throw new Error("Runtime fatal callback was not installed");
+    }
+
+    await reportFatal(new Error("disk full"));
+
+    expect(await reader.nextType("listener-error")).toMatchObject({
+      error: "disk full",
+    });
+    await expect(serving).rejects.toThrow("disk full");
+    expect(close).toHaveBeenCalledOnce();
+    reader.close();
+  });
+
   it("closes a runtime created after startup cancellation", async () => {
     const input = new PassThrough();
     const output = new PassThrough();
@@ -389,6 +424,24 @@ describe("adapter process proxy", () => {
     expect(closed).toBe(true);
   });
 
+  it("waits for stderr to close before completing adapter close", async () => {
+    let stderrEnded = false;
+    const adapter = await AdapterProcessNode.start({
+      path: "test",
+      channel: 1,
+      allowInboxDrain: true,
+      onStderrEnd: () => {
+        stderrEnded = true;
+      },
+      program: nodeScript(delayedStderrCloseChildScript()),
+    });
+    await adapter.activate();
+
+    await adapter.close();
+
+    expect(stderrEnded).toBe(true);
+  });
+
   it("rejects pending work when the child exits", async () => {
     const adapter = await AdapterProcessNode.start({
       path: "test",
@@ -470,7 +523,7 @@ ${activateThen('const response={type:"response",id:request.id,ok:true,result:{lo
       { destination: nodeB, signal: controller.signal },
     );
     controller.abort(new Error("stop"));
-    await expect(send).rejects.toThrow("aborted");
+    await expect(send).rejects.toThrow("stop");
     await aborting.close();
 
     const timingOut = await AdapterProcessNode.start({
@@ -495,6 +548,44 @@ ${activateThen('const response={type:"response",id:request.id,ok:true,result:{lo
       ),
     ).rejects.toThrow("timed out");
     await expect(timingOut.close()).rejects.toThrow("timed out");
+  });
+
+  it("settles an aborted request before the child responds", async () => {
+    const adapter = await AdapterProcessNode.start({
+      path: "test",
+      channel: 1,
+      allowInboxDrain: true,
+      requestTimeoutMs: 10_000,
+      program: nodeScript(unresponsiveAbortChildScript()),
+    });
+    await adapter.activate();
+    const controller = new AbortController();
+    let settled = false;
+    const send = adapter.send(
+      {
+        type: "test",
+        kind: "response",
+        correlationId: 1,
+        payload: new Uint8Array(),
+      },
+      { destination: nodeB, signal: controller.signal },
+    );
+    const observed = send.then(
+      () => undefined,
+      () => {
+        settled = true;
+      },
+    );
+
+    controller.abort(new Error("stop"));
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(true);
+      await expect(send).rejects.toThrow("stop");
+    } finally {
+      await adapter.close();
+      await observed;
+    }
   });
 
   it("force-stops and reaps an adapter that ignores termination", async () => {
@@ -741,6 +832,19 @@ function abortChildScript(): string {
 let pending="",sendId;
 process.stdin.setEncoding("utf8");
 process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="activate"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n");}else if(request.type==="send"){sendId=request.id;}else if(request.type==="abort"){process.stdout.write(JSON.stringify({type:"response",id:sendId,ok:false,error:"Adapter request aborted"})+"\\n");}else if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}}});`;
+}
+
+function unresponsiveAbortChildScript(): string {
+  return `${writeReady()}
+let pending="",sendId;
+process.stdin.setEncoding("utf8");
+process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="activate"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n");}else if(request.type==="send"){sendId=request.id;}else if(request.type==="close"){const responses=JSON.stringify({type:"response",id:sendId,ok:false,error:"send stopped"})+"\\n"+JSON.stringify({type:"response",id:request.id,ok:true})+"\\n";process.stdout.write(responses,()=>process.exit(0));}}});`;
+}
+
+function delayedStderrCloseChildScript(): string {
+  return `${writeReady()}
+const {spawn}=require("node:child_process");
+${activateThen('if(request.type==="close"){spawn(process.execPath,["-e","setTimeout(()=>{},100)"],{stdio:["ignore","ignore",process.stderr]});process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}')}`;
 }
 
 function activateThen(next: string): string {
