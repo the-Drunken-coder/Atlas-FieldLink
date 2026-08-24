@@ -333,8 +333,8 @@ export async function runAdapterProcess(
   const abort = (): void => {
     controller.abort(new Error("Adapter interrupted"));
   };
-  process.once("SIGINT", abort);
-  process.once("SIGTERM", abort);
+  process.on("SIGINT", abort);
+  process.on("SIGTERM", abort);
   let evidence: AdapterEvidence | undefined;
   try {
     if (!command.evidenceManagedByParent) {
@@ -422,6 +422,7 @@ export class AdapterProcessNode {
   #activation: Promise<void> | undefined;
   #activated = false;
   #closed = false;
+  #closePromise: Promise<void> | undefined;
   #exit: Promise<AdapterExit>;
   #readerDone: Promise<void> = Promise.resolve();
 
@@ -637,11 +638,12 @@ export class AdapterProcessNode {
     };
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) {
-      await Promise.all([this.#exit, this.#readerDone]);
-      return;
-    }
+  close(): Promise<void> {
+    this.#closePromise ??= this.#close();
+    return this.#closePromise;
+  }
+
+  async #close(): Promise<void> {
     this.#closed = true;
     const closeErrors: Error[] = [];
     try {

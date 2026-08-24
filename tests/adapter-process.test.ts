@@ -490,6 +490,35 @@ ${activateThen('const response={type:"response",id:request.id,ok:true,result:{lo
     await expect(adapter.close()).rejects.toThrow("timed out after 10 ms");
   });
 
+  it("returns the same cleanup result to concurrent close callers", async () => {
+    const adapter = await AdapterProcessNode.start({
+      path: "test",
+      channel: 1,
+      allowInboxDrain: true,
+      requestTimeoutMs: 500,
+      exitTimeoutMs: 10,
+      program: nodeScript(ignoredCloseChildScript()),
+    });
+    await adapter.activate();
+
+    const first = adapter.close();
+    const second = adapter.close();
+
+    expect(second).toBe(first);
+    const [firstResult, secondResult] = await Promise.allSettled([
+      first,
+      second,
+    ]);
+    expect(firstResult.status).toBe("rejected");
+    expect(secondResult.status).toBe("rejected");
+    if (
+      firstResult.status === "rejected" &&
+      secondResult.status === "rejected"
+    ) {
+      expect(secondResult.reason).toBe(firstResult.reason);
+    }
+  });
+
   it("reports a nonzero adapter exit during close", async () => {
     const adapter = await AdapterProcessNode.start({
       path: "test",
