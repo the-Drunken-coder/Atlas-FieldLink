@@ -5,6 +5,7 @@ import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import type { AdapterCommand } from "./args.js";
+import { AdapterEvidence } from "./evidence.js";
 import { messageRegistry, type SupportedMessage } from "./messages/index.js";
 import {
   FieldLinkNode,
@@ -124,6 +125,7 @@ export interface ServeAdapterOptions {
   readonly processId?: number;
   readonly signal?: AbortSignal;
   readonly createRuntime?: RuntimeFactory;
+  readonly onInboxMessage?: (message: InboxMessage) => void | Promise<void>;
 }
 
 /** Owns one FieldLinkNode and reserves stdout for typed NDJSON. */
@@ -136,8 +138,10 @@ export async function serveAdapter(
     path: options.path,
     channel: options.channel,
     processId: options.processId ?? process.pid,
-    onInboxMessage: (message) =>
-      writer.write({ type: "inbox-message", message }),
+    onInboxMessage: async (message) => {
+      await options.onInboxMessage?.(message);
+      await writer.write({ type: "inbox-message", message });
+    },
     onListenerError: (error) =>
       writer.write({ type: "listener-error", error: error.message }),
   });
@@ -331,18 +335,35 @@ export async function runAdapterProcess(
   };
   process.once("SIGINT", abort);
   process.once("SIGTERM", abort);
+  let evidence: AdapterEvidence | undefined;
   try {
-    await serveAdapter({
-      path: command.radio,
-      channel: command.channel,
-      input: process.stdin,
-      output: process.stdout,
-      signal: controller.signal,
-    });
+    if (!command.evidenceManagedByParent) {
+      if (command.output === undefined) {
+        throw new Error("Adapter evidence output is required");
+      }
+      evidence = await AdapterEvidence.create(command.output);
+    }
+    if (!controller.signal.aborted) {
+      const adapterEvidence = evidence;
+      await serveAdapter({
+        path: command.radio,
+        channel: command.channel,
+        input: process.stdin,
+        output: process.stdout,
+        signal: controller.signal,
+        ...(adapterEvidence === undefined
+          ? {}
+          : {
+              onInboxMessage: (message: InboxMessage) =>
+                adapterEvidence.record("inbox-message", { message }),
+            }),
+      });
+    }
     return controller.signal.aborted ? 130 : 0;
   } finally {
     process.removeListener("SIGINT", abort);
     process.removeListener("SIGTERM", abort);
+    await evidence?.close();
   }
 }
 
@@ -466,8 +487,15 @@ export class AdapterProcessNode {
     });
     const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
     const iterator = lines[Symbol.asyncIterator]();
+    let rejectStartupAbort: ((error: Error) => void) | undefined;
+    const startupAbort = new Promise<never>((_resolve, reject) => {
+      rejectStartupAbort = reject;
+    });
     const abort = (): void => {
       child.kill("SIGTERM");
+      if (options.signal !== undefined) {
+        rejectStartupAbort?.(abortError(options.signal));
+      }
     };
     options.signal?.addEventListener("abort", abort, { once: true });
     let ready: ({ readonly type: "ready" } & AdapterReady) | undefined;
@@ -476,7 +504,11 @@ export class AdapterProcessNode {
         throw abortError(options.signal);
       }
       while (ready === undefined) {
-        const first = await Promise.race([iterator.next(), spawnError]);
+        const first = await Promise.race([
+          iterator.next(),
+          spawnError,
+          startupAbort,
+        ]);
         if (first.done) {
           throw new Error("Adapter stdout ended before ready");
         }
@@ -1114,6 +1146,7 @@ function defaultAdapterProgram(
       options.path,
       "--channel",
       String(options.channel),
+      "--evidence-managed-by-parent",
       "--allow-inbox-drain",
     ],
   };

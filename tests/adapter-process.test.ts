@@ -11,6 +11,7 @@ import {
 import { encodeFrame, FrameKind } from "../src/frame.js";
 import { testMessage } from "../src/messages/test.js";
 import { FieldLinkNode, parseNodeId } from "../src/node.js";
+import type { InboxMessage } from "../src/radio.js";
 import { eventually, MemoryTransport } from "./helpers.js";
 
 const nodeA = parseNodeId("aaaaaaaaaaaaaaaa");
@@ -24,6 +25,9 @@ describe("NDJSON adapter server", () => {
     const node = new FieldLinkNode({ nodeId: nodeB, transport });
     let started = false;
     let activated = false;
+    const preservedInbox: unknown[] = [];
+    let emitInbox:
+      ((message: InboxMessage) => void | Promise<void>) | undefined;
     const reader = lineReader(output);
     const serving = serveAdapter({
       path: "/dev/cu.test",
@@ -31,8 +35,12 @@ describe("NDJSON adapter server", () => {
       input,
       output,
       processId: 123,
-      createRuntime: () =>
-        Promise.resolve({
+      onInboxMessage: (message) => {
+        preservedInbox.push(message);
+      },
+      createRuntime: (options) => {
+        emitInbox = options.onInboxMessage;
+        return Promise.resolve({
           node,
           start: () => {
             started = true;
@@ -43,7 +51,8 @@ describe("NDJSON adapter server", () => {
             return Promise.resolve();
           },
           ready: ready(123),
-        }),
+        });
+      },
     });
     expect(await reader.nextType("ready")).toMatchObject({
       processId: 123,
@@ -52,6 +61,19 @@ describe("NDJSON adapter server", () => {
       retryStrategies: [{ id: 1, name: "selective-window" }],
     });
     expect(started).toBe(true);
+    await emitInbox?.({
+      channelMessage: {
+        channelIdx: 2,
+        pathLen: 1,
+        txtType: 0,
+        senderTimestamp: 1,
+        text: "stale",
+      },
+    });
+    expect(await reader.nextType("inbox-message")).toMatchObject({
+      message: { channelMessage: { text: "stale" } },
+    });
+    expect(preservedInbox).toHaveLength(1);
     input.write(
       `${JSON.stringify({
         id: 1,
@@ -252,6 +274,33 @@ describe("adapter process proxy", () => {
         program: nodeScript(`${writeReady()} setInterval(()=>{},1000);`),
       }),
     ).rejects.toThrow("startup cancelled");
+  });
+
+  it("cancels and reaps an adapter while waiting for ready", async () => {
+    const controller = new AbortController();
+    let reportStarted = (): void => undefined;
+    const started = new Promise<void>((resolve) => {
+      reportStarted = resolve;
+    });
+    const starting = AdapterProcessNode.start({
+      path: "test",
+      channel: 1,
+      allowInboxDrain: true,
+      signal: controller.signal,
+      exitTimeoutMs: 10,
+      onStderr: (message) => {
+        if (message.includes("started")) {
+          reportStarted();
+        }
+      },
+      program: nodeScript(uncooperativeStartupChildScript()),
+    });
+    const rejected = expect(starting).rejects.toThrow("startup cancelled");
+    await started;
+
+    controller.abort(new Error("startup cancelled"));
+
+    await rejected;
   });
 
   it("waits for startup evidence callbacks before completing close", async () => {
@@ -615,4 +664,10 @@ function malformedStartupChildScript(): string {
   return `process.on("SIGTERM",()=>{});
 setInterval(()=>{},1000);
 process.stdout.write("{malformed}\\n");`;
+}
+
+function uncooperativeStartupChildScript(): string {
+  return `process.stderr.write("started\\n");
+process.on("SIGTERM",()=>{});
+setInterval(()=>{},1000);`;
 }

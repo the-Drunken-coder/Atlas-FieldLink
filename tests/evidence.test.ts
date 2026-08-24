@@ -3,7 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
-import { TestArtifacts, type TestManifest } from "../src/evidence.js";
+import {
+  AdapterEvidence,
+  TestArtifacts,
+  type TestManifest,
+} from "../src/evidence.js";
 
 const manifest: TestManifest = {
   command: "test",
@@ -19,6 +23,21 @@ const manifest: TestManifest = {
 };
 
 describe("test evidence", () => {
+  it("persists standalone adapter inbox evidence", async () => {
+    const temporary = await mkdtemp(join(tmpdir(), "fieldlink-evidence-"));
+    try {
+      const evidence = await AdapterEvidence.create(join(temporary, "adapter"));
+      await evidence.record("inbox-message", { text: "preserved" });
+      await evidence.close();
+
+      expect(await readFile(evidence.paths.events, "utf8")).toContain(
+        '"text":"preserved"',
+      );
+    } finally {
+      await rm(temporary, { recursive: true });
+    }
+  });
+
   it("creates manifest, event stream, and running summary before radio work", async () => {
     const temporary = await mkdtemp(join(tmpdir(), "fieldlink-evidence-"));
     try {

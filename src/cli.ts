@@ -43,7 +43,7 @@ const ADAPTER_REQUEST_TIMEOUT_MARGIN_MS = 30_000;
 const HELP = `Usage:
   fieldlink radios list [--json]
   fieldlink messages list [--json]
-  fieldlink adapter --radio <port> --channel <index> --allow-inbox-drain
+  fieldlink adapter --radio <port> --channel <index> --output <directory> --allow-inbox-drain
   fieldlink test --a <port> --b <port> [--channel auto|<index>] [--message <name>] [--payload-size <bytes>] [--retry-strategy selective-window] [--timeout-ms <ms>] [--output <directory>] --allow-inbox-drain
 
 Defaults:

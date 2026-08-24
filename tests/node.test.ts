@@ -263,6 +263,39 @@ describe("FieldLinkNode delivery", () => {
     await Promise.all([a.close(), b.close()]);
   });
 
+  it("preserves cancellation while waiting for transfer completion", async () => {
+    const [transportA, transportB] = memoryTransportPair();
+    let completionDropped = false;
+    transportB.drop = (bytes) => {
+      if (decodeFrame(bytes).kind !== FrameKind.completion) {
+        return false;
+      }
+      completionDropped = true;
+      return true;
+    };
+    const a = new FieldLinkNode({
+      nodeId: nodeA,
+      transport: transportA,
+      retryTimeoutMs: 1000,
+    });
+    const b = new FieldLinkNode({
+      nodeId: nodeB,
+      transport: transportB,
+      retryTimeoutMs: 1000,
+    });
+    const controller = new AbortController();
+    const sending = a.send(test("response", 200), {
+      destination: nodeB,
+      signal: controller.signal,
+    });
+    await eventually(() => completionDropped);
+
+    controller.abort(new Error("completion wait cancelled"));
+
+    await expect(sending).rejects.toThrow("completion wait cancelled");
+    await Promise.all([a.close(), b.close()]);
+  });
+
   it("lets a high-priority complete message preempt a bulk repair", async () => {
     const [transportA, transportB] = memoryTransportPair();
     let droppedReceipt = false;

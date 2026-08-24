@@ -26,6 +26,80 @@ export interface ArtifactPaths {
   readonly summary: string;
 }
 
+export interface AdapterEvidencePaths {
+  readonly directory: string;
+  readonly events: string;
+}
+
+export class AdapterEvidence {
+  readonly paths: AdapterEvidencePaths;
+  readonly #events: FileHandle;
+  #writeTail: Promise<void> = Promise.resolve();
+  #writeError: Error | undefined;
+  #closed = false;
+
+  private constructor(paths: AdapterEvidencePaths, events: FileHandle) {
+    this.paths = paths;
+    this.#events = events;
+  }
+
+  static async create(requestedDirectory: string): Promise<AdapterEvidence> {
+    const directory = resolve(requestedDirectory);
+    const paths = {
+      directory,
+      events: resolve(directory, "events.jsonl"),
+    } satisfies AdapterEvidencePaths;
+    await mkdir(directory, { recursive: true });
+    return new AdapterEvidence(paths, await open(paths.events, "wx"));
+  }
+
+  record(type: string, data: unknown): Promise<void> {
+    if (this.#closed) {
+      return Promise.reject(new Error("Adapter evidence is already closed"));
+    }
+    const line = `${stringify({ at: new Date().toISOString(), type, data })}\n`;
+    const write = this.#writeTail.then(() =>
+      this.#events.appendFile(line, "utf8"),
+    );
+    this.#writeTail = write.then(
+      () => undefined,
+      (error: unknown) => {
+        this.#writeError ??= asError(error);
+      },
+    );
+    return write;
+  }
+
+  async close(): Promise<void> {
+    if (this.#closed) {
+      return;
+    }
+    this.#closed = true;
+    const errors: Error[] = [];
+    try {
+      await this.#writeTail;
+      if (this.#writeError !== undefined) {
+        throw this.#writeError;
+      }
+    } catch (error: unknown) {
+      errors.push(asError(error));
+    }
+    try {
+      await this.#events.sync();
+    } catch (error: unknown) {
+      errors.push(asError(error));
+    }
+    try {
+      await this.#events.close();
+    } catch (error: unknown) {
+      errors.push(asError(error));
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, "Could not close adapter evidence");
+    }
+  }
+}
+
 export class TestArtifacts {
   readonly paths: ArtifactPaths;
   readonly #events: FileHandle;

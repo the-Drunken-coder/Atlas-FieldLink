@@ -52,6 +52,7 @@ class SelectiveWindowSender implements RetrySender {
             break;
           }
         } catch (error: unknown) {
+          throwIfAborted(session.signal);
           if (error instanceof TransferRejectedError) {
             throw error;
           }
@@ -79,6 +80,7 @@ class SelectiveWindowSender implements RetrySender {
         await session.waitForCompletion(SELECTIVE_WINDOW_RECEIPT_TIMEOUT_MS);
         return { retransmissions, receipts };
       } catch (error: unknown) {
+        throwIfAborted(session.signal);
         if (error instanceof TransferRejectedError) {
           throw error;
         }
@@ -103,6 +105,7 @@ class SelectiveWindowSender implements RetrySender {
           );
           receipts += 1;
         } catch (receiptError: unknown) {
+          throwIfAborted(session.signal);
           if (receiptError instanceof TransferRejectedError) {
             throw receiptError;
           }
@@ -150,6 +153,7 @@ async function openTransfer(session: TransferSenderSession): Promise<void> {
       await session.open(SELECTIVE_WINDOW_RECEIPT_TIMEOUT_MS);
       return;
     } catch (error: unknown) {
+      throwIfAborted(session.signal);
       if (error instanceof TransferRejectedError) {
         throw error;
       }

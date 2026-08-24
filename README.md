@@ -130,10 +130,11 @@ Run one deployed adapter process:
 npm run fieldlink -- adapter \
   --radio /dev/cu.usbmodem-A \
   --channel 1 \
+  --output results/adapter-A \
   --allow-inbox-drain
 ```
 
-The adapter reserves stdout for typed NDJSON. Diagnostics go to stderr. Its `ready` event includes safe radio identity, selected channel metadata, Node ID, supported messages, retry strategies, and delivery limits. `Uint8Array` values cross NDJSON as base64.
+The adapter creates `events.jsonl` in the output directory before opening the radio and records every consumed Companion inbox item there. It reserves stdout for typed NDJSON and sends diagnostics to stderr. Its `ready` event includes safe radio identity, selected channel metadata, Node ID, supported messages, retry strategies, and delivery limits. `Uint8Array` values cross NDJSON as base64.
 
 Run a two-radio Test echo:
 

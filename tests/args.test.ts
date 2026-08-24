@@ -20,6 +20,8 @@ describe("CLI arguments", () => {
         "/dev/cu.a",
         "--channel",
         "2",
+        "--output",
+        "out",
         "--allow-inbox-drain",
       ]),
     ).toEqual({
@@ -27,6 +29,8 @@ describe("CLI arguments", () => {
       radio: "/dev/cu.a",
       channel: 2,
       allowInboxDrain: true,
+      evidenceManagedByParent: false,
+      output: "out",
     });
     expect(
       parseCommand([
@@ -126,5 +130,26 @@ describe("CLI arguments", () => {
     expect(() =>
       parseCommand(["adapter", "--radio", "a", "--channel", "1"]),
     ).toThrow("--allow-inbox-drain");
+    expect(() =>
+      parseCommand([
+        "adapter",
+        "--radio",
+        "a",
+        "--channel",
+        "1",
+        "--allow-inbox-drain",
+      ]),
+    ).toThrow("--output");
+    expect(
+      parseCommand([
+        "adapter",
+        "--radio",
+        "a",
+        "--channel",
+        "1",
+        "--evidence-managed-by-parent",
+        "--allow-inbox-drain",
+      ]),
+    ).toMatchObject({ evidenceManagedByParent: true });
   });
 });
