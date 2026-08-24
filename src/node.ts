@@ -1259,12 +1259,17 @@ class OutboundSignals {
     afterSequence: number,
     timeoutMs: number,
     signal: AbortSignal | undefined,
-  ): Promise<number> {
+  ): Promise<number | undefined> {
     await this.#waitFor(
-      () => (this.#receiptSequences.get(windowStart) ?? 0) > afterSequence,
+      () =>
+        this.#completed ||
+        (this.#receiptSequences.get(windowStart) ?? 0) > afterSequence,
       timeoutMs,
       signal,
     );
+    if (this.#completed) {
+      return undefined;
+    }
     const bitmap = this.#receiptBitmaps.get(windowStart);
     if (bitmap === undefined) {
       throw new Error("Receipt arrived without a bitmap");

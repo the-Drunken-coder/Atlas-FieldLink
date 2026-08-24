@@ -5,9 +5,11 @@ import { describe, expect, it, vi } from "vitest";
 import {
   AdapterProcessNode,
   filteredExecArguments,
+  runAdapterProcess,
   serveAdapter,
   type StartAdapterProcessOptions,
 } from "../src/adapter-process.js";
+import { AdapterEvidence } from "../src/evidence.js";
 import { encodeFrame, FrameKind } from "../src/frame.js";
 import { testMessage } from "../src/messages/test.js";
 import { FieldLinkNode, parseNodeId } from "../src/node.js";
@@ -262,6 +264,75 @@ describe("NDJSON adapter server", () => {
     reader.close();
   });
 
+  it("requires durable parent acknowledgement for drained inbox messages", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const node = new FieldLinkNode({
+      nodeId: nodeB,
+      transport: new MemoryTransport(),
+    });
+    let started = false;
+    let emitInbox:
+      ((message: InboxMessage) => void | Promise<void>) | undefined;
+    const reader = lineReader(output);
+    const serving = serveAdapter({
+      path: "test",
+      channel: 1,
+      input,
+      output,
+      parentManagesEvidence: true,
+      createRuntime: (options) => {
+        emitInbox = options.onInboxMessage;
+        return Promise.resolve({
+          node,
+          start: () => {
+            started = true;
+            return Promise.resolve();
+          },
+          ready: ready(1),
+        });
+      },
+    });
+
+    await expect(reader.nextType("parent-ready-required")).resolves.toEqual({
+      type: "parent-ready-required",
+    });
+    expect(started).toBe(false);
+    input.write(`${JSON.stringify({ id: 1, type: "parent-ready" })}\n`);
+    await reader.nextType("ready");
+    expect(started).toBe(true);
+
+    if (emitInbox === undefined) {
+      throw new Error("Runtime inbox callback was not installed");
+    }
+    let preserved = false;
+    const preserving = Promise.resolve(
+      emitInbox({
+        channelMessage: {
+          channelIdx: 1,
+          pathLen: 1,
+          txtType: 0,
+          senderTimestamp: 1,
+          text: "preserve me",
+        },
+      }),
+    ).then(() => {
+      preserved = true;
+    });
+    const inbox = await reader.nextType("inbox-message");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(preserved).toBe(false);
+    input.write(`${JSON.stringify({ type: "inbox-ack", id: inbox.id })}\n`);
+    await preserving;
+    expect(preserved).toBe(true);
+
+    input.write(`${JSON.stringify({ id: 2, type: "close" })}\n`);
+    await reader.nextType("response");
+    input.end();
+    await serving;
+    reader.close();
+  });
+
   it("keeps every stdout line valid JSON", async () => {
     const input = new PassThrough();
     const output = new PassThrough();
@@ -291,6 +362,48 @@ describe("NDJSON adapter server", () => {
         JSON.parse(line);
       }
     }).not.toThrow();
+  });
+});
+
+describe("adapter process command", () => {
+  it("keeps interruption handlers installed while evidence closes", async () => {
+    const originalListeners = new Set(process.listeners("SIGINT"));
+    let abort: NodeJS.SignalsListener | undefined;
+    let handlerPresentDuringClose = false;
+    const evidence = {
+      close: () => {
+        handlerPresentDuringClose =
+          abort !== undefined && process.listeners("SIGINT").includes(abort);
+        abort?.("SIGINT");
+        return Promise.resolve();
+      },
+    } as unknown as AdapterEvidence;
+    const create = vi
+      .spyOn(AdapterEvidence, "create")
+      .mockImplementation(() => {
+        abort = process
+          .listeners("SIGINT")
+          .find((listener) => !originalListeners.has(listener));
+        abort?.("SIGINT");
+        return Promise.resolve(evidence);
+      });
+
+    try {
+      await expect(
+        runAdapterProcess({
+          name: "adapter",
+          radio: "test",
+          channel: 1,
+          allowInboxDrain: true,
+          evidenceManagedByParent: false,
+          output: "test-output",
+        }),
+      ).resolves.toBe(130);
+      expect(handlerPresentDuringClose).toBe(true);
+      expect(process.listeners("SIGINT")).toEqual([...originalListeners]);
+    } finally {
+      create.mockRestore();
+    }
   });
 });
 
@@ -809,6 +922,7 @@ function writeReady(channelIndex = 1): string {
 function preReadyEvidenceChildScript(): string {
   const inbox = {
     type: "inbox-message",
+    id: 1,
     message: {
       channelMessage: {
         channelIdx: 39,
@@ -842,6 +956,7 @@ ${activateThen('if(request.type==="close"){process.stdout.write(JSON.stringify({
 function closeWithBufferedInboxChildScript(): string {
   const inbox = {
     type: "inbox-message",
+    id: 1,
     message: {
       channelMessage: {
         channelIdx: 1,
@@ -853,7 +968,9 @@ function closeWithBufferedInboxChildScript(): string {
     },
   };
   return `${writeReady()}
-process.stdin.once("data",chunk=>{const request=JSON.parse(String(chunk).trim());const lines=JSON.stringify({type:"response",id:request.id,ok:true})+"\\n"+${JSON.stringify(JSON.stringify(inbox))}+"\\n";process.stdout.write(lines,()=>process.exit(0));});`;
+let pending="",closeId;
+process.stdin.setEncoding("utf8");
+process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="close"){closeId=request.id;process.stdout.write(${JSON.stringify(`${JSON.stringify(inbox)}\n`)});}else if(request.type==="inbox-ack"){process.stdout.write(JSON.stringify({type:"response",id:closeId,ok:true})+"\\n",()=>process.exit(0));}}});`;
 }
 
 function cooperativeChildScript(): string {

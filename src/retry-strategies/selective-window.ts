@@ -46,6 +46,9 @@ class SelectiveWindowSender implements RetrySender {
             windowCount,
             SELECTIVE_WINDOW_RECEIPT_TIMEOUT_MS,
           );
+          if (received === undefined) {
+            return { retransmissions, receipts };
+          }
           receipts += 1;
           missing = fullBitmap(windowCount) & ~received;
           if (missing === 0) {
@@ -98,11 +101,14 @@ class SelectiveWindowSender implements RetrySender {
         );
         const windowCount = session.fragmentCount - windowStart;
         try {
-          await session.requestReceipt(
+          const received = await session.requestReceipt(
             windowStart,
             windowCount,
             SELECTIVE_WINDOW_RECEIPT_TIMEOUT_MS,
           );
+          if (received === undefined) {
+            return { retransmissions, receipts };
+          }
           receipts += 1;
         } catch (receiptError: unknown) {
           throwIfAborted(session.signal);

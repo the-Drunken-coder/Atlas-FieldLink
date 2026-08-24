@@ -340,6 +340,39 @@ describe("CLI message exercise", () => {
     );
   });
 
+  it("fails as soon as the destination cannot send the echo", async () => {
+    const source = new ExerciseNodeProbe("aaaaaaaaaaaaaaaa");
+    const destination = new ExerciseNodeProbe("bbbbbbbbbbbbbbbb");
+    const controller = new AbortController();
+    const sent = testMessage.exercise.create(64);
+    const completion = waitForExerciseCompletion(
+      source,
+      destination,
+      testMessage,
+      sent,
+      controller.signal,
+    );
+
+    destination.emitMessage({
+      message: sent,
+      source: source.nodeId,
+      destination: destination.nodeId,
+      logicalId: "0000000000000001",
+      delivery: "complete",
+      receivedAt: new Date(),
+    });
+    destination.emitEvent({
+      type: "protocol-error",
+      at: new Date().toISOString(),
+      logicalId: "0000000000000001",
+      message: "Message handler failed: radio rejected",
+    });
+
+    await expect(completion).rejects.toThrow(
+      "Echo handler failed: radio rejected",
+    );
+  });
+
   it("ignores an unrelated echo transfer failure", async () => {
     const source = new ExerciseNodeProbe("aaaaaaaaaaaaaaaa");
     const destination = new ExerciseNodeProbe("bbbbbbbbbbbbbbbb");
@@ -420,6 +453,12 @@ class ExerciseNodeProbe implements ExerciseNode {
   emitEvent(event: FieldLinkEvent): void {
     for (const listener of this.#eventListeners) {
       void listener(event);
+    }
+  }
+
+  emitMessage(message: ReceivedMessage): void {
+    for (const listener of this.#messageListeners) {
+      void listener(message);
     }
   }
 }

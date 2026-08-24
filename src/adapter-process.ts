@@ -93,13 +93,25 @@ type AdapterRequest =
     }
   | { readonly id: number; readonly type: "activate" }
   | { readonly id: number; readonly type: "abort"; readonly targetId: number }
-  | { readonly id: number; readonly type: "close" };
+  | { readonly id: number; readonly type: "close" }
+  | { readonly id: number; readonly type: "parent-ready" }
+  | { readonly id: number; readonly type: "inbox-ack" };
+
+type AdapterControlRequest = Exclude<
+  AdapterRequest,
+  { readonly type: "inbox-ack" }
+>;
 
 type AdapterMessage =
   | ({ readonly type: "ready" } & AdapterReady)
+  | { readonly type: "parent-ready-required" }
   | { readonly type: "message"; readonly message: WireReceivedMessage }
   | { readonly type: "event"; readonly event: FieldLinkEvent }
-  | { readonly type: "inbox-message"; readonly message: InboxMessage }
+  | {
+      readonly type: "inbox-message";
+      readonly id: number;
+      readonly message: InboxMessage;
+    }
   | { readonly type: "listener-error"; readonly error: string }
   | {
       readonly type: "response";
@@ -127,6 +139,7 @@ export interface ServeAdapterOptions {
   readonly signal?: AbortSignal;
   readonly createRuntime?: RuntimeFactory;
   readonly onInboxMessage?: (message: InboxMessage) => void | Promise<void>;
+  readonly parentManagesEvidence?: boolean;
 }
 
 /** Owns one FieldLinkNode and reserves stdout for typed NDJSON. */
@@ -137,29 +150,43 @@ export async function serveAdapter(
   const createRuntime = options.createRuntime ?? createDefaultRuntime;
   let runtimeFailure: Error | undefined;
   let stopForRuntimeFailure = (): void => undefined;
+  let nextInboxMessageId = 1;
   const signal = options.signal;
   if (isAborted(signal)) {
     throw abortError(signal);
   }
-  const runtime = await createRuntime({
-    path: options.path,
-    channel: options.channel,
-    processId: options.processId ?? process.pid,
-    onInboxMessage: async (message) => {
-      await options.onInboxMessage?.(message);
-      await writer.write({ type: "inbox-message", message });
-    },
-    onListenerError: (error) =>
-      writer.write({ type: "listener-error", error: error.message }),
-    onFatalError: async (error) => {
-      runtimeFailure ??= error;
-      try {
-        await writer.write({ type: "listener-error", error: error.message });
-      } finally {
-        stopForRuntimeFailure();
-      }
-    },
-  });
+  const lines = createInterface({ input: options.input, crlfDelay: Infinity });
+  const requestPump = new AdapterRequestPump(lines);
+  let runtime: AdapterRuntime;
+  try {
+    runtime = await createRuntime({
+      path: options.path,
+      channel: options.channel,
+      processId: options.processId ?? process.pid,
+      onInboxMessage: async (message) => {
+        await options.onInboxMessage?.(message);
+        const id = nextInboxMessageId++;
+        const acknowledgement = options.parentManagesEvidence
+          ? requestPump.waitForInboxAcknowledgement(id)
+          : undefined;
+        await writer.write({ type: "inbox-message", id, message });
+        await acknowledgement;
+      },
+      onListenerError: (error) =>
+        writer.write({ type: "listener-error", error: error.message }),
+      onFatalError: async (error) => {
+        runtimeFailure ??= error;
+        try {
+          await writer.write({ type: "listener-error", error: error.message });
+        } finally {
+          stopForRuntimeFailure();
+        }
+      },
+    });
+  } catch (error: unknown) {
+    requestPump.close();
+    throw error;
+  }
   if (isAborted(signal)) {
     const abort = abortError(signal);
     try {
@@ -172,15 +199,12 @@ export async function serveAdapter(
     }
     throw abort;
   }
-  const lines = createInterface({ input: options.input, crlfDelay: Infinity });
-  const requests = lines[Symbol.asyncIterator]();
-  let nextRequest = requests.next();
   const active = new Map<number, AbortController>();
   const activeOperations = new Map<number, Promise<void>>();
   let activated = false;
   let closing = false;
   const stopReading = (): void => {
-    lines.close();
+    requestPump.close();
     if (isAborted(signal)) {
       void runtime.node.close().catch(() => undefined);
     }
@@ -204,22 +228,26 @@ export async function serveAdapter(
     if (options.signal?.aborted === true) {
       throw abortError(options.signal);
     }
+    if (options.parentManagesEvidence) {
+      await writer.write({ type: "parent-ready-required" });
+      const parentReady = await requestPump.next();
+      if (parentReady?.type !== "parent-ready") {
+        throw new Error("Adapter parent evidence handshake was not completed");
+      }
+    }
     await runtime.start?.();
     if (isAborted(signal)) {
       throw abortError(signal);
     }
     await writer.write({ type: "ready", ...runtime.ready });
     for (;;) {
-      const requestLine = await nextRequest;
-      if (requestLine.done) {
+      const request = await requestPump.next();
+      if (request === undefined) {
         break;
       }
-      nextRequest = requests.next();
-      const line = requestLine.value;
-      if (line.trim().length === 0) {
-        continue;
+      if (request.type === "parent-ready") {
+        throw new Error("Adapter parent evidence handshake was repeated");
       }
-      const request = parseAdapterRequest(line);
       if (request.type === "activate") {
         try {
           await runtime.activate?.();
@@ -307,7 +335,7 @@ export async function serveAdapter(
     options.signal?.removeEventListener("abort", stopReading);
     unsubscribeMessage();
     unsubscribeEvent();
-    lines.close();
+    requestPump.close();
     for (const controller of active.values()) {
       controller.abort(new Error("Adapter input closed"));
     }
@@ -399,6 +427,7 @@ export async function runAdapterProcess(
           input: process.stdin,
           output: process.stdout,
           signal: controller.signal,
+          parentManagesEvidence: command.evidenceManagedByParent,
           ...(adapterEvidence === undefined
             ? {}
             : {
@@ -414,9 +443,12 @@ export async function runAdapterProcess(
     }
     return controller.signal.aborted ? 130 : 0;
   } finally {
-    process.removeListener("SIGINT", abort);
-    process.removeListener("SIGTERM", abort);
-    await evidence?.close();
+    try {
+      await evidence?.close();
+    } finally {
+      process.removeListener("SIGINT", abort);
+      process.removeListener("SIGTERM", abort);
+    }
   }
 }
 
@@ -571,11 +603,26 @@ export class AdapterProcessNode {
         }
         const message = parseAdapterMessage(first.value);
         switch (message.type) {
+          case "parent-ready-required":
+            if (options.onInboxMessage === undefined) {
+              throw new Error(
+                "Adapter parent evidence handshake requires an inbox evidence sink",
+              );
+            }
+            await writeAdapterRequest(child, { type: "parent-ready", id: 1 });
+            break;
           case "ready":
             ready = message;
             break;
           case "inbox-message":
-            await options.onInboxMessage?.(message.message);
+            if (options.onInboxMessage === undefined) {
+              throw new Error("Adapter parent has no inbox evidence sink");
+            }
+            await options.onInboxMessage(message.message);
+            await writeAdapterRequest(child, {
+              type: "inbox-ack",
+              id: message.id,
+            });
             break;
           case "listener-error":
             await options.onListenerError?.(new Error(message.error));
@@ -888,13 +935,21 @@ export class AdapterProcessNode {
               }
               break;
             case "inbox-message":
-              await options.onInboxMessage?.(message.message);
+              if (options.onInboxMessage === undefined) {
+                throw new Error("Adapter parent has no inbox evidence sink");
+              }
+              await options.onInboxMessage(message.message);
+              await this.#write({ type: "inbox-ack", id: message.id });
               break;
             case "listener-error":
               await options.onListenerError?.(new Error(message.error));
               break;
             case "ready":
               throw new Error("Adapter sent ready more than once");
+            case "parent-ready-required":
+              throw new Error(
+                "Adapter requested parent readiness more than once",
+              );
           }
         }
       } catch (error: unknown) {
@@ -906,15 +961,7 @@ export class AdapterProcessNode {
   }
 
   #write(request: AdapterRequest): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      this.#child.stdin.write(`${stringifyWire(request)}\n`, (error) => {
-        if (error) {
-          reject(asError(error));
-        } else {
-          resolve();
-        }
-      });
-    });
+    return writeAdapterRequest(this.#child, request);
   }
 
   #fail(error: Error): void {
@@ -926,6 +973,146 @@ export class AdapterProcessNode {
     }
     this.#pending.clear();
   }
+}
+
+interface RequestWaiter {
+  readonly resolve: (request: AdapterControlRequest | undefined) => void;
+  readonly reject: (error: Error) => void;
+}
+
+interface InboxAcknowledgement {
+  readonly resolve: () => void;
+  readonly reject: (error: Error) => void;
+}
+
+class AdapterRequestPump {
+  readonly #lines: ReturnType<typeof createInterface>;
+  readonly #queued: AdapterControlRequest[] = [];
+  readonly #inboxAcknowledgements = new Map<number, InboxAcknowledgement>();
+  #waiter: RequestWaiter | undefined;
+  #done = false;
+  #error: Error | undefined;
+
+  constructor(lines: ReturnType<typeof createInterface>) {
+    this.#lines = lines;
+    void this.#read();
+  }
+
+  next(): Promise<AdapterControlRequest | undefined> {
+    const queued = this.#queued.shift();
+    if (queued !== undefined) {
+      return Promise.resolve(queued);
+    }
+    if (this.#error !== undefined) {
+      return Promise.reject(this.#error);
+    }
+    if (this.#done) {
+      return Promise.resolve(undefined);
+    }
+    if (this.#waiter !== undefined) {
+      return Promise.reject(
+        new Error("Adapter request read is already pending"),
+      );
+    }
+    return new Promise<AdapterControlRequest | undefined>((resolve, reject) => {
+      this.#waiter = { resolve, reject };
+    });
+  }
+
+  waitForInboxAcknowledgement(id: number): Promise<void> {
+    if (this.#error !== undefined) {
+      return Promise.reject(this.#error);
+    }
+    if (this.#done) {
+      return Promise.reject(
+        new Error(
+          `Adapter input ended before inbox message ${id} was preserved`,
+        ),
+      );
+    }
+    if (this.#inboxAcknowledgements.has(id)) {
+      return Promise.reject(
+        new Error(`Inbox message ${id} is already awaiting acknowledgement`),
+      );
+    }
+    return new Promise<void>((resolve, reject) => {
+      this.#inboxAcknowledgements.set(id, { resolve, reject });
+    });
+  }
+
+  close(): void {
+    this.#lines.close();
+  }
+
+  async #read(): Promise<void> {
+    try {
+      for await (const line of this.#lines) {
+        if (line.trim().length === 0) {
+          continue;
+        }
+        const request = parseAdapterRequest(line);
+        if (request.type === "inbox-ack") {
+          const acknowledgement = this.#inboxAcknowledgements.get(request.id);
+          if (acknowledgement === undefined) {
+            throw new Error(
+              `Unexpected acknowledgement for inbox message ${request.id}`,
+            );
+          }
+          this.#inboxAcknowledgements.delete(request.id);
+          acknowledgement.resolve();
+          continue;
+        }
+        const waiter = this.#waiter;
+        if (waiter === undefined) {
+          this.#queued.push(request);
+        } else {
+          this.#waiter = undefined;
+          waiter.resolve(request);
+        }
+      }
+      this.#finish();
+    } catch (error: unknown) {
+      this.#finish(asError(error));
+    }
+  }
+
+  #finish(error?: Error): void {
+    if (this.#done) {
+      return;
+    }
+    this.#done = true;
+    this.#error = error;
+    const inputError =
+      error ?? new Error("Adapter input ended before evidence was preserved");
+    for (const acknowledgement of this.#inboxAcknowledgements.values()) {
+      acknowledgement.reject(inputError);
+    }
+    this.#inboxAcknowledgements.clear();
+    const waiter = this.#waiter;
+    this.#waiter = undefined;
+    if (waiter !== undefined) {
+      if (error === undefined) {
+        waiter.resolve(undefined);
+      } else {
+        waiter.reject(error);
+      }
+    }
+  }
+}
+
+function writeAdapterRequest(
+  child: ChildProcessWithoutNullStreams,
+  request: AdapterRequest,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    child.stdin.write(`${stringifyWire(request)}\n`, (error) => {
+      if (error) {
+        reject(asError(error));
+      } else {
+        resolve();
+      }
+    });
+  });
 }
 
 class WireWriter {
@@ -965,6 +1152,12 @@ function parseAdapterRequest(line: string): AdapterRequest {
   }
   if (value.type === "close") {
     return { type: "close", id: value.id };
+  }
+  if (value.type === "parent-ready") {
+    return { type: "parent-ready", id: value.id };
+  }
+  if (value.type === "inbox-ack") {
+    return { type: "inbox-ack", id: value.id };
   }
   if (value.type === "activate") {
     return { type: "activate", id: value.id };
@@ -1017,6 +1210,8 @@ function isAdapterMessage(value: unknown): value is AdapterMessage {
   switch (value.type) {
     case "ready":
       return isAdapterReady(value);
+    case "parent-ready-required":
+      return true;
     case "message":
       return isWireReceivedMessage(value.message);
     case "event":
@@ -1026,7 +1221,7 @@ function isAdapterMessage(value: unknown): value is AdapterMessage {
         typeof value.event.at === "string"
       );
     case "inbox-message":
-      return isInboxMessage(value.message);
+      return isRequestId(value.id) && isInboxMessage(value.message);
     case "listener-error":
       return typeof value.error === "string";
     case "response":

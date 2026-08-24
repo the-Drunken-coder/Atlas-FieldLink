@@ -613,6 +613,7 @@ export function waitForExerciseCompletion(
     const completedTransfers = new Set<string>();
     const failedTransfers = new Map<string, Error>();
     const echoTransfers = new Set<string>();
+    const expectedHandlerLogicalIds = new Set<string>();
     const exerciseKey = definition.exercise.key(sent);
     let matched: ExerciseCompletion | undefined;
     let settled = false;
@@ -661,6 +662,12 @@ export function waitForExerciseCompletion(
           }
           let complete: boolean;
           try {
+            if (
+              side === "destination" &&
+              definition.exercise.key(received.message) === exerciseKey
+            ) {
+              expectedHandlerLogicalIds.add(received.logicalId);
+            }
             complete = definition.exercise.isComplete({
               sent,
               received: received.message,
@@ -681,6 +688,23 @@ export function waitForExerciseCompletion(
     const listenForTransfer = (node: ExerciseNode): void => {
       subscriptions.push(
         node.onEvent((event: FieldLinkEvent) => {
+          if (
+            node === destinationNode &&
+            event.type === "protocol-error" &&
+            typeof event.logicalId === "string" &&
+            expectedHandlerLogicalIds.has(event.logicalId) &&
+            typeof event.message === "string" &&
+            event.message.startsWith("Message handler failed:")
+          ) {
+            settled = true;
+            cleanup();
+            reject(
+              new Error(
+                `Echo handler failed:${event.message.slice("Message handler failed:".length)}`,
+              ),
+            );
+            return;
+          }
           if (
             node === destinationNode &&
             event.type === "transfer-started" &&

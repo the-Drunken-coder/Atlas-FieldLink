@@ -7,7 +7,7 @@ export interface TransferSenderSession {
     windowStart: number,
     windowCount: number,
     timeoutMs: number,
-  ): Promise<number>;
+  ): Promise<number | undefined>;
   waitForCompletion(timeoutMs: number): Promise<void>;
 }
 

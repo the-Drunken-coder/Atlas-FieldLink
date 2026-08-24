@@ -409,7 +409,7 @@ describe("FieldLinkNode delivery", () => {
       transport: transportB,
       retryTimeoutMs: 20,
     });
-    const bulk = a.send(test("response", 300), {
+    const bulk = a.send(test("response", 1200), {
       destination: nodeB,
       priority: "bulk",
     });
@@ -483,9 +483,31 @@ describe("FieldLinkNode delivery", () => {
     await node.close();
   });
 
-  it("fails cleanly when every selective-window receipt is lost", async () => {
+  it("accepts completion when the final selective-window receipt is lost", async () => {
     const [transportA, transportB] = memoryTransportPair();
     transportB.drop = (bytes) => decodeFrame(bytes).kind === FrameKind.receipt;
+    const a = new FieldLinkNode({
+      nodeId: nodeA,
+      transport: transportA,
+      retryTimeoutMs: 5,
+    });
+    const b = new FieldLinkNode({
+      nodeId: nodeB,
+      transport: transportB,
+      retryTimeoutMs: 5,
+    });
+    await expect(
+      a.send(test("response", 300), { destination: nodeB }),
+    ).resolves.toMatchObject({ delivery: "transfer", retransmissions: 0 });
+    await Promise.all([a.close(), b.close()]);
+  });
+
+  it("fails cleanly when every receipt and completion is lost", async () => {
+    const [transportA, transportB] = memoryTransportPair();
+    transportB.drop = (bytes) => {
+      const kind = decodeFrame(bytes).kind;
+      return kind === FrameKind.receipt || kind === FrameKind.completion;
+    };
     const a = new FieldLinkNode({
       nodeId: nodeA,
       transport: transportA,
