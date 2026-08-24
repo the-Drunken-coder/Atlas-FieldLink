@@ -1,4 +1,6 @@
 import importlib.util
+import io
+import signal
 import sys
 import tempfile
 import unittest
@@ -80,6 +82,32 @@ class FieldLinkTuiTests(unittest.TestCase):
 
         stop_process.assert_called_once_with(process)
         process.wait.assert_called_once_with(timeout=TUI.STOP_TIMEOUT_SECONDS)
+
+    def test_live_stop_force_kills_after_the_deadline(self):
+        screen = mock.Mock()
+        screen.getch.return_value = ord("q")
+        process = mock.Mock(
+            stdout=io.StringIO(), stderr=io.StringIO(), returncode=None
+        )
+        process.poll.return_value = None
+        process.wait.return_value = -signal.SIGKILL
+        with (
+            mock.patch.object(TUI, "draw_run", return_value=(0, 0)),
+            mock.patch.object(TUI, "read_new_events", return_value=(0, [])),
+            mock.patch.object(TUI, "stop_process") as stop_process,
+            mock.patch.object(TUI, "kill_process") as kill_process,
+            mock.patch.object(
+                TUI.time,
+                "monotonic",
+                side_effect=[100.0, 100.0 + TUI.STOP_TIMEOUT_SECONDS],
+            ),
+        ):
+            result = TUI.run_live(screen, process, self.config())
+
+        self.assertEqual(result, -signal.SIGKILL)
+        stop_process.assert_called_once_with(process)
+        kill_process.assert_called_once_with(process)
+        process.wait.assert_called_once_with()
 
     def test_renders_chunk_progress_and_statistics(self):
         view = TUI.RunView()

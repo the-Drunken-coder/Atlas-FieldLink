@@ -532,6 +532,7 @@ def run_live(
     scroll_top = 0
     follow_tail = True
     cancelling = False
+    stop_deadline: float | None = None
     screen.timeout(100)
     summary: dict[str, Any] | None = None
     drained = False
@@ -577,10 +578,19 @@ def run_live(
             scroll_top = min(maximum_scroll_top, scroll_top + 1)
             follow_tail = scroll_top == maximum_scroll_top
         elif process.poll() is None and key in (ord("q"), 27):
-            cancelling = True
-            stop_process(process)
+            if not cancelling:
+                cancelling = True
+                stop_deadline = time.monotonic() + STOP_TIMEOUT_SECONDS
+                stop_process(process)
         elif process.poll() is not None and key != -1:
             return process.returncode or 0
+        if (
+            stop_deadline is not None
+            and process.poll() is None
+            and time.monotonic() >= stop_deadline
+        ):
+            kill_process(process)
+            return process.wait()
         if process.poll() is not None and summary is None:
             summary = load_summary(config.output / "summary.json")
 
