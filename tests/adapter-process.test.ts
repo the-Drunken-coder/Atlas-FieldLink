@@ -172,6 +172,22 @@ describe("adapter process proxy", () => {
     await expect(adapter.close()).resolves.toBeUndefined();
   });
 
+  it("cancels adapter activation and reaps the child", async () => {
+    const adapter = await AdapterProcessNode.start({
+      path: "test",
+      channel: 1,
+      allowInboxDrain: true,
+      exitTimeoutMs: 10,
+      program: nodeScript(`${writeReady()} process.stdin.resume();`),
+    });
+    const controller = new AbortController();
+    const activation = adapter.activate(controller.signal);
+    controller.abort(new Error("activation cancelled"));
+
+    await expect(activation).rejects.toThrow("activation cancelled");
+    await expect(adapter.close()).rejects.toThrow();
+  });
+
   it("preserves startup inbox evidence without delivering stale messages", async () => {
     const inbox: unknown[] = [];
     const adapter = await AdapterProcessNode.start({

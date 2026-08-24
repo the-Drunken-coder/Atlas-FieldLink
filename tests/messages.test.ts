@@ -32,6 +32,7 @@ describe("message registry contracts", () => {
       ]) {
         const message = definition.exercise.create(payloadBytes);
         expect(definition.validate(message)).toBe(true);
+        expect(definition.exercise.key(message)).not.toBe("");
         expect(definition.encode(message).length).toBeLessThanOrEqual(
           FIELDLINK_MAX_MESSAGE_BYTES,
         );

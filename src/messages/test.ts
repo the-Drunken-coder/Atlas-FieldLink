@@ -116,6 +116,9 @@ export const testMessage = {
         ),
       };
     },
+    key(message): string {
+      return message.correlationId.toString(16).padStart(8, "0");
+    },
     isComplete({ sent, received, side }): boolean {
       return (
         side === "source" &&

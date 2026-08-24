@@ -87,9 +87,15 @@ function validateExercise(
         `Message ${definition.name} has an invalid exercise payload preset`,
       );
     }
-    if (!definition.validate(exercise.create(payloadBytes))) {
+    const message = exercise.create(payloadBytes);
+    if (!definition.validate(message)) {
       throw new Error(
         `Message ${definition.name} exercise created an invalid message`,
+      );
+    }
+    if (exercise.key(message).length === 0) {
+      throw new Error(
+        `Message ${definition.name} exercise created an empty key`,
       );
     }
   }

@@ -254,6 +254,7 @@ export class FieldLinkNode {
           destination,
           logicalId,
           messageType: definition.id,
+          exerciseKey: definition.exercise.key(message),
           priority,
           strategy,
           ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -348,6 +349,7 @@ export class FieldLinkNode {
     readonly destination: NodeId;
     readonly logicalId: bigint;
     readonly messageType: number;
+    readonly exerciseKey: string;
     readonly priority: Priority;
     readonly strategy: RetryStrategy;
     readonly signal?: AbortSignal;
@@ -434,6 +436,7 @@ export class FieldLinkNode {
       at: new Date().toISOString(),
       logicalId: key,
       destination: options.destination,
+      exerciseKey: options.exerciseKey,
       encodedBytes: options.body.length,
       fragmentCount,
       retryStrategy: options.strategy.name,
@@ -553,7 +556,6 @@ export class FieldLinkNode {
     const key = logicalIdHex(frame.logicalId);
     const existing = this.#inbound.get(key);
     if (existing !== undefined) {
-      existing.lastActivity = this.#now();
       if (
         existing.source !== frame.source ||
         existing.messageType !== frame.messageType ||
@@ -566,6 +568,7 @@ export class FieldLinkNode {
         await this.#reject(frame, 6, "Conflicting transfer start");
         return;
       }
+      existing.lastActivity = this.#now();
       await this.#submit(
         responseFrame(frame, FrameKind.transferReady),
         "high",

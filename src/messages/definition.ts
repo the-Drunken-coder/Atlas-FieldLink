@@ -12,6 +12,7 @@ export interface MessageExercise<Message> {
   readonly maximumPayloadBytes: number;
   readonly payloadPresets: readonly number[];
   create(payloadBytes: number): Message;
+  key(message: Message): string;
   isComplete(input: {
     readonly sent: Message;
     readonly received: Message;

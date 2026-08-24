@@ -529,15 +529,28 @@ export class AdapterProcessNode {
     return node;
   }
 
-  activate(): Promise<void> {
+  activate(signal?: AbortSignal): Promise<void> {
     if (this.#activation !== undefined) {
       return this.#activation;
     }
-    this.#activation = this.#request({ type: "activate" }, undefined).then(
-      () => {
+    const abort = (): void => {
+      if (signal === undefined) {
+        return;
+      }
+      this.#fail(abortError(signal));
+      this.#child.kill("SIGTERM");
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    this.#activation = this.#request({ type: "activate" }, undefined)
+      .then(() => {
         this.#activated = true;
-      },
-    );
+      })
+      .finally(() => {
+        signal?.removeEventListener("abort", abort);
+      });
+    if (signal?.aborted === true) {
+      abort();
+    }
     return this.#activation;
   }
 

@@ -38,6 +38,8 @@ import {
 } from "./radio.js";
 import { retryStrategies } from "./retry-strategies/index.js";
 
+const ADAPTER_REQUEST_TIMEOUT_MARGIN_MS = 30_000;
+
 const HELP = `Usage:
   fieldlink radios list [--json]
   fieldlink messages list [--json]
@@ -164,7 +166,10 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
       record,
     );
     verifyPreflight(a, b);
-    await Promise.all([a.activate(), b.activate()]);
+    await Promise.all([
+      a.activate(controller.signal),
+      b.activate(controller.signal),
+    ]);
     record("ready", {
       a: adapterEvidence(a, command.a),
       b: adapterEvidence(b, command.b),
@@ -343,6 +348,7 @@ async function startAdapterPair(
       channel,
       allowInboxDrain: true,
       signal,
+      requestTimeoutMs: command.timeoutMs + ADAPTER_REQUEST_TIMEOUT_MARGIN_MS,
       onInboxMessage: (message) => {
         record("inbox-message", { radio: label, message });
       },
@@ -565,6 +571,7 @@ export function waitForExerciseCompletion(
     const completedTransfers = new Set<string>();
     const failedTransfers = new Map<string, Error>();
     const echoTransfers = new Set<string>();
+    const exerciseKey = definition.exercise.key(sent);
     let matched: ExerciseCompletion | undefined;
     let settled = false;
 
@@ -636,7 +643,8 @@ export function waitForExerciseCompletion(
             node === destinationNode &&
             event.type === "transfer-started" &&
             typeof event.logicalId === "string" &&
-            event.destination === sourceNode.nodeId
+            event.destination === sourceNode.nodeId &&
+            event.exerciseKey === exerciseKey
           ) {
             echoTransfers.add(transferKey(node.nodeId, event.logicalId));
             return;

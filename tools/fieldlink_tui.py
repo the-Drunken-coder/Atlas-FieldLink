@@ -22,7 +22,7 @@ from typing import Any, TextIO
 REPOSITORY = Path(__file__).resolve().parents[1]
 CLI = ("npm", "run", "--silent", "fieldlink", "--")
 DISCOVERY_TIMEOUT_SECONDS = 30
-STOP_TIMEOUT_SECONDS = 10
+STOP_TIMEOUT_SECONDS = 30
 
 
 class Cancelled(Exception):

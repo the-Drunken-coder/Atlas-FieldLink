@@ -121,11 +121,12 @@ describe("CLI message exercise", () => {
     const source = new ExerciseNodeProbe("aaaaaaaaaaaaaaaa");
     const destination = new ExerciseNodeProbe("bbbbbbbbbbbbbbbb");
     const controller = new AbortController();
+    const sent = testMessage.exercise.create(4096);
     const completion = waitForExerciseCompletion(
       source,
       destination,
       testMessage,
-      testMessage.exercise.create(4096),
+      sent,
       controller.signal,
     );
 
@@ -134,6 +135,7 @@ describe("CLI message exercise", () => {
       at: new Date().toISOString(),
       logicalId: "0000000000000001",
       destination: source.nodeId,
+      exerciseKey: testMessage.exercise.key(sent),
     });
     destination.emitEvent({
       type: "transfer-failed",
@@ -144,6 +146,51 @@ describe("CLI message exercise", () => {
 
     await expect(completion).rejects.toThrow(
       "Echo transfer failed: repairs exhausted",
+    );
+  });
+
+  it("ignores an unrelated echo transfer failure", async () => {
+    const source = new ExerciseNodeProbe("aaaaaaaaaaaaaaaa");
+    const destination = new ExerciseNodeProbe("bbbbbbbbbbbbbbbb");
+    const controller = new AbortController();
+    const sent = testMessage.exercise.create(4096);
+    const completion = waitForExerciseCompletion(
+      source,
+      destination,
+      testMessage,
+      sent,
+      controller.signal,
+    );
+
+    destination.emitEvent({
+      type: "transfer-started",
+      at: new Date().toISOString(),
+      logicalId: "0000000000000001",
+      destination: source.nodeId,
+      exerciseKey: "unrelated",
+    });
+    destination.emitEvent({
+      type: "transfer-failed",
+      at: new Date().toISOString(),
+      logicalId: "0000000000000001",
+      error: "unrelated failure",
+    });
+    destination.emitEvent({
+      type: "transfer-started",
+      at: new Date().toISOString(),
+      logicalId: "0000000000000002",
+      destination: source.nodeId,
+      exerciseKey: testMessage.exercise.key(sent),
+    });
+    destination.emitEvent({
+      type: "transfer-failed",
+      at: new Date().toISOString(),
+      logicalId: "0000000000000002",
+      error: "current failure",
+    });
+
+    await expect(completion).rejects.toThrow(
+      "Echo transfer failed: current failure",
     );
   });
 });
