@@ -47,6 +47,14 @@ declare module "@liamcottle/meshcore.js" {
     readonly manufacturerModel: string;
   }
 
+  export interface MeshCoreStatsResponse {
+    readonly data: {
+      readonly batteryMilliVolts: number;
+      readonly uptimeSecs: number;
+      readonly queueLen: number;
+    };
+  }
+
   export type MeshCoreWaitingMessage =
     | { readonly channelData: MeshCoreChannelData }
     | { readonly channelMessage: MeshCoreChannelMessage }
@@ -60,8 +68,10 @@ declare module "@liamcottle/meshcore.js" {
     once(eventName: string | number, listener: MeshCoreListener): void;
     off(eventName: string | number, listener: MeshCoreListener): void;
     getChannel(channelIndex: number): Promise<MeshCoreChannelInfo>;
+    getChannels(): Promise<readonly MeshCoreChannelInfo[]>;
     getSelfInfo(): Promise<MeshCoreSelfInfo>;
     deviceQuery(appTargetVersion: number): Promise<MeshCoreDeviceInfo>;
+    getStatsCore(): Promise<MeshCoreStatsResponse>;
     sendChannelData(
       channelIndex: number,
       pathLength: number,

@@ -1,8 +1,7 @@
 {
   "name": "atlas-fieldlink",
-  "version": "0.1.0",
   "private": true,
-  "description": "Single-radio MeshCore adapter with a two-radio validation CLI",
+  "description": "Message-centered FieldLink delivery over MeshCore",
   "type": "module",
   "engines": {
     "node": ">=24 <25"
@@ -10,14 +9,22 @@
   "bin": {
     "fieldlink": "dist/cli.js"
   },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "check": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run build",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run test:python && npm run build",
     "fieldlink": "tsx src/cli.ts",
+    "fieldlink:tui": "python3 tools/fieldlink_tui.py",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint .",
     "test": "vitest run",
+    "test:python": "python3 -m unittest discover -s tests -p 'test_*.py'",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

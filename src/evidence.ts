@@ -1,16 +1,16 @@
 import { mkdir, open, writeFile, type FileHandle } from "node:fs/promises";
 import { resolve } from "node:path";
 
-import type { HardwareCommand } from "./args.js";
+import type { TestCommand } from "./args.js";
 
-export interface RunManifest {
-  readonly schemaVersion: 3;
-  readonly command: HardwareCommand["name"];
+export interface TestManifest {
+  readonly command: "test";
+  readonly message: string;
   readonly startedAt: string;
   readonly radios: { readonly a: string; readonly b: string };
-  readonly channel: number;
-  readonly requestedCountPerPhase: number;
-  readonly datagramBytes: number;
+  readonly channel: TestCommand["channel"];
+  readonly payloadSize: number;
+  readonly retryStrategy: TestCommand["retryStrategy"];
   readonly timeoutMs: number;
   readonly inboxDrainAccepted: true;
   readonly execution: {
@@ -26,7 +26,7 @@ export interface ArtifactPaths {
   readonly summary: string;
 }
 
-export class RunArtifacts {
+export class TestArtifacts {
   readonly paths: ArtifactPaths;
   readonly #events: FileHandle;
   #writeTail: Promise<void> = Promise.resolve();
@@ -39,9 +39,9 @@ export class RunArtifacts {
   }
 
   static async create(
-    manifest: RunManifest,
+    manifest: TestManifest,
     requestedDirectory: string | undefined,
-  ): Promise<RunArtifacts> {
+  ): Promise<TestArtifacts> {
     const timestamp = manifest.startedAt.replaceAll(":", "-");
     const directory = resolve(
       requestedDirectory ?? `results/${timestamp}-${manifest.command}`,
@@ -58,12 +58,24 @@ export class RunArtifacts {
       flag: "wx",
     });
     const events = await open(paths.events, "wx");
-    return new RunArtifacts(paths, events);
+    await writeFile(
+      paths.summary,
+      `${stringify(
+        {
+          command: "test",
+          startedAt: manifest.startedAt,
+          status: "running",
+        },
+        2,
+      )}\n`,
+      { encoding: "utf8", flag: "wx" },
+    );
+    return new TestArtifacts(paths, events);
   }
 
   record(type: string, data: unknown): Promise<void> {
     if (this.#closed) {
-      return Promise.reject(new Error("Run artifacts are already closed"));
+      return Promise.reject(new Error("Test artifacts are already closed"));
     }
     const line = `${stringify({ at: new Date().toISOString(), type, data })}\n`;
     const write = this.#writeTail.then(() =>
@@ -91,7 +103,7 @@ export class RunArtifacts {
 
   async finish(summary: unknown): Promise<void> {
     if (this.#closed) {
-      throw new Error("Run artifacts are already closed");
+      throw new Error("Test artifacts are already closed");
     }
     this.#closed = true;
     const errors: Error[] = [];
@@ -113,19 +125,15 @@ export class RunArtifacts {
     try {
       await writeFile(this.paths.summary, `${stringify(summary, 2)}\n`, {
         encoding: "utf8",
-        flag: "wx",
+        flag: "w",
       });
     } catch (error: unknown) {
       errors.push(asError(error));
     }
     if (errors.length > 0) {
-      throw new AggregateError(errors, "Could not finish run artifacts");
+      throw new AggregateError(errors, "Could not finish test artifacts");
     }
   }
-}
-
-function asError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
 }
 
 function stringify(value: unknown, spaces?: number): string {
@@ -133,7 +141,7 @@ function stringify(value: unknown, spaces?: number): string {
     value,
     (_key, nested: unknown) => {
       if (nested instanceof Uint8Array) {
-        return { hex: Buffer.from(nested).toString("hex") };
+        return { base64: Buffer.from(nested).toString("base64") };
       }
       if (nested instanceof Error) {
         return { name: nested.name, message: nested.message };
@@ -142,4 +150,8 @@ function stringify(value: unknown, spaces?: number): string {
     },
     spaces,
   );
+}
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
 }

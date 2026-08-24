@@ -1,21 +1,35 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import type { Readable, Writable } from "node:stream";
+import { extname } from "node:path";
 import { createInterface } from "node:readline";
+import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import type { AdapterCommand } from "./args.js";
+import { messageRegistry, type SupportedMessage } from "./messages/index.js";
 import {
-  MeshCoreRadio,
-  type ChannelConfiguration,
-  type ChannelDatagram,
-  type DatagramListener,
-  type DatagramRadio,
+  FieldLinkNode,
+  type FieldLinkEvent,
+  type NodeId,
+  type Priority,
+  type ReceivedMessage,
+  type SendOptions,
+  type SendResult,
+} from "./node.js";
+import {
+  retryStrategies,
+  type RetryStrategyName,
+} from "./retry-strategies/index.js";
+import {
+  FIELDLINK_DATA_TYPE,
+  MeshCoreTransport,
+  safeChannelConfiguration,
+  safeRadioIdentity,
   type InboxMessage,
-  type MeshCoreRadioOptions,
-  type RadioIdentity,
+  type SafeChannelConfiguration,
+  type SafeRadioIdentity,
 } from "./radio.js";
 
-const REQUEST_TIMEOUT_MS = 75_000;
+const REQUEST_TIMEOUT_MS = 31 * 60 * 1000;
 const EXIT_TIMEOUT_MS = 5_000;
 const BYTES_MARKER = "$fieldlinkBytes";
 const CONTROLLER_OPTIONS_WITH_VALUES = new Set([
@@ -25,39 +39,69 @@ const CONTROLLER_OPTIONS_WITH_VALUES = new Set([
   "--watch-path",
 ]);
 
-interface ManagedRadio extends DatagramRadio {
-  open(): Promise<void>;
-  close(): Promise<void>;
-  getIdentity(): Promise<RadioIdentity>;
-  getChannel(index: number): Promise<ChannelConfiguration>;
+export interface AdapterReady {
+  readonly processId: number;
+  readonly identity: SafeRadioIdentity;
+  readonly channel: SafeChannelConfiguration;
+  readonly nodeId: NodeId;
+  readonly supportedMessages: readonly {
+    readonly id: number;
+    readonly name: string;
+    readonly defaultPriority: Priority;
+  }[];
+  readonly retryStrategies: readonly {
+    readonly id: number;
+    readonly name: RetryStrategyName;
+  }[];
+  readonly delivery: {
+    readonly meshCoreDataType: number;
+    readonly meshCoreMode: "flood";
+    readonly maximumChannelDatagramBytes: 163;
+  };
 }
 
-type RadioFactory = (
-  path: string,
-  options: Pick<MeshCoreRadioOptions, "onInboxMessage" | "onListenerError">,
-) => ManagedRadio;
+interface AdapterRuntime {
+  readonly node: FieldLinkNode;
+  readonly ready: AdapterReady;
+  readonly start?: () => Promise<void>;
+}
 
-type AdapterOperation =
+interface RuntimeFactoryOptions {
+  readonly path: string;
+  readonly channel: number;
+  readonly processId: number;
+  readonly onInboxMessage: (message: InboxMessage) => void | Promise<void>;
+  readonly onListenerError: (error: Error) => void | Promise<void>;
+}
+
+type RuntimeFactory = (
+  options: RuntimeFactoryOptions,
+) => Promise<AdapterRuntime>;
+
+type AdapterRequest =
   | {
+      readonly id: number;
       readonly type: "send";
-      readonly bytes: Uint8Array;
+      readonly message: SupportedMessage;
+      readonly destination: string;
+      readonly priority?: Priority;
+      readonly retryStrategy?: RetryStrategyName;
     }
-  | { readonly type: "idle" }
-  | { readonly type: "close" };
-
-type AdapterRequest = AdapterOperation & { readonly id: number };
+  | { readonly id: number; readonly type: "abort"; readonly targetId: number }
+  | { readonly id: number; readonly type: "close" };
 
 type AdapterMessage =
-  | {
-      readonly type: "ready";
-      readonly processId: number;
-      readonly identity: RadioIdentity;
-      readonly channel: ChannelConfiguration;
-    }
-  | { readonly type: "datagram"; readonly datagram: ChannelDatagram }
+  | ({ readonly type: "ready" } & AdapterReady)
+  | { readonly type: "message"; readonly message: WireReceivedMessage }
+  | { readonly type: "event"; readonly event: FieldLinkEvent }
   | { readonly type: "inbox-message"; readonly message: InboxMessage }
   | { readonly type: "listener-error"; readonly error: string }
-  | { readonly type: "response"; readonly id: number; readonly ok: true }
+  | {
+      readonly type: "response";
+      readonly id: number;
+      readonly ok: true;
+      readonly result?: SendResult;
+    }
   | {
       readonly type: "response";
       readonly id: number;
@@ -65,21 +109,8 @@ type AdapterMessage =
       readonly error: string;
     };
 
-export interface AdapterProgram {
-  readonly executable: string;
-  readonly arguments: readonly string[];
-}
-
-export interface StartAdapterProcessOptions {
-  readonly path: string;
-  readonly channel: number;
-  readonly allowInboxDrain: true;
-  readonly program?: AdapterProgram;
-  readonly onInboxMessage?: (message: InboxMessage) => void | Promise<void>;
-  readonly onListenerError?: (error: Error) => void | Promise<void>;
-  readonly onStderr?: (message: string) => void;
-  readonly onStderrEnd?: () => void;
-  readonly requestTimeoutMs?: number;
+interface WireReceivedMessage extends Omit<ReceivedMessage, "receivedAt"> {
+  readonly receivedAt: string;
 }
 
 export interface ServeAdapterOptions {
@@ -89,65 +120,47 @@ export interface ServeAdapterOptions {
   readonly output: Writable;
   readonly processId?: number;
   readonly signal?: AbortSignal;
-  readonly createRadio?: RadioFactory;
+  readonly createRuntime?: RuntimeFactory;
 }
 
-/**
- * Owns one MeshCore radio and exposes it as a newline-delimited JSON process.
- * Standard output is reserved for the control protocol.
- */
+/** Owns one FieldLinkNode and reserves stdout for typed NDJSON. */
 export async function serveAdapter(
   options: ServeAdapterOptions,
 ): Promise<void> {
   const writer = new WireWriter(options.output);
-  const createRadio =
-    options.createRadio ??
-    ((path: string, radioOptions: MeshCoreRadioOptions) =>
-      new MeshCoreRadio(path, radioOptions));
-  const radio = createRadio(options.path, {
+  const createRuntime = options.createRuntime ?? createDefaultRuntime;
+  const runtime = await createRuntime({
+    path: options.path,
+    channel: options.channel,
+    processId: options.processId ?? process.pid,
     onInboxMessage: (message) =>
-      writer.write({ type: "inbox-message", message } satisfies AdapterMessage),
+      writer.write({ type: "inbox-message", message }),
     onListenerError: (error) =>
-      writer.write({
-        type: "listener-error",
-        error: error.message,
-      } satisfies AdapterMessage),
+      writer.write({ type: "listener-error", error: error.message }),
   });
   const lines = createInterface({ input: options.input, crlfDelay: Infinity });
   const requests = lines[Symbol.asyncIterator]();
   let nextRequest = requests.next();
+  const active = new Map<number, AbortController>();
+  const activeOperations = new Map<number, Promise<void>>();
+  let closing = false;
   const stopReading = (): void => {
     lines.close();
   };
   options.signal?.addEventListener("abort", stopReading, { once: true });
-  let closed = false;
-  const closeRadio = async (): Promise<void> => {
-    if (closed) {
-      return;
-    }
-    closed = true;
-    await radio.close();
-  };
-  const unsubscribe = radio.onDatagram((datagram) =>
-    writer.write({ type: "datagram", datagram } satisfies AdapterMessage),
+  const unsubscribeMessage = runtime.node.onMessage((received) =>
+    writer.write({
+      type: "message",
+      message: { ...received, receivedAt: received.receivedAt.toISOString() },
+    }),
+  );
+  const unsubscribeEvent = runtime.node.onEvent((event) =>
+    writer.write({ type: "event", event }),
   );
 
   try {
-    await radio.open();
-    const [identity, channel] = await Promise.all([
-      radio.getIdentity(),
-      radio.getChannel(options.channel),
-    ]);
-    if (options.signal?.aborted === true) {
-      return;
-    }
-    await writer.write({
-      type: "ready",
-      processId: options.processId ?? process.pid,
-      identity,
-      channel,
-    } satisfies AdapterMessage);
-
+    await writer.write({ type: "ready", ...runtime.ready });
+    await runtime.start?.();
     for (;;) {
       const requestLine = await nextRequest;
       if (requestLine.done) {
@@ -159,23 +172,124 @@ export async function serveAdapter(
         continue;
       }
       const request = parseAdapterRequest(line);
-      const keepRunning = await handleRequest(
-        request,
-        radio,
-        options.channel,
-        writer,
-        closeRadio,
-      );
-      if (!keepRunning) {
+      if (request.type === "abort") {
+        active
+          .get(request.targetId)
+          ?.abort(new Error(`Adapter request ${request.targetId} aborted`));
+        await writer.write({ type: "response", id: request.id, ok: true });
+        continue;
+      }
+      if (request.type === "close") {
+        closing = true;
+        for (const controller of active.values()) {
+          controller.abort(new Error("Adapter is closing"));
+        }
+        await Promise.allSettled(activeOperations.values());
+        await runtime.node.close();
+        await writer.write({ type: "response", id: request.id, ok: true });
         break;
       }
+
+      const controller = new AbortController();
+      active.set(request.id, controller);
+      const operation = runtime.node
+        .send(request.message, {
+          destination: request.destination,
+          signal: controller.signal,
+          ...(request.priority === undefined
+            ? {}
+            : { priority: request.priority }),
+          ...(request.retryStrategy === undefined
+            ? {}
+            : { retryStrategy: request.retryStrategy }),
+        })
+        .then(
+          (result) =>
+            writer.write({
+              type: "response",
+              id: request.id,
+              ok: true,
+              result,
+            }),
+          (error: unknown) =>
+            writer.write({
+              type: "response",
+              id: request.id,
+              ok: false,
+              error: asError(error).message,
+            }),
+        )
+        .finally(() => {
+          active.delete(request.id);
+          activeOperations.delete(request.id);
+        });
+      activeOperations.set(request.id, operation);
     }
   } finally {
     options.signal?.removeEventListener("abort", stopReading);
-    unsubscribe();
+    unsubscribeMessage();
+    unsubscribeEvent();
     lines.close();
-    await closeRadio();
+    for (const controller of active.values()) {
+      controller.abort(new Error("Adapter input closed"));
+    }
+    await Promise.allSettled(activeOperations.values());
+    if (!closing) {
+      await runtime.node.close();
+    }
     await writer.flush();
+  }
+}
+
+async function createDefaultRuntime(
+  options: RuntimeFactoryOptions,
+): Promise<AdapterRuntime> {
+  const transport = new MeshCoreTransport(options.path, {
+    channel: options.channel,
+    onInboxMessage: options.onInboxMessage,
+    onListenerError: options.onListenerError,
+  });
+  try {
+    await transport.open();
+    const [identity, channel] = await Promise.all([
+      transport.getIdentity(),
+      transport.getChannel(),
+    ]);
+    const safeChannel = safeChannelConfiguration(channel);
+    if (!safeChannel.configured) {
+      throw new Error(`Channel ${channel.index} is not configured`);
+    }
+    const node = new FieldLinkNode({
+      nodeId: identity.nodeId,
+      transport,
+    });
+    return {
+      node,
+      start: () => transport.startInbox(),
+      ready: {
+        processId: options.processId,
+        identity: safeRadioIdentity(identity),
+        channel: safeChannel,
+        nodeId: identity.nodeId,
+        supportedMessages: messageRegistry.map((definition) => ({
+          id: definition.id,
+          name: definition.name,
+          defaultPriority: definition.defaultPriority,
+        })),
+        retryStrategies: retryStrategies.map((strategy) => ({
+          id: strategy.id,
+          name: strategy.name,
+        })),
+        delivery: {
+          meshCoreDataType: FIELDLINK_DATA_TYPE,
+          meshCoreMode: "flood",
+          maximumChannelDatagramBytes: 163,
+        },
+      },
+    };
+  } catch (error: unknown) {
+    await transport.close().catch(() => undefined);
+    throw error;
   }
 }
 
@@ -183,20 +297,11 @@ export async function runAdapterProcess(
   command: AdapterCommand,
 ): Promise<number> {
   const controller = new AbortController();
-  const handleSignal = (signal: NodeJS.Signals): void => {
-    if (!controller.signal.aborted) {
-      controller.abort(signal);
-    }
+  const abort = (): void => {
+    controller.abort(new Error("Adapter interrupted"));
   };
-  const onSigint = (): void => {
-    handleSignal("SIGINT");
-  };
-  const onSigterm = (): void => {
-    handleSignal("SIGTERM");
-  };
-  process.on("SIGINT", onSigint);
-  process.on("SIGTERM", onSigterm);
-
+  process.once("SIGINT", abort);
+  process.once("SIGTERM", abort);
   try {
     await serveAdapter({
       path: command.radio,
@@ -207,342 +312,351 @@ export async function runAdapterProcess(
     });
     return controller.signal.aborted ? 130 : 0;
   } finally {
-    process.removeListener("SIGINT", onSigint);
-    process.removeListener("SIGTERM", onSigterm);
-    process.stdin.destroy();
+    process.removeListener("SIGINT", abort);
+    process.removeListener("SIGTERM", abort);
   }
 }
 
-/** A parent-side radio proxy backed by one FieldLink adapter process. */
-export class AdapterProcessRadio implements DatagramRadio {
+export interface AdapterProgram {
+  readonly executable: string;
+  readonly arguments: readonly string[];
+}
+
+export interface StartAdapterProcessOptions {
   readonly path: string;
   readonly channel: number;
+  readonly allowInboxDrain: true;
+  readonly program?: AdapterProgram;
+  readonly signal?: AbortSignal;
+  readonly onInboxMessage?: (message: InboxMessage) => void | Promise<void>;
+  readonly onListenerError?: (error: Error) => void | Promise<void>;
+  readonly onStderr?: (message: string) => void;
+  readonly onStderrEnd?: () => void;
+  readonly requestTimeoutMs?: number;
+}
+
+interface PendingRequest {
+  readonly resolve: (result: SendResult | undefined) => void;
+  readonly reject: (error: Error) => void;
+  readonly timer: ReturnType<typeof setTimeout>;
+  readonly cleanup: () => void;
+}
+
+/** Parent-side FieldLinkNode proxy for a radio-owning adapter process. */
+export class AdapterProcessNode {
+  readonly processId: number;
+  readonly identity: SafeRadioIdentity;
+  readonly channel: SafeChannelConfiguration;
+  readonly nodeId: NodeId;
+  readonly supportedMessages: AdapterReady["supportedMessages"];
+  readonly retryStrategies: AdapterReady["retryStrategies"];
+  readonly delivery: AdapterReady["delivery"];
   readonly #child: ChildProcessWithoutNullStreams;
-  readonly #listeners = new Set<DatagramListener>();
-  readonly #pending = new Map<number, PendingRequest>();
-  readonly #readyPromise: Promise<void>;
-  readonly #writer: WireWriter;
-  readonly #onInboxMessage: StartAdapterProcessOptions["onInboxMessage"];
-  readonly #onListenerError: StartAdapterProcessOptions["onListenerError"];
   readonly #requestTimeoutMs: number;
-  #ready: Extract<AdapterMessage, { readonly type: "ready" }> | undefined;
-  #resolveReady: () => void = () => undefined;
-  #rejectReady: (error: Error) => void = () => undefined;
-  #eventTail: Promise<void> = Promise.resolve();
+  readonly #pending = new Map<number, PendingRequest>();
+  readonly #messageListeners = new Set<
+    (message: ReceivedMessage) => void | Promise<void>
+  >();
+  readonly #eventListeners = new Set<
+    (event: FieldLinkEvent) => void | Promise<void>
+  >();
   #nextRequestId = 1;
-  #closing = false;
-  #closed = false;
   #failure: Error | undefined;
-  #closePromise: Promise<void> | undefined;
-  #exit: ChildExit | undefined;
+  #closed = false;
+  #exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 
   private constructor(
     child: ChildProcessWithoutNullStreams,
+    ready: AdapterReady,
     options: StartAdapterProcessOptions,
+    exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>,
   ) {
     this.#child = child;
-    this.#writer = new WireWriter(child.stdin);
-    this.#onInboxMessage = options.onInboxMessage;
-    this.#onListenerError = options.onListenerError;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
-    this.path = options.path;
-    this.channel = options.channel;
-    this.#readyPromise = new Promise((resolve, reject) => {
-      this.#resolveReady = resolve;
-      this.#rejectReady = reject;
-    });
-  }
-
-  get processId(): number {
-    return this.#readyMessage().processId;
-  }
-
-  get identity(): RadioIdentity {
-    return this.#readyMessage().identity;
-  }
-
-  get channelConfiguration(): ChannelConfiguration {
-    return this.#readyMessage().channel;
+    this.#exit = exit;
+    this.processId = ready.processId;
+    this.identity = ready.identity;
+    this.channel = ready.channel;
+    this.nodeId = ready.nodeId;
+    this.supportedMessages = ready.supportedMessages;
+    this.retryStrategies = ready.retryStrategies;
+    this.delivery = ready.delivery;
   }
 
   static async start(
     options: StartAdapterProcessOptions,
-  ): Promise<AdapterProcessRadio> {
-    const program = options.program ?? currentAdapterProgram();
-    const child = spawn(
-      program.executable,
-      [
-        ...program.arguments,
-        "adapter",
-        "--radio",
-        options.path,
-        "--channel",
-        String(options.channel),
-        "--allow-inbox-drain",
-      ],
-      {
-        stdio: "pipe",
-        // The controller owns foreground signals and closes adapters over NDJSON.
-        detached: process.platform !== "win32",
-      },
-    );
-    let stderr = "";
+  ): Promise<AdapterProcessNode> {
+    const program = options.program ?? defaultAdapterProgram(options);
+    const child = spawn(program.executable, [...program.arguments], {
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+    });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
-      stderr = `${stderr}${chunk}`.slice(-8_192);
       options.onStderr?.(chunk);
     });
     child.stderr.once("end", () => {
       options.onStderrEnd?.();
     });
 
-    const adapter = new AdapterProcessRadio(child, options);
-    adapter.#readMessages();
-    try {
-      // Radio operations own their deadlines. Inbox draining has no fixed duration.
-      await adapter.#readyPromise;
-      return adapter;
-    } catch (error: unknown) {
-      child.stdin.end();
-      await terminateChild(child);
-      const cause = asError(error);
-      const detail = stderr.trim().replace(/^fieldlink:\s*/, "");
-      if (detail.length === 0) {
-        throw cause;
-      }
-      throw new Error(`Adapter for ${options.path} failed: ${detail}`, {
-        cause,
+    const exit = new Promise<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>((resolve) => {
+      child.once("exit", (code, signal) => {
+        resolve({ code, signal });
       });
+    });
+    const stdoutDrained = new Promise<void>((resolve) => {
+      child.stdout.once("end", resolve);
+    });
+    const spawnError = new Promise<never>((_resolve, reject) => {
+      child.once("error", (error) => {
+        reject(asError(error));
+      });
+    });
+    const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+    const iterator = lines[Symbol.asyncIterator]();
+    const abort = (): void => {
+      child.kill("SIGTERM");
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
+    let first: IteratorResult<string>;
+    try {
+      first = await Promise.race([iterator.next(), spawnError]);
+    } catch (error: unknown) {
+      lines.close();
+      child.kill("SIGTERM");
+      throw error;
+    } finally {
+      options.signal?.removeEventListener("abort", abort);
     }
+    if (first.done) {
+      throw new Error("Adapter stdout ended before ready");
+    }
+    const message = parseAdapterMessage(first.value);
+    if (message.type !== "ready") {
+      throw new Error(`Adapter sent ${message.type} before ready`);
+    }
+    const node = new AdapterProcessNode(child, message, options, exit);
+    node.#read(iterator, lines, options);
+    void exit.then(async ({ code, signal }) => {
+      await stdoutDrained;
+      if (!node.#closed || code !== 0) {
+        node.#fail(
+          new Error(
+            `Adapter exited (${signal ?? `code ${code ?? "unknown"}`})`,
+          ),
+        );
+      }
+    });
+    return node;
   }
 
-  send(channel: number, bytes: Uint8Array): Promise<void> {
-    if (channel !== this.channel) {
-      return Promise.reject(
-        new Error(
-          `Adapter for ${this.path} opened channel ${this.channel}, not ${channel}`,
-        ),
-      );
-    }
-    return this.#request({ type: "send", bytes: Uint8Array.from(bytes) });
+  send(message: SupportedMessage, options: SendOptions): Promise<SendResult> {
+    return this.#request(
+      {
+        type: "send",
+        message,
+        destination: options.destination,
+        ...(options.priority === undefined
+          ? {}
+          : { priority: options.priority }),
+        ...(options.retryStrategy === undefined
+          ? {}
+          : { retryStrategy: options.retryStrategy }),
+      },
+      options.signal,
+    ).then((result) => {
+      if (result === undefined) {
+        throw new Error("Adapter send returned no result");
+      }
+      return result;
+    });
   }
 
-  onDatagram(listener: DatagramListener): () => void {
-    this.#listeners.add(listener);
+  onMessage(
+    listener: (message: ReceivedMessage) => void | Promise<void>,
+  ): () => void {
+    this.#messageListeners.add(listener);
     return () => {
-      this.#listeners.delete(listener);
+      this.#messageListeners.delete(listener);
     };
   }
 
-  async waitUntilIdle(): Promise<void> {
-    await this.#request({ type: "idle" });
-    await this.#eventTail;
+  onEvent(
+    listener: (event: FieldLinkEvent) => void | Promise<void>,
+  ): () => void {
+    this.#eventListeners.add(listener);
+    return () => {
+      this.#eventListeners.delete(listener);
+    };
   }
 
-  close(): Promise<void> {
-    this.#closePromise ??= this.#close();
-    return this.#closePromise;
-  }
-
-  async #close(): Promise<void> {
+  async close(): Promise<void> {
     if (this.#closed) {
-      await this.#eventTail;
-      if (this.#failure !== undefined) {
-        throw this.#failure;
-      }
+      await this.#exit;
       return;
     }
-    this.#closing = true;
+    this.#closed = true;
     let closeError: Error | undefined;
     try {
-      await this.#request({ type: "close" });
+      await this.#request({ type: "close" }, undefined);
     } catch (error: unknown) {
       closeError = asError(error);
     }
     this.#child.stdin.end();
-    await terminateChild(this.#child);
-    this.#closed = true;
-    await this.#eventTail;
+    try {
+      await withTimeout(this.#exit, EXIT_TIMEOUT_MS, "adapter process exit");
+    } catch (error: unknown) {
+      this.#child.kill("SIGTERM");
+      closeError ??= asError(error);
+    }
     if (closeError !== undefined) {
       throw closeError;
     }
   }
 
-  #request(request: AdapterOperation): Promise<void> {
+  #request(
+    operation:
+      | Omit<Extract<AdapterRequest, { type: "send" }>, "id">
+      | Omit<Extract<AdapterRequest, { type: "close" }>, "id">
+      | Omit<Extract<AdapterRequest, { type: "abort" }>, "id">,
+    signal: AbortSignal | undefined,
+  ): Promise<SendResult | undefined> {
     if (this.#failure !== undefined) {
       return Promise.reject(this.#failure);
     }
-    if (this.#closed) {
-      return Promise.reject(new Error(`Adapter for ${this.path} is closed`));
+    if (signal?.aborted === true) {
+      return Promise.reject(abortError(signal));
     }
-    const id = this.#nextRequestId;
-    this.#nextRequestId += 1;
-    const message: AdapterRequest = { ...request, id };
-    return new Promise<void>((resolve, reject) => {
+    const id = this.#nextRequestId++;
+    const request = { ...operation, id } as AdapterRequest;
+    return new Promise<SendResult | undefined>((resolve, reject) => {
+      const abort = (): void => {
+        void this.#write({
+          type: "abort",
+          id: this.#nextRequestId++,
+          targetId: id,
+        }).catch(() => undefined);
+      };
+      const cleanup = (): void => {
+        signal?.removeEventListener("abort", abort);
+      };
       const timer = setTimeout(() => {
-        this.#fail(
-          new Error(
-            `Adapter for ${this.path} did not answer ${request.type} after ${this.#requestTimeoutMs} ms`,
-          ),
+        this.#pending.delete(id);
+        cleanup();
+        const error = new Error(
+          `Adapter request ${id} timed out after ${this.#requestTimeoutMs} ms`,
         );
+        this.#fail(error);
+        reject(error);
       }, this.#requestTimeoutMs);
-      this.#pending.set(id, {
-        resolve: () => {
-          clearTimeout(timer);
-          resolve();
-        },
-        reject: (error) => {
-          clearTimeout(timer);
-          reject(error);
-        },
-      });
-      void this.#writer.write(message).catch((error: unknown) => {
-        this.#fail(asError(error));
+      const pending: PendingRequest = { resolve, reject, timer, cleanup };
+      this.#pending.set(id, pending);
+      signal?.addEventListener("abort", abort, { once: true });
+      void this.#write(request).catch((error: unknown) => {
+        cleanup();
+        this.#pending.delete(id);
+        clearTimeout(timer);
+        const failure = asError(error);
+        this.#fail(failure);
+        reject(failure);
       });
     });
   }
 
-  #readMessages(): void {
-    const lines = createInterface({
-      input: this.#child.stdout,
-      crlfDelay: Infinity,
-    });
+  #read(
+    iterator: AsyncIterator<string>,
+    lines: ReturnType<typeof createInterface>,
+    options: StartAdapterProcessOptions,
+  ): void {
     void (async () => {
       try {
-        for await (const line of lines) {
-          if (line.trim().length === 0) {
-            continue;
+        for (;;) {
+          const next = await iterator.next();
+          if (next.done) {
+            return;
           }
-          this.#handleMessage(parseAdapterMessage(line));
-        }
-        if (!this.#closing || this.#pending.size > 0) {
-          const failure =
-            this.#exit === undefined
-              ? new Error(`Adapter for ${this.path} closed its output`)
-              : new Error(
-                  `Adapter for ${this.path} exited ${describeExit(this.#exit.code, this.#exit.signal)}`,
+          const message = parseAdapterMessage(next.value);
+          switch (message.type) {
+            case "response": {
+              const pending = this.#pending.get(message.id);
+              if (pending === undefined) {
+                break;
+              }
+              this.#pending.delete(message.id);
+              clearTimeout(pending.timer);
+              pending.cleanup();
+              if (message.ok) {
+                pending.resolve(message.result);
+              } else {
+                pending.reject(new Error(message.error));
+              }
+              break;
+            }
+            case "message": {
+              const received: ReceivedMessage = {
+                ...message.message,
+                receivedAt: new Date(message.message.receivedAt),
+              };
+              for (const listener of this.#messageListeners) {
+                void Promise.resolve(listener(received)).catch(
+                  async (error: unknown) => {
+                    await options.onListenerError?.(asError(error));
+                  },
                 );
-          this.#fail(failure);
+              }
+              break;
+            }
+            case "event":
+              for (const listener of this.#eventListeners) {
+                void Promise.resolve(listener(message.event)).catch(
+                  async (error: unknown) => {
+                    await options.onListenerError?.(asError(error));
+                  },
+                );
+              }
+              break;
+            case "inbox-message":
+              await options.onInboxMessage?.(message.message);
+              break;
+            case "listener-error":
+              await options.onListenerError?.(new Error(message.error));
+              break;
+            case "ready":
+              throw new Error("Adapter sent ready more than once");
+          }
         }
       } catch (error: unknown) {
         this.#fail(asError(error));
       } finally {
-        this.#closed = true;
         lines.close();
       }
     })();
-    this.#child.once("error", (error) => {
-      this.#fail(error);
-    });
-    this.#child.once("exit", (code, signal) => {
-      this.#exit = { code, signal };
-    });
   }
 
-  #handleMessage(message: AdapterMessage): void {
-    if (this.#ready === undefined) {
-      if (message.type === "ready") {
-        this.#ready = message;
-        this.#resolveReady();
-        return;
-      }
-      if (message.type === "inbox-message") {
-        void Promise.resolve(this.#onInboxMessage?.(message.message)).catch(
-          (error: unknown) => this.#notifyListenerError(asError(error)),
-        );
-        return;
-      }
-      if (message.type === "listener-error") {
-        void this.#notifyListenerError(new Error(message.error));
-        return;
-      }
-      if (message.type === "datagram") {
-        return;
-      }
-      this.#fail(
-        new Error(`Adapter for ${this.path} answered before it was ready`),
-      );
-      return;
-    }
-    if (message.type === "response") {
-      const pending = this.#pending.get(message.id);
-      if (pending === undefined) {
-        this.#fail(
-          new Error(
-            `Adapter for ${this.path} answered unknown request ${message.id}`,
-          ),
-        );
-        return;
-      }
-      this.#pending.delete(message.id);
-      if (message.ok) {
-        pending.resolve();
-      } else {
-        pending.reject(new Error(message.error));
-      }
-      return;
-    }
-    if (message.type === "datagram") {
-      this.#eventTail = this.#eventTail.then(async () => {
-        for (const listener of this.#listeners) {
-          try {
-            await listener(message.datagram);
-          } catch (error: unknown) {
-            await this.#notifyListenerError(asError(error));
-          }
+  #write(request: AdapterRequest): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.#child.stdin.write(`${stringifyWire(request)}\n`, (error) => {
+        if (error) {
+          reject(asError(error));
+        } else {
+          resolve();
         }
       });
-      return;
-    }
-    if (message.type === "inbox-message") {
-      void Promise.resolve(this.#onInboxMessage?.(message.message)).catch(
-        (error: unknown) => this.#notifyListenerError(asError(error)),
-      );
-      return;
-    }
-    if (message.type === "listener-error") {
-      void this.#notifyListenerError(new Error(message.error));
-      return;
-    }
-    this.#fail(new Error(`Adapter for ${this.path} sent ready more than once`));
-  }
-
-  async #notifyListenerError(error: Error): Promise<void> {
-    try {
-      await this.#onListenerError?.(error);
-    } catch {
-      // Reporting failures must not stop adapter traffic.
-    }
+    });
   }
 
   #fail(error: Error): void {
-    if (this.#failure !== undefined) {
-      return;
-    }
-    this.#failure = error;
-    this.#rejectReady(error);
+    this.#failure ??= error;
     for (const pending of this.#pending.values()) {
-      pending.reject(error);
+      clearTimeout(pending.timer);
+      pending.cleanup();
+      pending.reject(this.#failure);
     }
     this.#pending.clear();
   }
-
-  #readyMessage(): Extract<AdapterMessage, { readonly type: "ready" }> {
-    if (this.#ready === undefined) {
-      throw new Error(`Adapter for ${this.path} is not ready`);
-    }
-    return this.#ready;
-  }
-}
-
-interface PendingRequest {
-  readonly resolve: () => void;
-  readonly reject: (error: Error) => void;
-}
-
-interface ChildExit {
-  readonly code: number | null;
-  readonly signal: NodeJS.Signals | null;
 }
 
 class WireWriter {
@@ -553,8 +667,19 @@ class WireWriter {
     this.#output = output;
   }
 
-  write(value: AdapterRequest | AdapterMessage): Promise<void> {
-    const write = this.#tail.then(() => writeWireLine(this.#output, value));
+  write(message: AdapterMessage): Promise<void> {
+    const write = this.#tail.then(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          this.#output.write(`${stringifyWire(message)}\n`, (error) => {
+            if (error) {
+              reject(asError(error));
+            } else {
+              resolve();
+            }
+          });
+        }),
+    );
     this.#tail = write.catch(() => undefined);
     return write;
   }
@@ -564,62 +689,289 @@ class WireWriter {
   }
 }
 
-async function handleRequest(
-  request: AdapterRequest,
-  radio: ManagedRadio,
-  channel: number,
-  writer: WireWriter,
-  closeRadio: () => Promise<void>,
-): Promise<boolean> {
-  try {
-    if (request.type === "send") {
-      await radio.send(channel, request.bytes);
-    } else if (request.type === "idle") {
-      await radio.waitUntilIdle();
-    } else {
-      await closeRadio();
+function parseAdapterRequest(line: string): AdapterRequest {
+  const value = parseWire(line);
+  if (!isRecord(value) || !isRequestId(value.id)) {
+    throw new Error("Malformed adapter request");
+  }
+  if (value.type === "close") {
+    return { type: "close", id: value.id };
+  }
+  if (value.type === "abort" && isRequestId(value.targetId)) {
+    return { type: "abort", id: value.id, targetId: value.targetId };
+  }
+  if (
+    value.type === "send" &&
+    typeof value.destination === "string" &&
+    isRecord(value.message)
+  ) {
+    const priority = value.priority;
+    const retryStrategy = value.retryStrategy;
+    if (
+      priority !== undefined &&
+      priority !== "high" &&
+      priority !== "normal" &&
+      priority !== "bulk"
+    ) {
+      throw new Error("Malformed adapter priority");
     }
-    await writer.write({ type: "response", id: request.id, ok: true });
-    return request.type !== "close";
-  } catch (error: unknown) {
-    await writer.write({
-      type: "response",
-      id: request.id,
-      ok: false,
-      error: asError(error).message,
-    });
-    return request.type !== "close";
+    if (retryStrategy !== undefined && retryStrategy !== "selective-window") {
+      throw new Error("Malformed adapter retry strategy");
+    }
+    return {
+      type: "send",
+      id: value.id,
+      message: value.message as SupportedMessage,
+      destination: value.destination,
+      ...(priority === undefined ? {} : { priority }),
+      ...(retryStrategy === undefined ? {} : { retryStrategy }),
+    };
+  }
+  throw new Error("Unknown adapter request");
+}
+
+function parseAdapterMessage(line: string): AdapterMessage {
+  const value = parseWire(line);
+  if (!isAdapterMessage(value)) {
+    throw new Error("Malformed adapter message");
+  }
+  return value;
+}
+
+function isAdapterMessage(value: unknown): value is AdapterMessage {
+  if (!isRecord(value)) {
+    return false;
+  }
+  switch (value.type) {
+    case "ready":
+      return isAdapterReady(value);
+    case "message":
+      return isWireReceivedMessage(value.message);
+    case "event":
+      return (
+        isRecord(value.event) &&
+        typeof value.event.type === "string" &&
+        typeof value.event.at === "string"
+      );
+    case "inbox-message":
+      return isInboxMessage(value.message);
+    case "listener-error":
+      return typeof value.error === "string";
+    case "response":
+      if (!isRequestId(value.id) || typeof value.ok !== "boolean") {
+        return false;
+      }
+      return value.ok
+        ? value.result === undefined || isSendResult(value.result)
+        : typeof value.error === "string";
+    default:
+      return false;
   }
 }
 
-function currentAdapterProgram(): AdapterProgram {
-  const extension = import.meta.url.endsWith(".ts") ? "ts" : "js";
+function isAdapterReady(value: unknown): value is {
+  readonly type: "ready";
+} & AdapterReady {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    isRequestId(value.processId) &&
+    isNodeId(value.nodeId) &&
+    isSafeIdentity(value.identity) &&
+    isSafeChannel(value.channel) &&
+    Array.isArray(value.supportedMessages) &&
+    value.supportedMessages.every(isSupportedMessageMetadata) &&
+    Array.isArray(value.retryStrategies) &&
+    value.retryStrategies.every(isRetryStrategyMetadata) &&
+    isRecord(value.delivery) &&
+    value.delivery.meshCoreDataType === 0xffff &&
+    value.delivery.meshCoreMode === "flood" &&
+    value.delivery.maximumChannelDatagramBytes === 163
+  );
+}
+
+function isWireReceivedMessage(value: unknown): value is WireReceivedMessage {
+  return (
+    isRecord(value) &&
+    messageRegistry.some((definition) => definition.validate(value.message)) &&
+    isNodeId(value.source) &&
+    isNodeId(value.destination) &&
+    typeof value.logicalId === "string" &&
+    (value.delivery === "complete" || value.delivery === "transfer") &&
+    typeof value.receivedAt === "string" &&
+    (value.snrDb === undefined || typeof value.snrDb === "number")
+  );
+}
+
+function isSendResult(value: unknown): value is SendResult {
+  return (
+    isRecord(value) &&
+    typeof value.logicalId === "string" &&
+    isUint16(value.messageType) &&
+    typeof value.messageName === "string" &&
+    isNodeId(value.destination) &&
+    isPriority(value.priority) &&
+    (value.delivery === "complete" || value.delivery === "transfer") &&
+    isNonnegativeInteger(value.encodedBytes) &&
+    isNonnegativeInteger(value.fragments) &&
+    (value.retryStrategy === undefined ||
+      value.retryStrategy === "selective-window") &&
+    isNonnegativeInteger(value.retransmissions) &&
+    isNonnegativeInteger(value.receipts) &&
+    typeof value.durationMs === "number"
+  );
+}
+
+function isSafeIdentity(value: unknown): value is SafeRadioIdentity {
+  return (
+    isRecord(value) &&
+    isNodeId(value.nodeId) &&
+    typeof value.fingerprint === "string" &&
+    typeof value.name === "string" &&
+    typeof value.model === "string" &&
+    typeof value.firmwareVersion === "string" &&
+    typeof value.firmwareBuildDate === "string" &&
+    isNonnegativeInteger(value.firmwareProtocolCode) &&
+    isNonnegativeInteger(value.clientProtocolVersion) &&
+    isRecord(value.radio) &&
+    [
+      value.radio.frequency,
+      value.radio.bandwidth,
+      value.radio.spreadingFactor,
+      value.radio.codingRate,
+      value.radio.transmitPower,
+      value.radio.maximumTransmitPower,
+    ].every((number) => typeof number === "number")
+  );
+}
+
+function isSafeChannel(value: unknown): value is SafeChannelConfiguration {
+  return (
+    isRecord(value) &&
+    typeof value.index === "number" &&
+    Number.isInteger(value.index) &&
+    value.index >= 0 &&
+    value.index <= 7 &&
+    typeof value.name === "string" &&
+    typeof value.configured === "boolean" &&
+    typeof value.keyFingerprint === "string"
+  );
+}
+
+function isSupportedMessageMetadata(value: unknown): value is {
+  readonly id: number;
+  readonly name: string;
+  readonly defaultPriority: Priority;
+} {
+  return (
+    isRecord(value) &&
+    isUint16(value.id) &&
+    typeof value.name === "string" &&
+    isPriority(value.defaultPriority)
+  );
+}
+
+function isRetryStrategyMetadata(value: unknown): value is {
+  readonly id: number;
+  readonly name: RetryStrategyName;
+} {
+  return (
+    isRecord(value) &&
+    isNonnegativeInteger(value.id) &&
+    value.id <= 0xff &&
+    value.name === "selective-window"
+  );
+}
+
+function isInboxMessage(value: unknown): value is InboxMessage {
+  return (
+    isRecord(value) &&
+    (("channelData" in value && isRecord(value.channelData)) ||
+      ("channelMessage" in value && isRecord(value.channelMessage)) ||
+      ("contactMessage" in value && isRecord(value.contactMessage)))
+  );
+}
+
+function isPriority(value: unknown): value is Priority {
+  return value === "high" || value === "normal" || value === "bulk";
+}
+
+function isNodeId(value: unknown): value is NodeId {
+  return typeof value === "string" && /^[0-9a-f]{16}$/.test(value);
+}
+
+function isUint16(value: unknown): value is number {
+  return isNonnegativeInteger(value) && value <= 0xffff;
+}
+
+function isNonnegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function stringifyWire(value: unknown): string {
+  return JSON.stringify(value, (_key, nested: unknown) =>
+    nested instanceof Uint8Array
+      ? { [BYTES_MARKER]: Buffer.from(nested).toString("base64") }
+      : nested,
+  );
+}
+
+function parseWire(line: string): unknown {
+  return JSON.parse(line, (_key, nested: unknown) => {
+    if (
+      isRecord(nested) &&
+      Object.keys(nested).length === 1 &&
+      typeof nested[BYTES_MARKER] === "string"
+    ) {
+      return Uint8Array.from(Buffer.from(nested[BYTES_MARKER], "base64"));
+    }
+    return nested;
+  }) as unknown;
+}
+
+function defaultAdapterProgram(
+  options: StartAdapterProcessOptions,
+): AdapterProgram {
+  const current = fileURLToPath(import.meta.url);
+  const extension = extname(current);
+  const cli = fileURLToPath(new URL(`./cli${extension}`, import.meta.url));
   return {
     executable: process.execPath,
     arguments: [
-      ...adapterNodeArguments(process.execArgv),
-      fileURLToPath(new URL(`./cli.${extension}`, import.meta.url)),
+      ...filteredExecArguments(process.execArgv),
+      cli,
+      "adapter",
+      "--radio",
+      options.path,
+      "--channel",
+      String(options.channel),
+      "--allow-inbox-drain",
     ],
   };
 }
 
-/** Keeps source loaders and preloads while removing controller-only Node modes. */
-export function adapterNodeArguments(arguments_: readonly string[]): string[] {
+export function filteredExecArguments(
+  arguments_: readonly string[],
+): readonly string[] {
   const filtered: string[] = [];
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
     if (argument === undefined) {
       continue;
     }
-    if (CONTROLLER_OPTIONS_WITH_VALUES.has(argument)) {
-      index += 1;
+    const [option] = argument.split("=", 1);
+    if (
+      option === "--inspect" ||
+      option === "--inspect-brk" ||
+      option === "--watch"
+    ) {
       continue;
     }
-    if (
-      argument.startsWith("--inspect") ||
-      argument === "--watch" ||
-      argument.startsWith("--watch-")
-    ) {
+    if (option !== undefined && CONTROLLER_OPTIONS_WITH_VALUES.has(option)) {
+      if (!argument.includes("=")) {
+        index += 1;
+      }
       continue;
     }
     filtered.push(argument);
@@ -627,194 +979,42 @@ export function adapterNodeArguments(arguments_: readonly string[]): string[] {
   return filtered;
 }
 
-async function terminateChild(
-  child: ChildProcessWithoutNullStreams,
-): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return;
-  }
-  if (await waitForExit(child, EXIT_TIMEOUT_MS)) {
-    return;
-  }
-  child.kill("SIGTERM");
-  if (!(await waitForExit(child, EXIT_TIMEOUT_MS))) {
-    child.kill("SIGKILL");
-    await waitForExit(child, EXIT_TIMEOUT_MS);
-  }
-}
-
-function waitForExit(
-  child: ChildProcessWithoutNullStreams,
+function withTimeout<Result>(
+  promise: Promise<Result>,
   timeoutMs: number,
-): Promise<boolean> {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return Promise.resolve(true);
-  }
-  return new Promise((resolve) => {
+  description: string,
+): Promise<Result> {
+  return new Promise<Result>((resolve, reject) => {
     const timer = setTimeout(() => {
-      child.removeListener("exit", onExit);
-      resolve(false);
+      reject(
+        new Error(`Timed out waiting for ${description} after ${timeoutMs} ms`),
+      );
     }, timeoutMs);
-    const onExit = (): void => {
-      clearTimeout(timer);
-      resolve(true);
-    };
-    child.once("exit", onExit);
+    void promise.then(
+      (result) => {
+        clearTimeout(timer);
+        resolve(result);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(asError(error));
+      },
+    );
   });
-}
-
-function writeWireLine(
-  output: Writable,
-  value: AdapterRequest | AdapterMessage,
-): Promise<void> {
-  const line = `${JSON.stringify(value, wireReplacer)}\n`;
-  return new Promise((resolve, reject) => {
-    output.write(line, "utf8", (error: Error | null | undefined) => {
-      if (error === null || error === undefined) {
-        resolve();
-      } else {
-        reject(error);
-      }
-    });
-  });
-}
-
-function parseAdapterRequest(line: string): AdapterRequest {
-  const value: unknown = JSON.parse(line, wireReviver);
-  if (!isRecord(value) || !isRequestId(value.id)) {
-    throw new Error("Adapter request must contain a positive integer id");
-  }
-  if (value.type === "idle" || value.type === "close") {
-    return { id: value.id, type: value.type };
-  }
-  if (value.type === "send" && value.bytes instanceof Uint8Array) {
-    return { id: value.id, type: "send", bytes: value.bytes };
-  }
-  throw new Error("Adapter request type is invalid");
-}
-
-function parseAdapterMessage(line: string): AdapterMessage {
-  const value: unknown = JSON.parse(line, wireReviver);
-  if (!isRecord(value) || typeof value.type !== "string") {
-    throw new Error("Adapter message is invalid");
-  }
-  if (
-    value.type === "ready" &&
-    Number.isSafeInteger(value.processId) &&
-    isRadioIdentity(value.identity) &&
-    isChannelConfiguration(value.channel)
-  ) {
-    return {
-      type: "ready",
-      processId: value.processId as number,
-      identity: value.identity,
-      channel: value.channel,
-    };
-  }
-  if (value.type === "datagram" && isChannelDatagram(value.datagram)) {
-    return { type: "datagram", datagram: value.datagram };
-  }
-  if (value.type === "inbox-message" && "message" in value) {
-    return { type: "inbox-message", message: value.message as InboxMessage };
-  }
-  if (value.type === "listener-error" && typeof value.error === "string") {
-    return { type: "listener-error", error: value.error };
-  }
-  if (value.type === "response" && isRequestId(value.id) && value.ok === true) {
-    return { type: "response", id: value.id, ok: true };
-  }
-  if (
-    value.type === "response" &&
-    isRequestId(value.id) &&
-    value.ok === false &&
-    typeof value.error === "string"
-  ) {
-    return {
-      type: "response",
-      id: value.id,
-      ok: false,
-      error: value.error,
-    };
-  }
-  throw new Error(`Adapter message type ${value.type} is invalid`);
-}
-
-function wireReplacer(_key: string, value: unknown): unknown {
-  if (value instanceof Uint8Array) {
-    return { [BYTES_MARKER]: Buffer.from(value).toString("base64") };
-  }
-  return value;
-}
-
-function wireReviver(_key: string, value: unknown): unknown {
-  if (
-    isRecord(value) &&
-    Object.keys(value).length === 1 &&
-    typeof value[BYTES_MARKER] === "string"
-  ) {
-    return Uint8Array.from(Buffer.from(value[BYTES_MARKER], "base64"));
-  }
-  return value;
-}
-
-function isRadioIdentity(value: unknown): value is RadioIdentity {
-  if (!isRecord(value) || !isRecord(value.radio)) {
-    return false;
-  }
-  return (
-    value.publicKey instanceof Uint8Array &&
-    typeof value.fingerprint === "string" &&
-    typeof value.name === "string" &&
-    typeof value.model === "string" &&
-    typeof value.firmwareVersion === "string" &&
-    typeof value.firmwareBuildDate === "string" &&
-    typeof value.firmwareProtocolCode === "number" &&
-    typeof value.clientProtocolVersion === "number" &&
-    typeof value.radio.frequency === "number" &&
-    typeof value.radio.bandwidth === "number" &&
-    typeof value.radio.spreadingFactor === "number" &&
-    typeof value.radio.codingRate === "number" &&
-    typeof value.radio.transmitPower === "number" &&
-    typeof value.radio.maximumTransmitPower === "number"
-  );
-}
-
-function isChannelConfiguration(value: unknown): value is ChannelConfiguration {
-  return (
-    isRecord(value) &&
-    typeof value.index === "number" &&
-    typeof value.name === "string" &&
-    value.secret instanceof Uint8Array
-  );
-}
-
-function isChannelDatagram(value: unknown): value is ChannelDatagram {
-  return (
-    isRecord(value) &&
-    typeof value.channel === "number" &&
-    typeof value.dataType === "number" &&
-    typeof value.snrDb === "number" &&
-    typeof value.pathLength === "number" &&
-    value.bytes instanceof Uint8Array
-  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return typeof value === "object" && value !== null;
 }
 
 function isRequestId(value: unknown): value is number {
-  return Number.isSafeInteger(value) && typeof value === "number" && value > 0;
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
-function describeExit(
-  code: number | null,
-  signal: NodeJS.Signals | null,
-): string {
-  if (signal !== null) {
-    return `from ${signal}`;
-  }
-  return `with code ${code ?? "unknown"}`;
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error("Operation aborted");
 }
 
 function asError(error: unknown): Error {

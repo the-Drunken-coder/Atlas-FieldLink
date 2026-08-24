@@ -3,414 +3,334 @@ import { createInterface } from "node:readline";
 import { describe, expect, it } from "vitest";
 
 import {
-  AdapterProcessRadio,
-  adapterNodeArguments,
+  AdapterProcessNode,
+  filteredExecArguments,
   serveAdapter,
 } from "../src/adapter-process.js";
-import {
-  FIELDLINK_DATA_TYPE,
-  type ChannelDatagram,
-  type DatagramListener,
-  type RadioIdentity,
-} from "../src/radio.js";
+import { encodeFrame, FrameKind } from "../src/frame.js";
+import { testMessage } from "../src/messages/test.js";
+import { FieldLinkNode, parseNodeId } from "../src/node.js";
+import { MemoryTransport } from "./helpers.js";
 
-const BYTES_MARKER = "$fieldlinkBytes";
+const nodeA = parseNodeId("aaaaaaaaaaaaaaaa");
+const nodeB = parseNodeId("bbbbbbbbbbbbbbbb");
 
-class FakeManagedRadio {
-  readonly listeners = new Set<DatagramListener>();
-  readonly sent: { readonly channel: number; readonly bytes: Uint8Array }[] =
-    [];
-  openCalls = 0;
-  closeCalls = 0;
-  idleCalls = 0;
-
-  open(): Promise<void> {
-    this.openCalls += 1;
-    return Promise.resolve();
-  }
-
-  close(): Promise<void> {
-    this.closeCalls += 1;
-    return Promise.resolve();
-  }
-
-  getIdentity(): Promise<RadioIdentity> {
-    return Promise.resolve(identity());
-  }
-
-  getChannel(index: number) {
-    return Promise.resolve({
-      index,
-      name: "fieldlink-test",
-      secret: new Uint8Array(32).fill(2),
-    });
-  }
-
-  async send(channel: number, bytes: Uint8Array): Promise<void> {
-    this.sent.push({ channel, bytes: Uint8Array.from(bytes) });
-    const datagram: ChannelDatagram = {
-      channel,
-      dataType: FIELDLINK_DATA_TYPE,
-      snrDb: -6,
-      pathLength: 0xff,
-      bytes: Uint8Array.from(bytes),
-    };
-    for (const listener of this.listeners) {
-      await listener(datagram);
-    }
-  }
-
-  onDatagram(listener: DatagramListener): () => void {
-    this.listeners.add(listener);
-    return () => {
-      this.listeners.delete(listener);
-    };
-  }
-
-  waitUntilIdle(): Promise<void> {
-    this.idleCalls += 1;
-    return Promise.resolve();
-  }
-}
-
-describe("single-radio adapter process", () => {
-  it("opens one radio and serves send, idle, and close over NDJSON", async () => {
+describe("NDJSON adapter server", () => {
+  it("reports safe ready metadata and carries typed bytes as base64", async () => {
     const input = new PassThrough();
     const output = new PassThrough();
-    const messages = new TestMessageReader(output);
-    const radio = new FakeManagedRadio();
-    const running = serveAdapter({
-      path: "/dev/radio-a",
+    const transport = new MemoryTransport();
+    const node = new FieldLinkNode({ nodeId: nodeB, transport });
+    const reader = lineReader(output);
+    const serving = serveAdapter({
+      path: "/dev/cu.test",
       channel: 2,
       input,
       output,
-      processId: 321,
-      createRadio: () => radio,
+      processId: 123,
+      createRuntime: () =>
+        Promise.resolve({
+          node,
+          ready: ready(123),
+        }),
     });
-
-    expect(await messages.next("ready")).toMatchObject({
-      type: "ready",
-      processId: 321,
-      channel: { index: 2, name: "fieldlink-test" },
+    expect(await reader.nextType("ready")).toMatchObject({
+      processId: 123,
+      nodeId: nodeB,
+      supportedMessages: [{ id: 1, name: "test" }],
+      retryStrategies: [{ id: 1, name: "selective-window" }],
     });
-
     input.write(
-      wireLine({
+      `${JSON.stringify({
         id: 1,
         type: "send",
-        bytes: new Uint8Array([1, 2, 3]),
-      }),
+        message: {
+          type: "test",
+          kind: "response",
+          correlationId: 7,
+          payload: { $fieldlinkBytes: "AP8=" },
+        },
+        destination: nodeA,
+      })}\n`,
     );
-    expect(await messages.next("datagram")).toMatchObject({
-      type: "datagram",
-      datagram: { channel: 2, bytes: new Uint8Array([1, 2, 3]) },
-    });
-    expect(await messages.next("send response")).toEqual({
-      type: "response",
+    expect(await reader.nextType("response")).toMatchObject({
       id: 1,
       ok: true,
+      result: { delivery: "complete", encodedBytes: 7 },
     });
 
-    input.write(wireLine({ id: 2, type: "idle" }));
-    expect(await messages.next("idle response")).toEqual({
-      type: "response",
+    transport.inject({
+      bytes: encodeFrame({
+        transmissionId: 1,
+        kind: FrameKind.complete,
+        source: nodeA,
+        destination: nodeB,
+        logicalId: 5n,
+        messageType: 1,
+        body: testMessage.encode({
+          type: "test",
+          kind: "response",
+          correlationId: 9,
+          payload: Uint8Array.of(1, 2, 3),
+        }),
+      }),
+    });
+    const message = await reader.nextType("message");
+    expect(message).toMatchObject({
+      message: {
+        message: {
+          type: "test",
+          kind: "response",
+          correlationId: 9,
+          payload: { $fieldlinkBytes: "AQID" },
+        },
+      },
+    });
+    input.write(`${JSON.stringify({ id: 2, type: "close" })}\n`);
+    expect(await reader.nextType("response")).toMatchObject({
       id: 2,
       ok: true,
     });
-    input.write(wireLine({ id: 3, type: "close" }));
-    expect(await messages.next("close response")).toEqual({
-      type: "response",
-      id: 3,
-      ok: true,
-    });
-    await withTimeout(running, "adapter server did not stop");
-
-    expect(radio.openCalls).toBe(1);
-    expect(radio.closeCalls).toBe(1);
-    expect(radio.idleCalls).toBe(1);
-    expect(radio.sent).toEqual([
-      { channel: 2, bytes: new Uint8Array([1, 2, 3]) },
-    ]);
+    input.end();
+    await serving;
+    reader.close();
   });
 
-  it("proxies traffic through a separate child process", async () => {
-    const inbox: unknown[] = [];
-    const adapter = await AdapterProcessRadio.start({
-      path: "/dev/fixture",
+  it("keeps every stdout line valid JSON", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const lines: string[] = [];
+    output.setEncoding("utf8");
+    output.on("data", (chunk: string) =>
+      lines.push(...chunk.trim().split("\n")),
+    );
+    const node = new FieldLinkNode({
+      nodeId: nodeB,
+      transport: new MemoryTransport(),
+    });
+    const serving = serveAdapter({
+      path: "test",
       channel: 1,
-      allowInboxDrain: true,
-      program: {
-        executable: process.execPath,
-        arguments: ["-e", ADAPTER_FIXTURE],
-      },
-      onInboxMessage: (message) => {
-        inbox.push(message);
-      },
+      input,
+      output,
+      createRuntime: () => Promise.resolve({ node, ready: ready(1) }),
     });
-
-    try {
-      expect(adapter.processId).not.toBe(process.pid);
-      expect(adapter.identity.fingerprint).toBe("fixture-fingerprint");
-      expect(adapter.channelConfiguration).toMatchObject({
-        index: 1,
-        name: "fixture-channel",
-      });
-      expect(inbox).toEqual([{ channelMessage: { text: "preserved" } }]);
-
-      const received: ChannelDatagram[] = [];
-      adapter.onDatagram((datagram) => {
-        received.push(datagram);
-      });
-      await adapter.send(1, new Uint8Array([4, 5, 6]));
-      await adapter.waitUntilIdle();
-
-      expect(received).toEqual([
-        {
-          channel: 1,
-          dataType: FIELDLINK_DATA_TYPE,
-          snrDb: -7,
-          pathLength: 0xff,
-          bytes: new Uint8Array([4, 5, 6]),
-        },
-      ]);
-    } finally {
-      await adapter.close();
-    }
-  });
-
-  it("fails pending work when an adapter process exits", async () => {
-    const adapter = await AdapterProcessRadio.start({
-      path: "/dev/fixture",
-      channel: 1,
-      allowInboxDrain: true,
-      program: {
-        executable: process.execPath,
-        arguments: ["-e", ADAPTER_FIXTURE, "exit-on-idle"],
-      },
-    });
-
-    const expected = /closed its output|exited with code 7/;
-    await expect(adapter.waitUntilIdle()).rejects.toThrow(expected);
-    await expect(adapter.close()).rejects.toThrow(expected);
-  });
-
-  it("drains a close response written immediately before child exit", async () => {
-    const adapter = await AdapterProcessRadio.start({
-      path: "/dev/fixture",
-      channel: 1,
-      allowInboxDrain: true,
-      program: {
-        executable: process.execPath,
-        arguments: ["-e", ADAPTER_FIXTURE, "exit-on-close"],
-      },
-    });
-
-    await expect(adapter.close()).resolves.toBeUndefined();
-  });
-
-  it("makes a request timeout the adapter's persistent failure", async () => {
-    const adapter = await AdapterProcessRadio.start({
-      path: "/dev/fixture",
-      channel: 1,
-      allowInboxDrain: true,
-      requestTimeoutMs: 20,
-      program: {
-        executable: process.execPath,
-        arguments: ["-e", ADAPTER_FIXTURE, "ignore-idle"],
-      },
-    });
-
-    const expected = "did not answer idle after 20 ms";
-    await expect(adapter.waitUntilIdle()).rejects.toThrow(expected);
-    await expect(adapter.close()).rejects.toThrow(expected);
-  });
-
-  it("keeps loader arguments but removes controller execution modes", () => {
-    expect(
-      adapterNodeArguments([
-        "--inspect-brk",
-        "--inspect-port=9230",
-        "--watch",
-        "--watch-path",
-        "src",
-        "--watch-preserve-output",
-        "--import",
-        "tsx",
-        "--enable-source-maps",
-      ]),
-    ).toEqual(["--import", "tsx", "--enable-source-maps"]);
-  });
-
-  it("includes child stderr when adapter startup fails", async () => {
-    await expect(
-      AdapterProcessRadio.start({
-        path: "/dev/fixture",
-        channel: 1,
-        allowInboxDrain: true,
-        program: {
-          executable: process.execPath,
-          arguments: ["-e", 'console.error("radio open failed")'],
-        },
-      }),
-    ).rejects.toThrow("radio open failed");
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    input.write('{"id":1,"type":"close"}\n');
+    input.end();
+    await serving;
+    expect(lines.length).toBeGreaterThan(0);
+    expect(() => {
+      for (const line of lines) {
+        JSON.parse(line);
+      }
+    }).not.toThrow();
   });
 });
 
-function identity(): RadioIdentity {
+describe("adapter process proxy", () => {
+  it("sends typed messages and closes cooperatively", async () => {
+    const adapter = await AdapterProcessNode.start({
+      path: "test",
+      channel: 1,
+      allowInboxDrain: true,
+      program: nodeScript(cooperativeChildScript()),
+    });
+    const result = await adapter.send(
+      {
+        type: "test",
+        kind: "response",
+        correlationId: 1,
+        payload: Uint8Array.of(1, 2),
+      },
+      { destination: nodeB },
+    );
+    expect(result).toMatchObject({ delivery: "complete", encodedBytes: 7 });
+    await expect(adapter.close()).resolves.toBeUndefined();
+  });
+
+  it("rejects pending work when the child exits", async () => {
+    const adapter = await AdapterProcessNode.start({
+      path: "test",
+      channel: 1,
+      allowInboxDrain: true,
+      program: nodeScript(
+        `${writeReady()} process.stdin.once("data",()=>process.exit(7));`,
+      ),
+    });
+    await expect(
+      adapter.send(
+        {
+          type: "test",
+          kind: "response",
+          correlationId: 1,
+          payload: new Uint8Array(),
+        },
+        { destination: nodeB },
+      ),
+    ).rejects.toThrow("code 7");
+  });
+
+  it("drains the final response before treating child exit as failure", async () => {
+    const script = `${writeReady()}
+process.stdin.once("data",chunk=>{const request=JSON.parse(String(chunk).trim());const response={type:"response",id:request.id,ok:true,result:{logicalId:"0000000000000001",messageType:1,messageName:"test",destination:request.destination,priority:"normal",delivery:"complete",encodedBytes:5,fragments:1,retransmissions:0,receipts:0,durationMs:1}};process.stdout.write(JSON.stringify(response)+"\\n",()=>process.exit(0));});`;
+    const adapter = await AdapterProcessNode.start({
+      path: "test",
+      channel: 1,
+      allowInboxDrain: true,
+      program: nodeScript(script),
+    });
+    await expect(
+      adapter.send(
+        {
+          type: "test",
+          kind: "response",
+          correlationId: 1,
+          payload: new Uint8Array(),
+        },
+        { destination: nodeB },
+      ),
+    ).resolves.toMatchObject({ delivery: "complete" });
+  });
+
+  it("propagates abort and persistent request timeout", async () => {
+    const aborting = await AdapterProcessNode.start({
+      path: "test",
+      channel: 1,
+      allowInboxDrain: true,
+      program: nodeScript(abortChildScript()),
+    });
+    const controller = new AbortController();
+    const send = aborting.send(
+      {
+        type: "test",
+        kind: "response",
+        correlationId: 1,
+        payload: new Uint8Array(),
+      },
+      { destination: nodeB, signal: controller.signal },
+    );
+    controller.abort(new Error("stop"));
+    await expect(send).rejects.toThrow("aborted");
+    await aborting.close();
+
+    const timingOut = await AdapterProcessNode.start({
+      path: "test",
+      channel: 1,
+      allowInboxDrain: true,
+      requestTimeoutMs: 10,
+      program: nodeScript(
+        `${writeReady()} process.stdin.on("end",()=>process.exit(0)); process.stdin.resume();`,
+      ),
+    });
+    await expect(
+      timingOut.send(
+        {
+          type: "test",
+          kind: "response",
+          correlationId: 1,
+          payload: new Uint8Array(),
+        },
+        { destination: nodeB },
+      ),
+    ).rejects.toThrow("timed out");
+    await expect(timingOut.close()).rejects.toThrow("timed out");
+  });
+
+  it("removes controller-only execution flags from child arguments", () => {
+    expect(
+      filteredExecArguments([
+        "--import",
+        "tsx",
+        "--inspect=9229",
+        "--watch-path",
+        "src",
+        "--conditions=development",
+      ]),
+    ).toEqual(["--import", "tsx", "--conditions=development"]);
+  });
+});
+
+function ready(processId: number) {
   return {
-    publicKey: new Uint8Array(32).fill(1),
-    fingerprint: "fixture-fingerprint",
-    name: "Fixture radio",
-    model: "fixture",
-    firmwareVersion: "1.0.0",
-    firmwareBuildDate: "2026-08-22",
-    firmwareProtocolCode: 12,
-    clientProtocolVersion: 1,
-    radio: {
-      frequency: 910.525,
-      bandwidth: 250,
-      spreadingFactor: 10,
-      codingRate: 5,
-      transmitPower: 10,
-      maximumTransmitPower: 22,
+    processId,
+    identity: {
+      nodeId: nodeB,
+      fingerprint: nodeB,
+      name: "test",
+      model: "fake",
+      firmwareVersion: "1",
+      firmwareBuildDate: "2026-01-01",
+      firmwareProtocolCode: 12,
+      clientProtocolVersion: 1,
+      radio: {
+        frequency: 915_000_000,
+        bandwidth: 250_000,
+        spreadingFactor: 10,
+        codingRate: 5,
+        transmitPower: 10,
+        maximumTransmitPower: 22,
+      },
+    },
+    channel: {
+      index: 1,
+      name: "test",
+      configured: true,
+      keyFingerprint: "0011223344556677",
+    },
+    nodeId: nodeB,
+    supportedMessages: [
+      { id: 1, name: "test", defaultPriority: "normal" as const },
+    ],
+    retryStrategies: [{ id: 1, name: "selective-window" as const }],
+    delivery: {
+      meshCoreDataType: 0xffff,
+      meshCoreMode: "flood" as const,
+      maximumChannelDatagramBytes: 163 as const,
     },
   };
 }
 
-class TestMessageReader {
-  readonly #messages: unknown[] = [];
-  readonly #waiters: ((message: unknown) => void)[] = [];
-
-  constructor(input: PassThrough) {
-    const lines = createInterface({ input, crlfDelay: Infinity });
-    lines.on("line", (line) => {
-      const message = JSON.parse(line, wireReviver) as unknown;
-      const waiter = this.#waiters.shift();
-      if (waiter === undefined) {
-        this.#messages.push(message);
-      } else {
-        waiter(message);
+function lineReader(output: PassThrough) {
+  const lines = createInterface({ input: output, crlfDelay: Infinity });
+  const iterator = lines[Symbol.asyncIterator]();
+  return {
+    async nextType(type: string): Promise<Record<string, unknown>> {
+      for (;;) {
+        const next = await iterator.next();
+        if (next.done) {
+          throw new Error(`stdout ended before ${type}`);
+        }
+        const value = JSON.parse(next.value) as Record<string, unknown>;
+        if (value.type === type) {
+          return value;
+        }
       }
-    });
-  }
-
-  next(description: string): Promise<unknown> {
-    const message = this.#messages.shift();
-    if (message !== undefined) {
-      return Promise.resolve(message);
-    }
-    return withTimeout(
-      new Promise((resolve) => {
-        this.#waiters.push(resolve);
-      }),
-      `adapter did not write ${description}`,
-    );
-  }
-}
-
-function withTimeout<Result>(
-  promise: Promise<Result>,
-  message: string,
-): Promise<Result> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(message));
-    }, 1_000);
-    void promise.then(
-      (result) => {
-        clearTimeout(timer);
-        resolve(result);
-      },
-      (error: unknown) => {
-        clearTimeout(timer);
-        reject(error instanceof Error ? error : new Error(String(error)));
-      },
-    );
-  });
-}
-
-function wireLine(value: unknown): string {
-  return `${JSON.stringify(value, wireReplacer)}\n`;
-}
-
-function wireReplacer(_key: string, value: unknown): unknown {
-  if (value instanceof Uint8Array) {
-    return { [BYTES_MARKER]: Buffer.from(value).toString("base64") };
-  }
-  return value;
-}
-
-function wireReviver(_key: string, value: unknown): unknown {
-  if (
-    typeof value === "object" &&
-    value !== null &&
-    BYTES_MARKER in value &&
-    typeof (value as Record<string, unknown>)[BYTES_MARKER] === "string"
-  ) {
-    return Uint8Array.from(
-      Buffer.from(
-        (value as Record<string, string>)[BYTES_MARKER] ?? "",
-        "base64",
-      ),
-    );
-  }
-  return value;
-}
-
-const ADAPTER_FIXTURE = String.raw`
-const readline = require("node:readline");
-const marker = "${BYTES_MARKER}";
-const replacer = (_key, value) =>
-  value instanceof Uint8Array
-    ? { [marker]: Buffer.from(value).toString("base64") }
-    : value;
-const reviver = (_key, value) =>
-  value && typeof value === "object" && typeof value[marker] === "string"
-    ? Uint8Array.from(Buffer.from(value[marker], "base64"))
-    : value;
-const write = (message, callback) =>
-  process.stdout.write(JSON.stringify(message, replacer) + "\n", callback);
-const identity = ${JSON.stringify(identity(), wireReplacer)};
-write({ type: "inbox-message", message: { channelMessage: { text: "preserved" } } });
-write({
-  type: "ready",
-  processId: process.pid,
-  identity: JSON.parse(JSON.stringify(identity), reviver),
-  channel: {
-    index: 1,
-    name: "fixture-channel",
-    secret: new Uint8Array(32).fill(2),
-  },
-});
-const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-lines.on("line", (line) => {
-  const request = JSON.parse(line, reviver);
-  if (request.type === "idle" && process.argv.includes("exit-on-idle")) {
-    process.exit(7);
-  }
-  if (request.type === "idle" && process.argv.includes("ignore-idle")) {
-    return;
-  }
-  if (request.type === "send") {
-    write({
-      type: "datagram",
-      datagram: {
-        channel: 1,
-        dataType: ${FIELDLINK_DATA_TYPE},
-        snrDb: -7,
-        pathLength: 255,
-        bytes: request.bytes,
-      },
-    });
-  }
-  write({ type: "response", id: request.id, ok: true }, () => {
-    if (request.type === "close") {
+    },
+    close: () => {
       lines.close();
-      process.stdin.destroy();
-      if (process.argv.includes("exit-on-close")) {
-        process.exit(0);
-      }
-    }
-  });
-});
-`;
+    },
+  };
+}
+
+function nodeScript(source: string) {
+  return { executable: process.execPath, arguments: ["-e", source] };
+}
+
+function writeReady(): string {
+  return `process.stdout.write(${JSON.stringify(`${JSON.stringify({ type: "ready", ...ready(999) })}\n`)});`;
+}
+
+function cooperativeChildScript(): string {
+  return `${writeReady()}
+let pending="";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="send"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true,result:{logicalId:"0000000000000001",messageType:1,messageName:"test",destination:request.destination,priority:"normal",delivery:"complete",encodedBytes:7,fragments:1,retransmissions:0,receipts:0,durationMs:1}})+"\\n");}else if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}}});`;
+}
+
+function abortChildScript(): string {
+  return `${writeReady()}
+let pending="",sendId;
+process.stdin.setEncoding("utf8");
+process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="send"){sendId=request.id;}else if(request.type==="abort"){process.stdout.write(JSON.stringify({type:"response",id:sendId,ok:false,error:"Adapter request aborted"})+"\\n");}else if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}}});`;
+}

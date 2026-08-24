@@ -1,4 +1,6 @@
 dist/
 node_modules/
 results/
+__pycache__/
+*.py[cod]
 *.log

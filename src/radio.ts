@@ -4,9 +4,12 @@ import {
   type MeshCoreWaitingMessage,
 } from "@liamcottle/meshcore.js";
 import { createHash } from "node:crypto";
+import { readdir } from "node:fs/promises";
 import { SerialPort } from "serialport";
 
-import { FIELDLINK_MAX_DATAGRAM_BYTES } from "./protocol.js";
+import { MESHCORE_DATAGRAM_BYTES } from "./frame.js";
+import type { FieldLinkTransport, TransportDatagram } from "./node.js";
+import { nodeIdFromPublicKey, type NodeId } from "./node-types.js";
 
 const FLOOD_PATH_LENGTH = 0xff;
 const INBOX_POLL_INTERVAL_MS = 500;
@@ -17,24 +20,6 @@ const MIN_CHANNEL_DATAGRAM_FIRMWARE_CODE = 12;
 
 export const FIELDLINK_DATA_TYPE = Constants.DataTypes.Dev;
 
-export interface ChannelDatagram {
-  readonly channel: number;
-  readonly dataType: number;
-  readonly snrDb: number;
-  readonly pathLength: number;
-  readonly bytes: Uint8Array;
-}
-
-export type DatagramListener = (
-  datagram: ChannelDatagram,
-) => void | Promise<void>;
-
-export interface DatagramRadio {
-  send(channel: number, bytes: Uint8Array): Promise<void>;
-  onDatagram(listener: DatagramListener): () => void;
-  waitUntilIdle(): Promise<void>;
-}
-
 export interface RadioPort {
   readonly path: string;
   readonly manufacturer?: string;
@@ -43,14 +28,24 @@ export interface RadioPort {
   readonly productId?: string;
 }
 
+type ListedRadioPort = Awaited<ReturnType<typeof SerialPort.list>>[number];
+
 export interface ChannelConfiguration {
   readonly index: number;
   readonly name: string;
   readonly secret: Uint8Array;
 }
 
+export interface SafeChannelConfiguration {
+  readonly index: number;
+  readonly name: string;
+  readonly configured: boolean;
+  readonly keyFingerprint: string;
+}
+
 export interface RadioIdentity {
   readonly publicKey: Uint8Array;
+  readonly nodeId: NodeId;
   readonly fingerprint: string;
   readonly name: string;
   readonly model: string;
@@ -68,14 +63,17 @@ export interface RadioIdentity {
   };
 }
 
+export type SafeRadioIdentity = Omit<RadioIdentity, "publicKey">;
 export type InboxMessage = MeshCoreWaitingMessage;
 
-type CompanionConnection = Pick<
+export type CompanionConnection = Pick<
   SerialConnection,
   | "close"
   | "getChannel"
+  | "getChannels"
   | "getSelfInfo"
   | "deviceQuery"
+  | "getStatsCore"
   | "sendChannelData"
   | "syncNextMessage"
 > & {
@@ -90,14 +88,15 @@ type CompanionConnection = Pick<
   ): unknown;
 };
 
-export interface MeshCoreRadioOptions {
+export interface MeshCoreTransportOptions {
+  readonly channel: number;
   readonly commandTimeoutMs?: number;
   readonly connection?: CompanionConnection;
   readonly onInboxMessage?: (message: InboxMessage) => void | Promise<void>;
   readonly onListenerError?: (error: Error) => void | Promise<void>;
 }
 
-/** MeshCore's Node adapter does not await the underlying serial-port close. */
+/** MeshCore's bundled Node adapter does not await serial open or close. */
 class FieldLinkSerialConnection extends SerialConnection {
   readonly #serialPort: SerialPort;
 
@@ -124,9 +123,9 @@ class FieldLinkSerialConnection extends SerialConnection {
       this.#serialPort.open((error) => {
         if (error) {
           reject(asError(error));
-          return;
+        } else {
+          resolve();
         }
-        resolve();
       });
     });
     await this.onConnected();
@@ -143,9 +142,9 @@ class FieldLinkSerialConnection extends SerialConnection {
       this.#serialPort.close((error) => {
         if (error) {
           reject(asError(error));
-          return;
+        } else {
+          resolve();
         }
-        resolve();
       });
     });
   }
@@ -155,35 +154,41 @@ class FieldLinkSerialConnection extends SerialConnection {
       this.#serialPort.write(bytes, (error) => {
         if (error) {
           reject(asError(error));
-          return;
+        } else {
+          resolve();
         }
-        resolve();
       });
     });
   }
 }
 
-export class MeshCoreRadio implements DatagramRadio {
+/** Owns one Companion USB radio and exposes only FieldLink channel datagrams. */
+export class MeshCoreTransport implements FieldLinkTransport {
   readonly #connection: CompanionConnection;
-  readonly #listeners = new Set<DatagramListener>();
+  readonly #listeners = new Set<
+    (datagram: TransportDatagram) => void | Promise<void>
+  >();
   readonly #path: string;
+  readonly #channel: number;
   readonly #commandTimeoutMs: number;
-  readonly #onInboxMessage: MeshCoreRadioOptions["onInboxMessage"];
-  readonly #onListenerError: MeshCoreRadioOptions["onListenerError"];
+  readonly #onInboxMessage: MeshCoreTransportOptions["onInboxMessage"];
+  readonly #onListenerError: MeshCoreTransportOptions["onListenerError"];
   readonly #messageWaitingListener: (...arguments_: readonly unknown[]) => void;
   readonly #disconnectedListener: (...arguments_: readonly unknown[]) => void;
   readonly #transportErrorListener: (...arguments_: readonly unknown[]) => void;
   #commandTail: Promise<void> = Promise.resolve();
   #drainPromise: Promise<void> | undefined;
-  #drainRequestVersion = 0;
+  #drainRequestSequence = 0;
   #open = false;
+  #inboxActive = false;
   #closing = false;
-  #lifecycleVersion = 0;
+  #lifecycleGeneration = 0;
   #pollTimer: ReturnType<typeof setInterval> | undefined;
   #fatalError: Error | undefined;
 
-  constructor(path: string, options: MeshCoreRadioOptions = {}) {
+  constructor(path: string, options: MeshCoreTransportOptions) {
     this.#path = path;
+    this.#channel = options.channel;
     this.#commandTimeoutMs =
       options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
     this.#connection =
@@ -207,15 +212,14 @@ export class MeshCoreRadio implements DatagramRadio {
     if (this.#open) {
       return;
     }
-
-    const lifecycleVersion = ++this.#lifecycleVersion;
+    const lifecycleGeneration = ++this.#lifecycleGeneration;
     try {
       await withTimeout(
         this.#connection.connect(),
         connectTimeoutMs,
         `opening ${this.#path}`,
       );
-      if (lifecycleVersion !== this.#lifecycleVersion) {
+      if (lifecycleGeneration !== this.#lifecycleGeneration) {
         throw new Error(`Opening ${this.#path} was cancelled by close`);
       }
     } catch (error: unknown) {
@@ -230,17 +234,25 @@ export class MeshCoreRadio implements DatagramRadio {
       }
       throw openError;
     }
-
     this.#open = true;
+    this.#connection.on("disconnected", this.#disconnectedListener);
+    this.#connection.on("error", this.#transportErrorListener);
+  }
+
+  async startInbox(): Promise<void> {
+    this.#throwIfUnavailable();
+    if (this.#inboxActive) {
+      return;
+    }
+    this.#inboxActive = true;
     this.#connection.on(
       Constants.PushCodes.MsgWaiting,
       this.#messageWaitingListener,
     );
-    this.#connection.on("disconnected", this.#disconnectedListener);
-    this.#connection.on("error", this.#transportErrorListener);
     this.#pollTimer = setInterval(() => {
       this.#requestDrain();
     }, INBOX_POLL_INTERVAL_MS);
+    this.#pollTimer.unref();
     await this.flushInbox();
   }
 
@@ -249,8 +261,9 @@ export class MeshCoreRadio implements DatagramRadio {
       return;
     }
     this.#closing = true;
-    this.#lifecycleVersion += 1;
+    this.#lifecycleGeneration += 1;
     this.#open = false;
+    this.#inboxActive = false;
     this.#stopPolling();
     this.#connection.off(
       Constants.PushCodes.MsgWaiting,
@@ -258,7 +271,6 @@ export class MeshCoreRadio implements DatagramRadio {
     );
     this.#connection.off("disconnected", this.#disconnectedListener);
     this.#connection.off("error", this.#transportErrorListener);
-
     const errors: Error[] = [];
     try {
       await this.waitUntilIdle();
@@ -277,7 +289,7 @@ export class MeshCoreRadio implements DatagramRadio {
     }
   }
 
-  async getChannel(index: number): Promise<ChannelConfiguration> {
+  async getChannel(index = this.#channel): Promise<ChannelConfiguration> {
     this.#throwIfUnavailable();
     const channel = await this.#runTimedCommand(
       () => this.#connection.getChannel(index),
@@ -288,6 +300,24 @@ export class MeshCoreRadio implements DatagramRadio {
       name: channel.name,
       secret: channel.secret,
     };
+  }
+
+  async getChannels(): Promise<readonly ChannelConfiguration[]> {
+    this.#throwIfUnavailable();
+    const channels = await this.#runTimedCommand(
+      () => this.#connection.getChannels(),
+      `reading channels from ${this.#path}`,
+    );
+    if (channels.some((channel, index) => channel.channelIdx !== index)) {
+      throw new Error(
+        `${this.#path} returned channel slots out of order or with gaps`,
+      );
+    }
+    return channels.map((channel) => ({
+      index: channel.channelIdx,
+      name: channel.name,
+      secret: channel.secret,
+    }));
   }
 
   async getIdentity(): Promise<RadioIdentity> {
@@ -305,17 +335,16 @@ export class MeshCoreRadio implements DatagramRadio {
     );
     if (device.firmwareVer < MIN_CHANNEL_DATAGRAM_FIRMWARE_CODE) {
       throw new Error(
-        `${this.#path} reports Companion firmware code ${device.firmwareVer}; channel datagrams require 12 or newer`,
+        `${this.#path} reports Companion firmware code ${device.firmwareVer}; channel datagrams require ${MIN_CHANNEL_DATAGRAM_FIRMWARE_CODE} or newer`,
       );
     }
     const [model = "unknown", firmwareVersion = "unknown"] =
       device.manufacturerModel.split("\0").filter((part) => part.length > 0);
+    const nodeId = nodeIdFromPublicKey(self.publicKey);
     return {
       publicKey: self.publicKey,
-      fingerprint: createHash("sha256")
-        .update(self.publicKey)
-        .digest("hex")
-        .slice(0, 16),
+      nodeId,
+      fingerprint: nodeId,
       name: self.name,
       model,
       firmwareVersion,
@@ -333,18 +362,18 @@ export class MeshCoreRadio implements DatagramRadio {
     };
   }
 
-  async send(channel: number, bytes: Uint8Array): Promise<void> {
+  async send(bytes: Uint8Array): Promise<void> {
     this.#throwIfUnavailable();
-    if (bytes.length > FIELDLINK_MAX_DATAGRAM_BYTES) {
+    if (bytes.length > MESHCORE_DATAGRAM_BYTES) {
       throw new RangeError(
-        `MeshCore datagrams cannot exceed ${FIELDLINK_MAX_DATAGRAM_BYTES} bytes`,
+        `MeshCore channel data cannot exceed ${MESHCORE_DATAGRAM_BYTES} bytes`,
       );
     }
     try {
       await this.#runTimedCommand(
         () =>
           this.#connection.sendChannelData(
-            channel,
+            this.#channel,
             FLOOD_PATH_LENGTH,
             new Uint8Array(),
             FIELDLINK_DATA_TYPE,
@@ -356,14 +385,26 @@ export class MeshCoreRadio implements DatagramRadio {
       const sendError = asError(error);
       throw new Error(
         `Could not send through ${this.#path}: ${sendError.message}`,
-        {
-          cause: sendError,
-        },
+        { cause: sendError },
       );
     }
   }
 
-  onDatagram(listener: DatagramListener): () => void {
+  async getQueueLength(): Promise<number> {
+    this.#throwIfUnavailable();
+    const stats = await this.#runTimedCommand(
+      () => this.#connection.getStatsCore(),
+      `reading Core Stats from ${this.#path}`,
+    );
+    if (!Number.isInteger(stats.data.queueLen) || stats.data.queueLen < 0) {
+      throw new Error(`${this.#path} returned an invalid Core Stats queueLen`);
+    }
+    return stats.data.queueLen;
+  }
+
+  onDatagram(
+    listener: (datagram: TransportDatagram) => void | Promise<void>,
+  ): () => void {
     this.#listeners.add(listener);
     return () => {
       this.#listeners.delete(listener);
@@ -382,14 +423,16 @@ export class MeshCoreRadio implements DatagramRadio {
       );
     }
     await withTimeout(
-      Promise.all([this.#commandTail, this.#drainPromise]),
+      Promise.all([this.#commandTail, this.#drainPromise]).then(
+        () => undefined,
+      ),
       DEFAULT_IDLE_TIMEOUT_MS,
       `waiting for ${this.#path} commands to finish`,
     );
   }
 
   #requestDrain(): void {
-    this.#drainRequestVersion += 1;
+    this.#drainRequestSequence += 1;
     void this.#startDrain().catch((error: unknown) => {
       this.#makeFatal(asError(error));
     });
@@ -410,7 +453,7 @@ export class MeshCoreRadio implements DatagramRadio {
 
   async #drainInbox(): Promise<void> {
     for (;;) {
-      const observedRequestVersion = this.#drainRequestVersion;
+      const observedRequestSequence = this.#drainRequestSequence;
       for (;;) {
         const waitingMessage = await this.#runTimedCommand(
           () => this.#connection.syncNextMessage(),
@@ -423,13 +466,17 @@ export class MeshCoreRadio implements DatagramRadio {
         if (!("channelData" in waitingMessage)) {
           continue;
         }
-        const channelData = waitingMessage.channelData;
-        const datagram: ChannelDatagram = {
-          channel: channelData.channelIdx,
-          dataType: channelData.dataType,
-          snrDb: channelData.snr,
-          pathLength: channelData.pathLen,
-          bytes: channelData.data,
+        const data = waitingMessage.channelData;
+        if (
+          data.channelIdx !== this.#channel ||
+          data.dataType !== FIELDLINK_DATA_TYPE
+        ) {
+          continue;
+        }
+        const datagram: TransportDatagram = {
+          bytes: data.data,
+          snrDb: data.snr,
+          pathLength: data.pathLen,
         };
         for (const listener of this.#listeners) {
           try {
@@ -439,7 +486,10 @@ export class MeshCoreRadio implements DatagramRadio {
           }
         }
       }
-      if (!this.#open || observedRequestVersion === this.#drainRequestVersion) {
+      if (
+        !this.#open ||
+        observedRequestSequence === this.#drainRequestSequence
+      ) {
         return;
       }
     }
@@ -457,12 +507,13 @@ export class MeshCoreRadio implements DatagramRadio {
   }
 
   async #notifyListenerError(error: Error): Promise<void> {
-    if (this.#onListenerError !== undefined) {
-      try {
-        await this.#onListenerError(error);
-      } catch {
-        // The reporting hook must not stop the shared inbox drain.
-      }
+    if (this.#onListenerError === undefined) {
+      return;
+    }
+    try {
+      await this.#onListenerError(error);
+    } catch {
+      // Evidence hooks cannot stop the shared inbox drain.
     }
   }
 
@@ -513,29 +564,141 @@ export class MeshCoreRadio implements DatagramRadio {
     if (this.#fatalError !== undefined) {
       throw new Error(
         `${this.#path} is unavailable: ${this.#fatalError.message}`,
-        {
-          cause: this.#fatalError,
-        },
+        { cause: this.#fatalError },
       );
     }
   }
 }
 
+export function safeRadioIdentity(identity: RadioIdentity): SafeRadioIdentity {
+  return {
+    nodeId: identity.nodeId,
+    fingerprint: identity.fingerprint,
+    name: identity.name,
+    model: identity.model,
+    firmwareVersion: identity.firmwareVersion,
+    firmwareBuildDate: identity.firmwareBuildDate,
+    firmwareProtocolCode: identity.firmwareProtocolCode,
+    clientProtocolVersion: identity.clientProtocolVersion,
+    radio: identity.radio,
+  };
+}
+
+export function safeChannelConfiguration(
+  channel: ChannelConfiguration,
+): SafeChannelConfiguration {
+  return {
+    index: channel.index,
+    name: channel.name,
+    configured: channel.secret.some((byte) => byte !== 0),
+    keyFingerprint: createHash("sha256")
+      .update(channel.secret)
+      .digest("hex")
+      .slice(0, 16),
+  };
+}
+
+export function selectMatchingChannel(
+  a: readonly SafeChannelConfiguration[],
+  b: readonly SafeChannelConfiguration[],
+): SafeChannelConfiguration | undefined {
+  const bByIndex = new Map(b.map((channel) => [channel.index, channel]));
+  return [...a]
+    .sort((left, right) => left.index - right.index)
+    .find((channel) => {
+      const other = bByIndex.get(channel.index);
+      return (
+        channel.configured &&
+        other?.configured === true &&
+        channel.name === other.name &&
+        channel.keyFingerprint === other.keyFingerprint
+      );
+    });
+}
+
 export async function listRadioPorts(): Promise<readonly RadioPort[]> {
-  const ports = await SerialPort.list();
-  return ports
-    .map((port) => ({
-      path: port.path,
-      ...(port.manufacturer === undefined
-        ? {}
-        : { manufacturer: port.manufacturer }),
-      ...(port.serialNumber === undefined
-        ? {}
-        : { serialNumber: port.serialNumber }),
-      ...(port.vendorId === undefined ? {} : { vendorId: port.vendorId }),
-      ...(port.productId === undefined ? {} : { productId: port.productId }),
-    }))
-    .sort((left, right) => left.path.localeCompare(right.path));
+  const ports = (await SerialPort.list()).map(toRadioPort);
+  let darwinDeviceNames: readonly string[] | undefined;
+  if (process.platform === "darwin") {
+    try {
+      darwinDeviceNames = await readdir("/dev");
+    } catch {
+      darwinDeviceNames = undefined;
+    }
+  }
+  return radioPortCandidates(ports, process.platform, darwinDeviceNames);
+}
+
+export function radioPortCandidates(
+  ports: readonly RadioPort[],
+  platform: NodeJS.Platform,
+  darwinDeviceNames?: readonly string[],
+): readonly RadioPort[] {
+  if (platform !== "darwin") {
+    return ports
+      .filter(isUsbSerialCandidate)
+      .sort((left, right) => left.path.localeCompare(right.path));
+  }
+
+  const byPath = new Map(ports.map((port) => [port.path, port]));
+  const calloutPaths =
+    darwinDeviceNames === undefined
+      ? ports
+          .filter(isUsbSerialCandidate)
+          .map((port) => darwinCalloutPath(port.path))
+      : darwinDeviceNames
+          .filter((name) => name.startsWith("cu."))
+          .map((name) => `/dev/${name}`)
+          .filter((path) => {
+            const metadata =
+              byPath.get(path) ??
+              byPath.get(path.replace("/dev/cu.", "/dev/tty."));
+            return isUsbSerialCandidate(metadata ?? { path });
+          });
+
+  const candidates = new Map<string, RadioPort>();
+  for (const path of calloutPaths) {
+    const metadata =
+      byPath.get(path) ?? byPath.get(path.replace("/dev/cu.", "/dev/tty."));
+    candidates.set(path, { ...(metadata ?? {}), path });
+  }
+  return [...candidates.values()].sort((left, right) =>
+    left.path.localeCompare(right.path),
+  );
+}
+
+function toRadioPort(port: ListedRadioPort): RadioPort {
+  return {
+    path: port.path,
+    ...(port.manufacturer === undefined
+      ? {}
+      : { manufacturer: port.manufacturer }),
+    ...(port.serialNumber === undefined
+      ? {}
+      : { serialNumber: port.serialNumber }),
+    ...(port.vendorId === undefined ? {} : { vendorId: port.vendorId }),
+    ...(port.productId === undefined ? {} : { productId: port.productId }),
+  };
+}
+
+function isUsbSerialCandidate(port: RadioPort): boolean {
+  const path = port.path.toLowerCase();
+  return (
+    path.includes("usbserial") ||
+    path.includes("usbmodem") ||
+    path.includes("wchusb") ||
+    path.includes("slab_usb") ||
+    path.includes("ttyusb") ||
+    path.includes("ttyacm") ||
+    port.vendorId !== undefined ||
+    port.productId !== undefined
+  );
+}
+
+function darwinCalloutPath(path: string): string {
+  return path.startsWith("/dev/tty.")
+    ? `/dev/cu.${path.slice("/dev/tty.".length)}`
+    : path;
 }
 
 function withTimeout<Result>(

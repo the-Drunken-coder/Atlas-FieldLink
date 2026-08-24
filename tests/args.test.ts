@@ -1,107 +1,130 @@
 import { describe, expect, it } from "vitest";
 
 import { parseCommand } from "../src/args.js";
+import { FIELDLINK_MAX_MESSAGE_BYTES } from "../src/frame.js";
 
 describe("CLI arguments", () => {
-  it("parses radios list", () => {
-    expect(parseCommand(["radios", "list"])).toEqual({ name: "list" });
-  });
-
-  it("parses one adapter process", () => {
+  it("parses the three commands", () => {
+    expect(parseCommand(["radios", "list"])).toEqual({
+      name: "list-radios",
+      json: false,
+    });
+    expect(parseCommand(["messages", "list", "--json"])).toEqual({
+      name: "list-messages",
+      json: true,
+    });
     expect(
       parseCommand([
         "adapter",
         "--radio",
-        "/dev/radio",
+        "/dev/cu.a",
         "--channel",
         "2",
         "--allow-inbox-drain",
       ]),
     ).toEqual({
       name: "adapter",
-      radio: "/dev/radio",
+      radio: "/dev/cu.a",
       channel: 2,
       allowInboxDrain: true,
     });
-  });
-
-  it("parses the required benchmark command", () => {
     expect(
       parseCommand([
-        "bench",
+        "test",
         "--a",
-        "/dev/a",
+        "/dev/cu.a",
         "--b",
-        "/dev/b",
+        "/dev/cu.b",
         "--channel",
-        "1",
-        "--count",
-        "100",
-        "--payload-size",
-        "64",
+        "2",
         "--allow-inbox-drain",
       ]),
-    ).toMatchObject({
-      name: "bench",
-      channel: 1,
-      count: 100,
+    ).toEqual({
+      name: "test",
+      message: "test",
+      a: "/dev/cu.a",
+      b: "/dev/cu.b",
+      channel: 2,
       payloadSize: 64,
-      timeoutMs: 30_000,
+      retryStrategy: "selective-window",
+      timeoutMs: 1_800_000,
       allowInboxDrain: true,
     });
   });
 
-  it("uses the fixed ping datagram size and default timeout", () => {
+  it("accepts the maximum Test payload and rejects invalid values", () => {
+    const base = [
+      "test",
+      "--a",
+      "a",
+      "--b",
+      "b",
+      "--channel",
+      "7",
+      "--allow-inbox-drain",
+    ];
     expect(
       parseCommand([
-        "ping",
-        "--a",
-        "/dev/a",
-        "--b",
-        "/dev/b",
-        "--channel",
+        ...base,
+        "--payload-size",
+        String(FIELDLINK_MAX_MESSAGE_BYTES - 5),
+        "--timeout-ms",
         "1",
-        "--count",
-        "10",
-        "--allow-inbox-drain",
+        "--output",
+        "out",
       ]),
     ).toMatchObject({
-      name: "ping",
-      payloadSize: 16,
-      timeoutMs: 30_000,
+      payloadSize: FIELDLINK_MAX_MESSAGE_BYTES - 5,
+      timeoutMs: 1,
+      output: "out",
     });
-  });
-
-  it("requires explicit permission to drain both Companion inboxes", () => {
     expect(() =>
       parseCommand([
-        "ping",
-        "--a",
-        "/dev/a",
-        "--b",
-        "/dev/b",
-        "--channel",
-        "1",
-        "--count",
-        "1",
+        ...base,
+        "--payload-size",
+        String(FIELDLINK_MAX_MESSAGE_BYTES - 4),
       ]),
-    ).toThrow("--allow-inbox-drain is required");
+    ).toThrow("--payload-size");
+    expect(() => parseCommand([...base, "--retry-strategy", "magic"])).toThrow(
+      "selective-window",
+    );
+    expect(() => parseCommand([...base, "--message", "missing"])).toThrow(
+      "test",
+    );
   });
 
-  it("rejects the same serial port for both radios", () => {
+  it("selects a shared channel automatically unless explicitly overridden", () => {
+    const base = ["test", "--a", "a", "--b", "b", "--allow-inbox-drain"];
+    expect(parseCommand(base)).toMatchObject({ channel: "auto" });
+    expect(parseCommand([...base, "--channel", "auto"])).toMatchObject({
+      channel: "auto",
+    });
+    expect(parseCommand([...base, "--channel", "3"])).toMatchObject({
+      channel: 3,
+    });
+    expect(parseCommand([...base, "--channel", "39"])).toMatchObject({
+      channel: 39,
+    });
+    expect(() => parseCommand([...base, "--channel", "256"])).toThrow(
+      "between 0 and 255",
+    );
+  });
+
+  it("requires distinct ports and explicit inbox-drain acknowledgement", () => {
     expect(() =>
       parseCommand([
-        "ping",
+        "test",
         "--a",
-        "/dev/radio",
+        "same",
         "--b",
-        "/dev/radio",
+        "same",
         "--channel",
-        "1",
-        "--count",
         "1",
         "--allow-inbox-drain",
       ]),
     ).toThrow("different serial ports");
+    expect(() =>
+      parseCommand(["adapter", "--radio", "a", "--channel", "1"]),
+    ).toThrow("--allow-inbox-drain");
   });
 });

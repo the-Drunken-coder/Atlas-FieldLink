@@ -1,16 +1,23 @@
 import { parseArgs } from "node:util";
 
+import { FIELDLINK_MAX_MESSAGE_BYTES } from "./frame.js";
 import {
-  FIELDLINK_HEADER_BYTES,
-  FIELDLINK_MAX_DATAGRAM_BYTES,
-  FIELDLINK_PING_DATAGRAM_BYTES,
-} from "./protocol.js";
+  definitionForName,
+  messageRegistry,
+  type MessageName,
+} from "./messages/index.js";
+import type { RetryStrategyName } from "./retry-strategies/index.js";
 
-const DEFAULT_TIMEOUT_MS = 30_000;
-const MAX_SAMPLE_COUNT = 10_000;
+const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 
-export interface ListCommand {
-  readonly name: "list";
+export interface ListRadiosCommand {
+  readonly name: "list-radios";
+  readonly json: boolean;
+}
+
+export interface ListMessagesCommand {
+  readonly name: "list-messages";
+  readonly json: boolean;
 }
 
 export interface AdapterCommand {
@@ -20,155 +27,160 @@ export interface AdapterCommand {
   readonly allowInboxDrain: true;
 }
 
-export interface HardwareCommand {
-  readonly name: "ping" | "bench";
+export type ChannelSelection = number | "auto";
+
+export interface TestCommand {
+  readonly name: "test";
+  readonly message: MessageName;
   readonly a: string;
   readonly b: string;
-  readonly channel: number;
-  readonly count: number;
+  readonly channel: ChannelSelection;
   readonly payloadSize: number;
+  readonly retryStrategy: RetryStrategyName;
   readonly timeoutMs: number;
   readonly allowInboxDrain: true;
   readonly output?: string;
 }
 
-export type FieldLinkCommand = AdapterCommand | ListCommand | HardwareCommand;
+export type FieldLinkCommand =
+  AdapterCommand | ListMessagesCommand | ListRadiosCommand | TestCommand;
 
 export class UsageError extends Error {}
 
 export function parseCommand(arguments_: readonly string[]): FieldLinkCommand {
-  if (
-    arguments_[0] === "radios" &&
-    arguments_[1] === "list" &&
-    arguments_.length === 2
-  ) {
-    return { name: "list" };
+  if (arguments_[0] === "radios" && arguments_[1] === "list") {
+    return parseListCommand("list-radios", arguments_.slice(2));
   }
-  if (arguments_[0] === "ping" || arguments_[0] === "bench") {
-    return parseHardwareCommand(arguments_[0], arguments_.slice(1));
+  if (arguments_[0] === "messages" && arguments_[1] === "list") {
+    return parseListCommand("list-messages", arguments_.slice(2));
   }
   if (arguments_[0] === "adapter") {
     return parseAdapterCommand(arguments_.slice(1));
   }
-  throw new UsageError("Expected 'radios list', 'adapter', 'ping', or 'bench'");
+  if (arguments_[0] === "test") {
+    return parseTestCommand(arguments_.slice(1));
+  }
+  throw new UsageError(
+    "Expected 'radios list', 'messages list', 'adapter', or 'test'",
+  );
+}
+
+function parseListCommand(
+  name: ListMessagesCommand["name"] | ListRadiosCommand["name"],
+  arguments_: readonly string[],
+): ListMessagesCommand | ListRadiosCommand {
+  const parsed = parseOptions(arguments_, {
+    json: { type: "boolean", default: false },
+  });
+  return { name, json: parsed.json };
 }
 
 function parseAdapterCommand(arguments_: readonly string[]): AdapterCommand {
-  const config = {
-    args: [...arguments_],
-    allowPositionals: false,
-    strict: true,
-    options: {
-      radio: { type: "string" },
-      channel: { type: "string" },
-      "allow-inbox-drain": { type: "boolean", default: false },
-    },
-  } as const;
-  const parse = () => parseArgs(config);
-  let parsed: ReturnType<typeof parse>;
-  try {
-    parsed = parse();
-  } catch (error: unknown) {
-    throw usageError(error);
-  }
-  if (!parsed.values["allow-inbox-drain"]) {
+  const parsed = parseOptions(arguments_, {
+    radio: { type: "string" },
+    channel: { type: "string" },
+    "allow-inbox-drain": { type: "boolean", default: false },
+  });
+  if (!parsed["allow-inbox-drain"]) {
     throw inboxDrainError();
   }
   return {
     name: "adapter",
-    radio: required(parsed.values.radio, "--radio"),
-    channel: parseChannel(parsed.values.channel),
+    radio: required(parsed.radio, "--radio"),
+    channel: parseChannel(parsed.channel),
     allowInboxDrain: true,
   };
 }
 
-function parseHardwareCommand(
-  name: HardwareCommand["name"],
-  arguments_: readonly string[],
-): HardwareCommand {
-  const config = {
-    args: [...arguments_],
-    allowPositionals: false,
-    strict: true,
-    options: {
-      a: { type: "string" },
-      b: { type: "string" },
-      channel: { type: "string" },
-      count: { type: "string" },
-      "payload-size": { type: "string" },
-      "timeout-ms": { type: "string", default: String(DEFAULT_TIMEOUT_MS) },
-      "allow-inbox-drain": { type: "boolean", default: false },
-      output: { type: "string" },
-    },
-  } as const;
-  const parse = () => parseArgs(config);
-  let parsed: ReturnType<typeof parse>;
-  try {
-    parsed = parse();
-  } catch (error: unknown) {
-    throw usageError(error);
-  }
-
-  const a = required(parsed.values.a, "--a");
-  const b = required(parsed.values.b, "--b");
-  if (!parsed.values["allow-inbox-drain"]) {
-    throw inboxDrainError();
+function parseTestCommand(arguments_: readonly string[]): TestCommand {
+  const parsed = parseOptions(arguments_, {
+    a: { type: "string" },
+    b: { type: "string" },
+    channel: { type: "string" },
+    message: { type: "string", default: "test" },
+    "payload-size": { type: "string" },
+    "retry-strategy": { type: "string", default: "selective-window" },
+    "timeout-ms": { type: "string", default: String(DEFAULT_TIMEOUT_MS) },
+    output: { type: "string" },
+    "allow-inbox-drain": { type: "boolean", default: false },
+  });
+  const a = required(parsed.a, "--a");
+  const b = required(parsed.b, "--b");
+  const message = required(parsed.message, "--message");
+  const definition = definitionForName(message);
+  if (definition === undefined) {
+    throw new UsageError(
+      `--message must be one of: ${messageRegistry.map((item) => item.name).join(", ")}`,
+    );
   }
   if (a === b) {
     throw new UsageError("--a and --b must name different serial ports");
   }
-  const channel = parseChannel(parsed.values.channel);
-  const count = integer(
-    required(parsed.values.count, "--count"),
-    "--count",
-    1,
-    MAX_SAMPLE_COUNT,
-  );
-  const timeoutMs = integer(
-    required(parsed.values["timeout-ms"], "--timeout-ms"),
-    "--timeout-ms",
-    1,
-    3_600_000,
-  );
-
-  let payloadSize = FIELDLINK_PING_DATAGRAM_BYTES;
-  if (name === "bench") {
-    payloadSize = integer(
-      required(parsed.values["payload-size"], "--payload-size"),
-      "--payload-size",
-      FIELDLINK_HEADER_BYTES,
-      FIELDLINK_MAX_DATAGRAM_BYTES,
-    );
-  } else if (parsed.values["payload-size"] !== undefined) {
-    throw new UsageError("--payload-size is only valid for bench");
+  if (!parsed["allow-inbox-drain"]) {
+    throw inboxDrainError();
   }
-
+  const retryStrategy = required(parsed["retry-strategy"], "--retry-strategy");
+  if (retryStrategy !== "selective-window") {
+    throw new UsageError("--retry-strategy must be 'selective-window'");
+  }
   return {
-    name,
+    name: "test",
+    message: definition.name,
     a,
     b,
-    channel,
-    count,
-    payloadSize,
-    timeoutMs,
+    channel: parseTestChannel(parsed.channel),
+    payloadSize: integer(
+      parsed["payload-size"] ?? String(definition.exercise.defaultPayloadBytes),
+      "--payload-size",
+      0,
+      Math.min(
+        FIELDLINK_MAX_MESSAGE_BYTES,
+        definition.exercise.maximumPayloadBytes,
+      ),
+    ),
+    retryStrategy,
+    timeoutMs: integer(
+      required(parsed["timeout-ms"], "--timeout-ms"),
+      "--timeout-ms",
+      1,
+      24 * 60 * 60 * 1000,
+    ),
     allowInboxDrain: true,
-    ...(parsed.values.output === undefined
-      ? {}
-      : { output: parsed.values.output }),
+    ...(parsed.output === undefined ? {} : { output: parsed.output }),
   };
 }
 
-function parseChannel(value: string | undefined): number {
-  return integer(required(value, "--channel"), "--channel", 0, 7);
+function parseOptions<
+  Options extends Record<
+    string,
+    { readonly type: "string" | "boolean"; readonly default?: string | boolean }
+  >,
+>(arguments_: readonly string[], options: Options) {
+  try {
+    return parseArgs({
+      args: [...arguments_],
+      allowPositionals: false,
+      strict: true,
+      options,
+    }).values;
+  } catch (error: unknown) {
+    throw new UsageError(
+      error instanceof Error ? error.message : String(error),
+    );
+  }
 }
 
-function usageError(error: unknown): UsageError {
-  return new UsageError(error instanceof Error ? error.message : String(error));
+function parseChannel(value: string | undefined): number {
+  return integer(required(value, "--channel"), "--channel", 0, 255);
+}
+
+function parseTestChannel(value: string | undefined): ChannelSelection {
+  return value === undefined || value === "auto" ? "auto" : parseChannel(value);
 }
 
 function inboxDrainError(): UsageError {
   return new UsageError(
-    "--allow-inbox-drain is required because Companion inbox messages are consumed while the adapter runs",
+    "--allow-inbox-drain is required because the complete Companion inbox is consumed while FieldLink runs",
   );
 }
 
