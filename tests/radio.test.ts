@@ -17,6 +17,11 @@ describe("radio discovery", () => {
     const ports = [
       { path: "/dev/tty.Bluetooth-Incoming-Port" },
       { path: "/dev/tty.debug-console" },
+      {
+        path: "/dev/tty.usbmodem-debug-console",
+        vendorId: "239a",
+      },
+      { path: "/dev/tty.usbmodem-audio", productId: "0001" },
       { path: "/dev/tty.soundcoreSpaceOne" },
       {
         path: "/dev/tty.usbserial-4",
@@ -32,6 +37,8 @@ describe("radio discovery", () => {
         "cu.Bluetooth-Incoming-Port",
         "cu.debug-console",
         "cu.soundcoreSpaceOne",
+        "cu.usbmodem-audio",
+        "cu.usbmodem-debug-console",
         "cu.usbserial-0001",
         "cu.usbserial-4",
         "tty.usbserial-4",

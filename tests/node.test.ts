@@ -313,6 +313,35 @@ describe("FieldLinkNode delivery", () => {
     await Promise.all([a.close(), b.close()]);
   });
 
+  it("rechecks complete-message priority after waiting for MeshCore", async () => {
+    const transport = new MemoryTransport();
+    transport.queueLength = 1;
+    const node = new FieldLinkNode({ nodeId: nodeA, transport });
+    const bulk = node.send(
+      { ...test("response", 0), correlationId: 1 },
+      { destination: nodeB, priority: "bulk" },
+    );
+    await eventually(() => transport.queueLengths.length > 0);
+    const high = node.send(
+      { ...test("response", 0), correlationId: 2 },
+      { destination: nodeB, priority: "high" },
+    );
+
+    transport.queueLength = 0;
+    await Promise.all([bulk, high]);
+
+    expect(
+      transport.sent.map((bytes) => {
+        const frame = decodeFrame(bytes);
+        if (frame.kind !== FrameKind.complete) {
+          throw new Error("Expected a complete frame");
+        }
+        return testMessage.decode(frame.body).correlationId;
+      }),
+    ).toEqual([2, 1]);
+    await node.close();
+  });
+
   it("fails cleanly when every selective-window receipt is lost", async () => {
     const [transportA, transportB] = memoryTransportPair();
     transportB.drop = (bytes) => decodeFrame(bytes).kind === FrameKind.receipt;
@@ -448,6 +477,46 @@ describe("inbound transfer validation", () => {
     await transport.settle();
     await eventually(() => messages.length === 1);
     expect(messages[0]?.message).toEqual(test("response", 200));
+    await node.close();
+  });
+
+  it("keeps a completed tombstone when a delayed cancellation arrives", async () => {
+    const transport = new MemoryTransport();
+    const node = new FieldLinkNode({ nodeId: nodeB, transport });
+    const transfer = transferFrames(
+      11n,
+      testMessage.encode(test("response", 200)),
+      1,
+    );
+    const messages: ReceivedMessage[] = [];
+    node.onMessage((message) => {
+      messages.push(message);
+    });
+
+    transport.inject({ bytes: encodeFrame(transfer.start) });
+    for (const fragment of transfer.fragments) {
+      transport.inject({ bytes: encodeFrame(fragment) });
+    }
+    await transport.settle();
+    await eventually(() => messages.length === 1);
+
+    transport.inject({
+      bytes: encodeFrame({
+        transmissionId: 99,
+        kind: FrameKind.cancellation,
+        source: nodeA,
+        destination: nodeB,
+        logicalId: 11n,
+        code: 1,
+      }),
+    });
+    transport.inject({ bytes: encodeFrame(transfer.start) });
+    for (const fragment of transfer.fragments) {
+      transport.inject({ bytes: encodeFrame(fragment) });
+    }
+    await transport.settle();
+
+    expect(messages).toHaveLength(1);
     await node.close();
   });
 

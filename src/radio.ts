@@ -691,6 +691,18 @@ function toRadioPort(port: ListedRadioPort): RadioPort {
 
 function isUsbSerialCandidate(port: RadioPort): boolean {
   const path = port.path.toLowerCase();
+  if (
+    [
+      "bluetooth",
+      "debug-console",
+      "debug_console",
+      "debugconsole",
+      "audio",
+      "soundcore",
+    ].some((marker) => path.includes(marker))
+  ) {
+    return false;
+  }
   return (
     path.includes("usbserial") ||
     path.includes("usbmodem") ||

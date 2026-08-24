@@ -511,15 +511,25 @@ export class FieldLinkNode {
       case FrameKind.rejection:
         this.#receiveOutboundControl(frame);
         return;
-      case FrameKind.cancellation:
-        this.#inbound.delete(logicalIdHex(frame.logicalId));
+      case FrameKind.cancellation: {
+        const key = logicalIdHex(frame.logicalId);
+        const transfer = this.#inbound.get(key);
+        if (
+          transfer === undefined ||
+          transfer.source !== frame.source ||
+          transfer.completed
+        ) {
+          return;
+        }
+        this.#inbound.delete(key);
         this.#emit({
           type: "transfer-cancelled",
           at: new Date().toISOString(),
-          logicalId: logicalIdHex(frame.logicalId),
+          logicalId: key,
           source: frame.source,
         });
         return;
+      }
     }
   }
 
@@ -1038,13 +1048,26 @@ class FrameScheduler {
 
   async #run(): Promise<void> {
     for (;;) {
-      const item = this.#takeNext();
-      if (item === undefined) {
+      const waiting = this.#next();
+      if (waiting === undefined) {
         return;
       }
       try {
+        throwIfAborted(waiting.signal);
+        await this.#waitForShallowQueue(waiting.signal);
+      } catch (error: unknown) {
+        this.#remove(waiting);
+        this.#reject(waiting, error);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        continue;
+      }
+
+      const item = this.#takeNext();
+      if (item === undefined) {
+        continue;
+      }
+      try {
         throwIfAborted(item.signal);
-        await this.#waitForShallowQueue(item.signal);
         await this.#transport.send(item.bytes);
         await this.#waitForShallowQueue(item.signal);
         this.#emit({
@@ -1055,13 +1078,7 @@ class FrameScheduler {
         });
         item.resolve();
       } catch (error: unknown) {
-        const failure = asError(error);
-        this.#emit({
-          type: "transport-error",
-          at: new Date().toISOString(),
-          message: failure.message,
-        });
-        item.reject(failure);
+        this.#reject(item, error);
       }
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
@@ -1091,6 +1108,24 @@ class FrameScheduler {
     return (
       this.#queues.high[0] ?? this.#queues.normal[0] ?? this.#queues.bulk[0]
     );
+  }
+
+  #remove(item: ScheduledFrame): void {
+    const queue = this.#queues[item.priority];
+    const index = queue.indexOf(item);
+    if (index !== -1) {
+      queue.splice(index, 1);
+    }
+  }
+
+  #reject(item: ScheduledFrame, error: unknown): void {
+    const failure = asError(error);
+    this.#emit({
+      type: "transport-error",
+      at: new Date().toISOString(),
+      message: failure.message,
+    });
+    item.reject(failure);
   }
 
   #ensureRunning(): void {
