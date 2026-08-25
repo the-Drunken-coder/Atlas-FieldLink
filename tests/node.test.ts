@@ -302,7 +302,11 @@ describe("FieldLinkNode delivery", () => {
   it("does not let an aborted cancellation wait on the MeshCore queue", async () => {
     const transport = new MemoryTransport();
     transport.queueLength = 1;
-    const node = new FieldLinkNode({ nodeId: nodeA, transport });
+    const node = new FieldLinkNode({
+      nodeId: nodeA,
+      transport,
+      retryTimeoutMs: 10,
+    });
     const controller = new AbortController();
     const sending = node.send(test("response", 200), {
       destination: nodeB,
@@ -315,6 +319,60 @@ describe("FieldLinkNode delivery", () => {
 
     await rejected;
     await node.close();
+  });
+
+  it("releases the receiver transfer slot after caller cancellation", async () => {
+    const [transportA, transportB] = memoryTransportPair();
+    transportA.drop = (bytes) => decodeFrame(bytes).kind === FrameKind.fragment;
+    const a = new FieldLinkNode({
+      nodeId: nodeA,
+      transport: transportA,
+      retryTimeoutMs: 20,
+    });
+    const b = new FieldLinkNode({
+      nodeId: nodeB,
+      transport: transportB,
+      retryTimeoutMs: 20,
+    });
+    let controller: AbortController | undefined;
+    let cancellationsRemaining = 4;
+    const events: FieldLinkEvent[] = [];
+    b.onEvent((event) => {
+      events.push(event);
+      if (event.type === "transfer-accepted" && cancellationsRemaining > 0) {
+        cancellationsRemaining -= 1;
+        controller?.abort(new Error("caller cancelled transfer"));
+      }
+    });
+
+    try {
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        controller = new AbortController();
+        await expect(
+          a.send(test("response", 4096), {
+            destination: nodeB,
+            signal: controller.signal,
+          }),
+        ).rejects.toThrow("caller cancelled transfer");
+        await Promise.all([transportA.settle(), transportB.settle()]);
+      }
+
+      expect(
+        transportA.sent
+          .map(decodeFrame)
+          .filter((frame) => frame.kind === FrameKind.cancellation),
+      ).toHaveLength(4);
+      expect(
+        events.filter((event) => event.type === "transfer-cancelled"),
+      ).toHaveLength(4);
+
+      transportA.drop = undefined;
+      await expect(
+        a.send(test("response", 4096), { destination: nodeB }),
+      ).resolves.toMatchObject({ delivery: "transfer" });
+    } finally {
+      await Promise.all([a.close(), b.close()]);
+    }
   });
 
   it("isolates synchronous message and event listener failures", async () => {

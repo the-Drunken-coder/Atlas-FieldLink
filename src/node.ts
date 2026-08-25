@@ -463,10 +463,12 @@ export class FieldLinkNode {
         error: failure.message,
       });
       if (!this.#closed) {
+        // Caller cancellation must not cancel the cleanup that releases remote state.
+        const cancellationSignal = AbortSignal.timeout(this.#retryTimeoutMs);
         await this.#submit(
           { ...base, kind: FrameKind.cancellation, code: 1 },
           "high",
-          options.signal,
+          cancellationSignal,
         ).catch(() => undefined);
       }
       throw failure;
