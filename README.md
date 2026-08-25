@@ -1,113 +1,203 @@
 # Atlas FieldLink
 
-FieldLink is a single-radio software adapter plus a local two-radio test controller. One adapter process owns one MeshCore Companion USB radio. The deployed shape is one Raspberry Pi, one FieldLink adapter process, and one radio.
-
-The current `ping` and `bench` commands start two copies of that adapter on one computer. Each copy gets one serial port. The controller drives both adapters through newline-delimited JSON over standard input and output, but it never opens either radio itself.
+FieldLink delivers registered binary messages through one MeshCore Companion USB radio. The public module is `FieldLinkNode`. A thin NDJSON adapter exposes the same interface across a process boundary, and the local `fieldlink test` command starts two adapters to prove a real RF echo.
 
 ```text
-Test controller
-  |-- Adapter A process -- USB radio A ~~ RF ~~ USB radio B -- Adapter B process
+Atlas-side caller
+  -> FieldLinkNode or adapter process
+  -> MeshCore Companion USB radio
+  -> MeshCore channel and RF mesh
 ```
 
-This structure exercises the same radio-owning process intended for a Raspberry Pi deployment. It does not integrate with Atlas yet. It does not flash firmware, configure radio parameters, change channels, implement routing, or send text messages.
+FieldLink does not flash firmware, write radio configuration, change channels, or replace MeshCore routing. It uses MeshCore channel data type `0xFFFF`, flood delivery, and the 163-byte channel-datagram limit.
 
 ## Requirements
 
 - Node.js 24
-- Two radios already flashed with MeshCore Companion USB firmware
-- The same non-empty channel configured in the same slot on both radios
-- Both radios connected to the test computer over USB
+- Python 3 for the optional terminal console
+- MeshCore.js 1.13.0
+- MeshCore Companion USB firmware with channel-data support
+- A shared non-empty channel configured in the same slot on both radios
+- Two dedicated radios with matching LoRa and channel settings for hardware testing
 
-Use dedicated test radios. MeshCore exposes a shared Companion inbox, so FieldLink must consume both inboxes while it looks for channel datagrams. The required `--allow-inbox-drain` flag acknowledges this behavior. Every consumed channel, contact, and text message is preserved in the run's `events.jsonl` artifact.
-
-Each adapter opens its own radio, reads its identity and selected channel, and returns that preflight information to the controller. The controller checks that the radios have different full public keys and matching LoRa and channel settings. It records short SHA-256 fingerprints and never writes radio configuration.
-
-## Install
+Install exactly from the lockfile:
 
 ```bash
-npm install
+npm ci
 ```
 
-## Find serial ports
+## FieldLinkNode
+
+```ts
+import { FieldLinkNode, type FieldLinkTransport } from "atlas-fieldlink";
+
+async function sendTest(nodeId: string, transport: FieldLinkTransport) {
+  const node = new FieldLinkNode({ nodeId, transport });
+
+  const unsubscribe = node.onMessage((received) => {
+    console.log(received.source, received.message);
+  });
+
+  try {
+    return await node.send(
+      {
+        type: "test",
+        kind: "request",
+        correlationId: 1,
+        payload: Uint8Array.of(1, 2, 3),
+      },
+      {
+        destination: "0123456789abcdef",
+        priority: "normal",
+        retryStrategy: "selective-window",
+      },
+    );
+  } finally {
+    unsubscribe();
+    await node.close();
+  }
+}
+```
+
+The module exposes this interface:
+
+```ts
+send(message, {
+  destination,
+  priority?,
+  retryStrategy?,
+  signal?,
+}): Promise<SendResult>
+
+onMessage(listener): () => void
+onEvent(listener): () => void
+close(): Promise<void>
+```
+
+A Node ID is the first eight bytes of the SHA-256 hash of a MeshCore public key, written as 16 lowercase hexadecimal characters. It is an address, not proof of identity. Any member of the MeshCore channel can spoof a FieldLink source or destination Node ID. FieldLink relies on MeshCore channel membership as its only sender trust.
+
+## Messages
+
+Message-specific behavior lives in one file under `src/messages/`. A message definition owns its stable `uint16` ID, name, default priority, runtime validation, binary codec, examples, hardware exercise, and optional inbound handler. `src/messages/test.ts` documents and implements the only registered message.
+
+The explicit registry is `src/messages/index.ts`. Adding a message requires one new message file and one registry entry. Startup rejects duplicate IDs or names. Generic contract tests validate every registered example and codec round trip.
+
+The hardware exercise constructs a representative message and recognizes successful end-to-end delivery. This keeps message-specific test input and completion rules in the message file while the CLI continues to own radios, transport, evidence, and timing.
+
+Test has request and response variants. Both carry a `uint32` correlation ID and arbitrary bytes. A received request is echoed to its source with identical correlation and payload. A response is delivered to listeners and never echoed.
+
+## Delivery
+
+An encoded message of 132 bytes or less uses one complete FieldLink frame. Larger messages use an in-memory transfer with 132-byte fragments. The maximum encoded message is 1 MiB.
+
+Every FieldLink frame submission carries a 16-bit transmission ID. MeshCore can suppress duplicate RF copies of one submission, while an intentional FieldLink retry has a new ID and reaches the receiver. Fragment indexes and logical transfer IDs still make reassembly idempotent.
+
+FieldLink ships `selective-window`, retry strategy ID 1:
+
+- The receiver accepts the transfer before fragments are sent.
+- The sender transmits windows of eight fragments.
+- A one-byte receipt bitmap identifies received fragments.
+- Only missing fragments are repaired.
+- Each window allows five repair rounds with a 30-second receipt timeout.
+- Completion is sent only after length and SHA-256 validation.
+
+FieldLink permits one outbound transfer, four active inbound transfers, and 64 pending sends per node. Inactive inbound state expires after two minutes. High, normal, and bulk queues are checked between every MeshCore frame. Core Stats `queueLen` keeps the radio queue shallow so a high-priority complete message can preempt a bulk transfer.
+
+Transfers are not persisted. Restart, disconnect, shutdown, abort, or exhausted retries fail the transfer and require the caller to send it again. FieldLink does not add compression, persistent resume, replay protection, or signatures.
+
+MeshCore remains responsible for channel encryption and integrity, RF routing, repeater forwarding, radio-packet duplicate suppression, its transmit queue, and the shared Companion inbox. FieldLink adds only message framing, destination filtering, transfer reassembly, selective repair, application priority, and delivery evidence that MeshCore does not provide.
+
+## Commands
+
+List current USB serial radio candidates:
 
 ```bash
 npm run fieldlink -- radios list
 ```
 
-The command lists every serial port reported by the host. Use the `/dev/cu.*` paths for the two Companion radios.
+On macOS, discovery reads current `/dev/cu.*` entries and keeps USB serial and USB modem callout paths. It hides Bluetooth, debug-console, audio, and other unrelated serial endpoints. A listed path is still unverified. The adapter confirms MeshCore Companion identity and capabilities during preflight before any test traffic is sent.
 
-## Adapter process
+List the message registry and its runnable payload presets:
+
+```bash
+npm run fieldlink -- messages list
+npm run fieldlink -- messages list --json
+```
+
+Run one deployed adapter process:
 
 ```bash
 npm run fieldlink -- adapter \
   --radio /dev/cu.usbmodem-A \
   --channel 1 \
+  --output results/adapter-A \
   --allow-inbox-drain
 ```
 
-`adapter` is the single-radio process. It reserves standard input and output for its newline-delimited JSON control protocol. The test controller starts this command twice automatically, so normal bench use does not require starting it by hand.
+The adapter creates `events.jsonl` in the output directory before opening the radio and records every consumed Companion inbox item there. It reserves stdout for typed NDJSON and sends diagnostics to stderr. Its `ready` event includes safe radio identity, selected channel metadata, Node ID, supported messages, retry strategies, and delivery limits. `Uint8Array` values cross NDJSON as base64.
 
-The adapter is the deployment unit under test, but its Atlas-facing interface does not exist yet. A future Raspberry Pi deployment will run one adapter process with one attached radio and connect the Atlas-side code to the same adapter interface.
-
-## Ping
+Run a two-radio Test echo:
 
 ```bash
-npm run fieldlink -- ping \
+npm run fieldlink -- test \
   --a /dev/cu.usbmodem-A \
   --b /dev/cu.usbmodem-B \
-  --channel 1 \
-  --count 10 \
-  --allow-inbox-drain
-```
-
-Ping sends a 16-byte binary request through adapter A. Adapter B reports the received bytes to the controller, which verifies them and asks adapter B to send the response. The round trip completes when adapter A reports the verified response.
-
-## Benchmark
-
-```bash
-npm run fieldlink -- bench \
-  --a /dev/cu.usbmodem-A \
-  --b /dev/cu.usbmodem-B \
-  --channel 1 \
-  --count 100 \
+  --message test \
   --payload-size 64 \
+  --retry-strategy selective-window \
+  --timeout-ms 1800000 \
   --allow-inbox-drain
 ```
 
-Benchmark runs two independent phases, first A to B and then B to A. `--count` applies to each phase. The controller timestamps both adapter processes on the same host. Each phase therefore reports controller-observed one-way latency, including local process communication, without claiming synchronized radio clocks.
+`--payload-size` is the Test message payload, excluding its five-byte message-local header. It defaults to 64 bytes. The overall test timeout defaults to 30 minutes.
 
-`--payload-size` is the total MeshCore channel-data payload, including FieldLink's 12-byte test header. MeshCore's channel-data upper limit is 163 bytes; FieldLink imposes the 12-byte lower limit needed for its header. The CLI sends one datagram at a time so harness queueing does not inflate the result.
+Before starting the adapters, the controller asks MeshCore for every channel slot available on both radios. It chooses the lowest configured slot whose name and key fingerprint match exactly. This inspection does not write radio configuration or transmit RF. If no slot matches, the test stops with an error. `--channel <index>` skips automatic selection and forces one slot for diagnostics.
 
-Both commands accept `--timeout-ms` for the full send-and-delivery deadline and `--output` for a specific artifact directory. Counts are capped at 10,000 per phase so an accidental command cannot create an unbounded hardware run.
+The controller then starts one adapter per radio, verifies distinct identities and matching LoRa and selected-channel settings, and sends one deterministic Test request from A to B. B's registered handler echoes it. The test passes only when A receives the matching response with identical bytes and, for a fragmented response, B receives the final transfer completion.
 
-## Results
+## Terminal console
 
-Each run creates an artifact directory under `results/` before either radio opens:
+Run the standard-library Python console from the repository root:
 
-- `manifest.json` records the requested operation.
-- `events.jsonl` streams adapter process IDs, samples, anomalies, inbox messages, errors, and interruption events as they occur.
-- `summary.json` records the final result, adapter process IDs, safe radio identities, cleanup failures, and interrupted state.
+```bash
+npm run fieldlink:tui
+```
 
-This layout leaves useful evidence if a run is interrupted. Latency distributions include minimum, mean, p50, p95, p99, and maximum.
+Use the arrow keys and Enter to select a registered message, source radio, destination radio, payload, and retry strategy. The console reads both lists from the real FieldLink CLI. Radio entries are USB serial candidates and remain marked unverified until MeshCore preflight succeeds. FieldLink finds the shared MeshCore channel automatically and shows the chosen slot in the live log. Every registered message supplies its own runnable hardware exercise.
 
-Ping RTT starts immediately before FieldLink submits the request to radio A and ends when the verified response reaches FieldLink through radio A. Its deadline includes the outbound send. FieldLink will not begin the next sample while a timed-out send still owns a radio command queue.
+Test offers these presets:
 
-Application goodput counts only verified bytes after the 12-byte FieldLink header. Mesh datagram bitrate counts the complete verified channel datagrams. Neither is a claim about raw LoRa bitrate or MeshCore airtime efficiency.
+- 64 payload bytes in one frame
+- 127 payload bytes, the largest Test payload that fits in one frame
+- 4096 payload bytes across 32 fragments
+- a custom size up to the message limit
 
-The command exits with status 1 if any requested delivery fails or if FieldLink observes a duplicate, malformed datagram, unexpected run ID/kind/sequence, or payload mismatch. `SIGINT` and `SIGTERM` stop the run cooperatively, close both radios, write a partial summary, and exit with status 130.
+The test starts after retry-strategy selection. During the run, the console shows the CLI's RF and inbox-drain warning, then follows `events.jsonl` for frames, fragmentation, receipts, retransmissions, delivery on both radios, SNR, errors, and cleanup. The header, events, and statistics form one scrolling transcript. It follows new events until you press the up arrow, then holds that position while more events arrive. Press the down arrow to return to the bottom. Press `q` to stop cooperatively.
 
-## Protocol boundary
+The console writes the normal `manifest.json`, `events.jsonl`, and `summary.json` under `results/`. It does not implement radio or delivery behavior itself. It launches `fieldlink test` and renders its evidence.
 
-Each adapter process uses `@liamcottle/meshcore.js` for USB framing, Companion Protocol commands, and inbound message parsing. Test traffic uses MeshCore channel data datagrams with the developer data type `0xFFFF` and flood delivery. MeshCore remains responsible for radio transport and routing.
+## Inbox and evidence safety
 
-The 12-byte FieldLink test header contains a magic value, version, operation kind, random run ID, and sequence number. The remaining bytes follow a deterministic pattern so the receiver can detect truncation or corruption.
+MeshCore exposes one shared Companion inbox containing channel data, channel text, and contact messages. FieldLink must drain the complete inbox while it runs. `--allow-inbox-drain` is an explicit acknowledgement of that behavior.
 
-## Documentation
+Before either radio opens, `fieldlink test` creates:
 
-Start at [`docs/README.md`](docs/README.md) for focused project documentation, durable design decisions, and active problem notes. Repository-wide agent guidance lives in [`AGENTS.md`](AGENTS.md).
+- `manifest.json` with requested test inputs
+- `events.jsonl` for streamed inbox, frame, message, fragment, receipt, retry, SNR, interruption, error, and cleanup evidence
+- `summary.json` with an initial `running` state that is replaced by the final or partial result
+
+Each adapter also creates `adapters/a/events.jsonl` or `adapters/b/events.jsonl` before opening its radio. It appends every consumed inbox item to that local file before sending the item to the controller. The root `events.jsonl` remains the combined test transcript.
+
+The default directory is `results/<timestamp>-test/`. Existing evidence is never overwritten. Full public keys and channel keys are never written or exposed by the process adapter.
+
+Use dedicated test radios. Automated validation never transmits RF. A hardware run requires explicit authorization and confirmed `/dev/cu.*` paths.
 
 ## Development
 
 ```bash
+npm ci
 npm run check
+git diff --check
 ```
+
+Start at [`docs/README.md`](docs/README.md) for the dictionary and design decisions.
