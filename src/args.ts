@@ -30,7 +30,7 @@ export interface AdapterCommand {
   readonly channel: number;
   readonly allowInboxDrain: true;
   readonly evidenceManagedByParent: boolean;
-  readonly output?: string;
+  readonly output: string;
 }
 
 export type ChannelSelection = number | "auto";
@@ -93,23 +93,13 @@ function parseAdapterCommand(arguments_: readonly string[]): AdapterCommand {
     throw inboxDrainError();
   }
   const evidenceManagedByParent = parsed["evidence-managed-by-parent"];
-  if (parsed.output === undefined && !evidenceManagedByParent) {
-    throw new UsageError(
-      "--output is required for adapter evidence unless a parent process manages it",
-    );
-  }
-  if (parsed.output !== undefined && evidenceManagedByParent) {
-    throw new UsageError(
-      "--output and --evidence-managed-by-parent cannot be used together",
-    );
-  }
   return {
     name: "adapter",
     radio: required(parsed.radio, "--radio"),
     channel: parseChannel(parsed.channel),
     allowInboxDrain: true,
     evidenceManagedByParent,
-    ...(parsed.output === undefined ? {} : { output: parsed.output }),
+    output: required(parsed.output, "--output"),
   };
 }
 

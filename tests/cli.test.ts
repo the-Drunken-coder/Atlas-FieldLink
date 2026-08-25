@@ -131,6 +131,9 @@ describe("CLI message exercise", () => {
       ).resolves.toBe(1);
       expect(acknowledgedBeforePersistence).toBe(false);
       expect(acknowledged).toBe(true);
+      expect(
+        start.mock.calls.map(([options]) => options.evidenceDirectory),
+      ).toEqual(["test-artifacts/adapters/a", "test-artifacts/adapters/b"]);
     } finally {
       releaseInboxEvidence();
       start.mockRestore();

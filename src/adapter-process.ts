@@ -412,12 +412,7 @@ export async function runAdapterProcess(
   process.on("SIGTERM", abort);
   let evidence: AdapterEvidence | undefined;
   try {
-    if (!command.evidenceManagedByParent) {
-      if (command.output === undefined) {
-        throw new Error("Adapter evidence output is required");
-      }
-      evidence = await AdapterEvidence.create(command.output);
-    }
+    evidence = await AdapterEvidence.create(command.output);
     if (!controller.signal.aborted) {
       const adapterEvidence = evidence;
       try {
@@ -428,12 +423,8 @@ export async function runAdapterProcess(
           output: process.stdout,
           signal: controller.signal,
           parentManagesEvidence: command.evidenceManagedByParent,
-          ...(adapterEvidence === undefined
-            ? {}
-            : {
-                onInboxMessage: (message: InboxMessage) =>
-                  adapterEvidence.record("inbox-message", { message }),
-              }),
+          onInboxMessage: (message: InboxMessage) =>
+            adapterEvidence.record("inbox-message", { message }),
         });
       } catch (error: unknown) {
         if (!isAborted(controller.signal)) {
@@ -457,11 +448,10 @@ export interface AdapterProgram {
   readonly arguments: readonly string[];
 }
 
-export interface StartAdapterProcessOptions {
+interface StartAdapterProcessBaseOptions {
   readonly path: string;
   readonly channel: number;
   readonly allowInboxDrain: true;
-  readonly program?: AdapterProgram;
   readonly signal?: AbortSignal;
   readonly onInboxMessage?: (message: InboxMessage) => void | Promise<void>;
   readonly onListenerError?: (error: Error) => void | Promise<void>;
@@ -470,6 +460,18 @@ export interface StartAdapterProcessOptions {
   readonly requestTimeoutMs?: number;
   readonly exitTimeoutMs?: number;
 }
+
+export type StartAdapterProcessOptions = StartAdapterProcessBaseOptions &
+  (
+    | {
+        readonly program: AdapterProgram;
+        readonly evidenceDirectory?: string;
+      }
+    | {
+        readonly program?: undefined;
+        readonly evidenceDirectory: string;
+      }
+  );
 
 interface PendingRequest {
   readonly resolve: (result: SendResult | undefined) => void;
@@ -543,7 +545,14 @@ export class AdapterProcessNode {
         "Adapter process startup requires explicit inbox-drain acknowledgement",
       );
     }
-    const program = options.program ?? defaultAdapterProgram(options);
+    let program = options.program;
+    if (program === undefined) {
+      const evidenceDirectory = options.evidenceDirectory;
+      if (evidenceDirectory === undefined) {
+        throw new Error("Adapter process evidence directory is required");
+      }
+      program = defaultAdapterProgram(options, evidenceDirectory);
+    }
     const child = spawn(program.executable, [...program.arguments], {
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
@@ -1399,6 +1408,7 @@ function parseWire(line: string): unknown {
 
 function defaultAdapterProgram(
   options: StartAdapterProcessOptions,
+  evidenceDirectory: string,
 ): AdapterProgram {
   const current = fileURLToPath(import.meta.url);
   const extension = extname(current);
@@ -1413,6 +1423,8 @@ function defaultAdapterProgram(
       options.path,
       "--channel",
       String(options.channel),
+      "--output",
+      evidenceDirectory,
       "--evidence-managed-by-parent",
       "--allow-inbox-drain",
     ],

@@ -186,6 +186,8 @@ Before either radio opens, `fieldlink test` creates:
 - `events.jsonl` for streamed inbox, frame, message, fragment, receipt, retry, SNR, interruption, error, and cleanup evidence
 - `summary.json` with an initial `running` state that is replaced by the final or partial result
 
+Each adapter also creates `adapters/a/events.jsonl` or `adapters/b/events.jsonl` before opening its radio. It appends every consumed inbox item to that local file before sending the item to the controller. The root `events.jsonl` remains the combined test transcript.
+
 The default directory is `results/<timestamp>-test/`. Existing evidence is never overwritten. Full public keys and channel keys are never written or exposed by the process adapter.
 
 Use dedicated test radios. Automated validation never transmits RF. A hardware run requires explicit authorization and confirmed `/dev/cu.*` paths.

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { performance } from "node:perf_hooks";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -196,6 +197,7 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
     [a, b] = await startAdapterPair(
       command,
       selectedChannel,
+      artifacts.paths.directory,
       controller.signal,
       record,
       preserveEvidence,
@@ -368,6 +370,7 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
 async function startAdapterPair(
   command: TestCommand,
   channel: number,
+  artifactDirectory: string,
   signal: AbortSignal,
   record: (type: string, data: unknown) => void,
   preserveEvidence: (type: string, data: unknown) => Promise<void>,
@@ -384,6 +387,11 @@ async function startAdapterPair(
     return {
       path,
       channel,
+      evidenceDirectory: join(
+        artifactDirectory,
+        "adapters",
+        label.toLowerCase(),
+      ),
       allowInboxDrain: true,
       signal: startupSignal,
       requestTimeoutMs: command.timeoutMs + ADAPTER_REQUEST_TIMEOUT_MARGIN_MS,

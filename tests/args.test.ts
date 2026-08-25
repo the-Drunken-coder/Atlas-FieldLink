@@ -140,7 +140,7 @@ describe("CLI arguments", () => {
         "--allow-inbox-drain",
       ]),
     ).toThrow("--output");
-    expect(
+    expect(() =>
       parseCommand([
         "adapter",
         "--radio",
@@ -150,6 +150,19 @@ describe("CLI arguments", () => {
         "--evidence-managed-by-parent",
         "--allow-inbox-drain",
       ]),
-    ).toMatchObject({ evidenceManagedByParent: true });
+    ).toThrow("--output");
+    expect(
+      parseCommand([
+        "adapter",
+        "--radio",
+        "a",
+        "--channel",
+        "1",
+        "--evidence-managed-by-parent",
+        "--output",
+        "out",
+        "--allow-inbox-drain",
+      ]),
+    ).toMatchObject({ evidenceManagedByParent: true, output: "out" });
   });
 });

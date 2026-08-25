@@ -272,6 +272,19 @@ describe("NDJSON adapter server", () => {
       transport: new MemoryTransport(),
     });
     let started = false;
+    let outputText = "";
+    output.setEncoding("utf8");
+    output.on("data", (chunk: string) => {
+      outputText += chunk;
+    });
+    let reportLocalPersistence = (): void => undefined;
+    const localPersistenceStarted = new Promise<void>((resolve) => {
+      reportLocalPersistence = resolve;
+    });
+    let releaseLocalPersistence = (): void => undefined;
+    const localPersistence = new Promise<void>((resolve) => {
+      releaseLocalPersistence = resolve;
+    });
     let emitInbox:
       ((message: InboxMessage) => void | Promise<void>) | undefined;
     const reader = lineReader(output);
@@ -281,6 +294,10 @@ describe("NDJSON adapter server", () => {
       input,
       output,
       parentManagesEvidence: true,
+      onInboxMessage: async () => {
+        reportLocalPersistence();
+        await localPersistence;
+      },
       createRuntime: (options) => {
         emitInbox = options.onInboxMessage;
         return Promise.resolve({
@@ -319,6 +336,10 @@ describe("NDJSON adapter server", () => {
     ).then(() => {
       preserved = true;
     });
+    await localPersistenceStarted;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(outputText).not.toContain('"type":"inbox-message"');
+    releaseLocalPersistence();
     const inbox = await reader.nextType("inbox-message");
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(preserved).toBe(false);
@@ -395,10 +416,11 @@ describe("adapter process command", () => {
           radio: "test",
           channel: 1,
           allowInboxDrain: true,
-          evidenceManagedByParent: false,
+          evidenceManagedByParent: true,
           output: "test-output",
         }),
       ).resolves.toBe(130);
+      expect(create).toHaveBeenCalledWith("test-output");
       expect(handlerPresentDuringClose).toBe(true);
       expect(process.listeners("SIGINT")).toEqual([...originalListeners]);
     } finally {
