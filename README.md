@@ -11,6 +11,21 @@ Atlas-side caller
 
 FieldLink does not flash firmware, write radio configuration, change channels, or replace MeshCore routing. It uses MeshCore channel data type `0xFFFF`, flood delivery, and the 163-byte channel-datagram limit.
 
+## Project status
+
+Only the first row describes code that exists in this repository today.
+
+| Status                   | Scope                                                                                                                                                                                                                                                                                                               |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Implemented now          | Registered Test and Resource messages, FieldLink framing, fragmentation, reassembly, priority, selective repair, delivery evidence, the adapter process, the two-radio test controller, the terminal console, and a test-only Atlas SDK Resource gateway. Resource supports Entity and Object CRUD plus Task reads. |
+| Planned, not implemented | A deployed Gateway OS and Asset OS integration, Asset self-registration, Task push and lifecycle messages, passive state collection through FieldLink Picture, Observation and Object-content messages, congestion estimates, and a one-gateway, three-simulated-asset acceptance exercise over real radios.        |
+| Still to design          | The exact Runtime, Task, Observation, and Object-content message shapes; FieldLink Picture storage and queries; congestion calculations; Object-content transfer limits; and the package boundaries between Atlas Protocol, Gateway OS, Asset OS, and FieldLink.                                                    |
+| Deferred                 | Radio sender authentication, a deny or quarantine system, congestion-based traffic control, and transfer recovery across process restarts. FieldLink Track fusion is not planned. Future Track fusion belongs to Atlas Core.                                                                                        |
+
+The Resource gateway is an integration test capability, not a deployed Core
+bridge. The terminal console can execute real Atlas API calls over two radios,
+but this repository does not yet run an operational asset or gateway.
+
 ## Requirements
 
 - Node.js 24

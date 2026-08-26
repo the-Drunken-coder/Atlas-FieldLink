@@ -13,6 +13,19 @@ gateway. That adapter loads the Atlas SDK, executes one request received from
 the preflight-approved source radio, and sends the SDK result back as a
 Resource response.
 
+## Implementation status
+
+| Status                   | Scope                                                                                                                                                                                                                    |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Implemented now          | Resource JSON validation and encoding, Entity and Object CRUD, Task get and list, response correlation, request replay protection, CLI and terminal-console input, evidence output, and execution through the Atlas SDK. |
+| Test-only                | The Atlas SDK executor runs only when the two-radio test controller enables it on adapter B. A normal adapter receives Resource messages but does not call Atlas.                                                        |
+| Planned, not implemented | A deployed Gateway OS that reconciles Resource state with Core, unsolicited Task delivery, Task lifecycle actions, Object-content bytes, passive state collection, and asset runtime registration.                       |
+| Not part of Resource     | Task lifecycle semantics, arbitrary HTTP requests, API credentials, radio authentication, and binary Object content. These need separate system or message designs.                                                      |
+
+The sections below document the implemented Resource message. References to
+future Task, Object-content, and gateway behavior describe boundaries, not
+code that exists today.
+
 ## Request contract
 
 Every request starts with these fields:
