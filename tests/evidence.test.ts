@@ -15,7 +15,7 @@ const manifest: TestManifest = {
   startedAt: "2026-08-24T12:00:00.000Z",
   radios: { a: "/dev/cu.a", b: "/dev/cu.b" },
   channel: 1,
-  payloadSize: 64,
+  input: { kind: "exercise", payloadSize: 64 },
   retryStrategy: "selective-window",
   timeoutMs: 1000,
   inboxDrainAccepted: true,

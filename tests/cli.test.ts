@@ -56,6 +56,35 @@ describe("CLI message catalog", () => {
           ],
         },
       },
+      {
+        id: 2,
+        name: "resource",
+        defaultPriority: "normal",
+        exercise: {
+          defaultPayloadBytes: 32,
+          maximumPayloadBytes: 1024 * 1024 - 93,
+          presets: [
+            {
+              payloadBytes: 32,
+              encodedBytes: 125,
+              delivery: "complete",
+              fragments: 1,
+            },
+            {
+              payloadBytes: 39,
+              encodedBytes: 132,
+              delivery: "complete",
+              fragments: 1,
+            },
+            {
+              payloadBytes: 4096,
+              encodedBytes: 4189,
+              delivery: "transfer",
+              fragments: 32,
+            },
+          ],
+        },
+      },
     ]);
     expect(catalog.retryStrategies).toEqual([
       { id: 1, name: "selective-window" },
@@ -299,6 +328,18 @@ describe("CLI message exercise", () => {
       type: "test",
       kind: "response",
     });
+    expect(completion.response).toMatchObject({
+      logicalId: completion.received.logicalId,
+      delivery: "transfer",
+      encodedBytes: 4101,
+      fragments: 32,
+      retransmissions: 0,
+      retryStrategy: "selective-window",
+    });
+    expect(completion.response.receiptRequests).toBeGreaterThan(0);
+    expect(completion.response.receiptRequestRetries).toBe(0);
+    expect(completion.response.receipts).toBeGreaterThanOrEqual(0);
+    expect(typeof completion.response.durationMs).toBe("number");
     expect(
       destinationEvents.some(
         (event) =>
@@ -309,6 +350,70 @@ describe("CLI message exercise", () => {
     expect(
       destinationEvents.some((event) => event.type === "transfer-failed"),
     ).toBe(false);
+  });
+
+  it("reports a repeated response receipt request as recovery", async () => {
+    const source = new ExerciseNodeProbe("aaaaaaaaaaaaaaaa");
+    const destination = new ExerciseNodeProbe("bbbbbbbbbbbbbbbb");
+    const controller = new AbortController();
+    const sent = testMessage.exercise.create(4096);
+    const logicalId = "0000000000000001";
+    const completion = waitForExerciseCompletion(
+      source,
+      destination,
+      testMessage,
+      sent,
+      controller.signal,
+    );
+
+    destination.emitEvent({
+      type: "transfer-started",
+      at: "2026-08-25T12:00:00.000Z",
+      logicalId,
+      destination: source.nodeId,
+      encodedBytes: 4101,
+      fragmentCount: 32,
+      retryStrategy: "selective-window",
+      exerciseKey: testMessage.exercise.key(sent),
+    });
+    for (let index = 0; index < 2; index += 1) {
+      destination.emitEvent({
+        type: "receipt-request-sent",
+        at: `2026-08-25T12:00:0${index + 1}.000Z`,
+        logicalId,
+        windowStart: 0,
+        windowCount: 8,
+      });
+    }
+    destination.emitEvent({
+      type: "transfer-completed",
+      at: "2026-08-25T12:00:05.000Z",
+      logicalId,
+      retransmissions: 0,
+      receipts: 4,
+    });
+    source.emitMessage({
+      message: {
+        type: "test",
+        kind: "response",
+        correlationId: sent.correlationId,
+        payload: sent.payload.slice(),
+      },
+      source: destination.nodeId,
+      destination: source.nodeId,
+      logicalId,
+      delivery: "transfer",
+      receivedAt: new Date("2026-08-25T12:00:05.000Z"),
+    });
+
+    await expect(completion).resolves.toMatchObject({
+      response: {
+        retransmissions: 0,
+        receiptRequests: 2,
+        receiptRequestRetries: 1,
+        durationMs: 5000,
+      },
+    });
   });
 
   it("fails as soon as the echo transfer fails", async () => {

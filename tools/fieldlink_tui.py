@@ -5,14 +5,17 @@ from __future__ import annotations
 
 import argparse
 import curses
+import curses.textpad
 import json
 import os
 import queue
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,9 +24,11 @@ from typing import Any, TextIO
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 CLI = ("npm", "run", "--silent", "fieldlink", "--")
+RESULTS_TRANSCRIPT = REPOSITORY / "tools" / "results.txt"
 DISCOVERY_TIMEOUT_SECONDS = 30
 STOP_TIMEOUT_SECONDS = 30
 MAX_TIMEOUT_MS = 24 * 60 * 60 * 1000
+MAX_RESOURCE_LIST_LIMIT = 1000
 
 
 class Cancelled(Exception):
@@ -78,10 +83,62 @@ class RunConfiguration:
     message: MessageChoice
     radio_a: RadioChoice
     radio_b: RadioChoice
-    payload_bytes: int
+    payload_bytes: int | None
+    resource_request: dict[str, Any] | None
+    resource_request_path: Path | None
     retry_strategy: str
     timeout_ms: int
     output: Path
+
+
+class RunTranscript:
+    """Write the current TUI run as one continuously flushed text transcript."""
+
+    def __init__(self, path: Path, config: RunConfiguration):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = path.open("w", encoding="utf-8")
+        self._finished = False
+        self._write("SENT MESSAGE\n============\n")
+        if config.resource_request is not None:
+            self._write(
+                json.dumps(config.resource_request, indent=2, ensure_ascii=False)
+                + "\n"
+            )
+        else:
+            self._write(
+                f"Test exercise input: {config.payload_bytes:,} payload bytes\n"
+                "The CLI generates the Test correlation ID and deterministic payload.\n"
+            )
+        self._write("\nRUN LOG\n=======\n")
+
+    def append(self, line: str | None) -> None:
+        if not self._finished and line:
+            self._write(line.rstrip() + "\n")
+
+    def finish(
+        self,
+        received_message: dict[str, Any] | None = None,
+        result_lines: list[str] | None = None,
+    ) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        if result_lines:
+            self._write("\nRUN RESULT\n==========\n")
+            for line in result_lines:
+                self._write(line.rstrip() + "\n")
+        self._write("\nRECEIVED MESSAGE\n================\n")
+        if received_message is None:
+            self._write("(no response received)\n")
+        else:
+            self._write(
+                json.dumps(received_message, indent=2, ensure_ascii=False) + "\n"
+            )
+        self._handle.close()
+
+    def _write(self, text: str) -> None:
+        self._handle.write(text)
+        self._handle.flush()
 
 
 class FieldLinkCli:
@@ -157,7 +214,7 @@ class FieldLinkCli:
 
 
 def build_test_command(config: RunConfiguration) -> list[str]:
-    return [
+    command = [
         *CLI,
         "test",
         "--message",
@@ -166,8 +223,6 @@ def build_test_command(config: RunConfiguration) -> list[str]:
         config.radio_a.path,
         "--b",
         config.radio_b.path,
-        "--payload-size",
-        str(config.payload_bytes),
         "--retry-strategy",
         config.retry_strategy,
         "--timeout-ms",
@@ -176,6 +231,13 @@ def build_test_command(config: RunConfiguration) -> list[str]:
         str(config.output),
         "--allow-inbox-drain",
     ]
+    if config.resource_request_path is not None:
+        command.extend(["--resource-request", str(config.resource_request_path)])
+    elif config.payload_bytes is not None:
+        command.extend(["--payload-size", str(config.payload_bytes)])
+    else:
+        raise RuntimeError("Run configuration has no message input")
+    return command
 
 
 @dataclass
@@ -189,19 +251,25 @@ class RunView:
     fragments_sent: int = 0
     fragments_received: int = 0
     retransmissions: int = 0
+    receipt_requests: int = 0
     receipts: int = 0
     snr_samples: list[float] = field(default_factory=list)
     selected_channel: int | None = None
     selected_channel_name: str | None = None
+    received_message: dict[str, Any] | None = None
+    resource_response: dict[str, Any] | None = None
 
-    def add_output(self, source: str, line: str) -> None:
+    def add_output(self, source: str, line: str) -> str | None:
         clean = line.strip()
         if source == "diag" and clean.startswith("[adapter "):
-            return
+            return None
         if clean:
-            self.logs.append(f"[{source}] {clean}")
+            rendered = f"[{source}] {clean}"
+            self.logs.append(rendered)
+            return rendered
+        return None
 
-    def observe(self, record: dict[str, Any]) -> None:
+    def observe(self, record: dict[str, Any]) -> str:
         timestamp = str(record.get("at", ""))[11:19]
         kind = record.get("type")
         data = record.get("data", {})
@@ -235,9 +303,15 @@ class RunView:
         elif kind == "message":
             radio = str(data.get("radio", "?"))
             message = data.get("message", {}).get("message", {})
+            if isinstance(message, dict) and message.get("kind") == "response":
+                self.received_message = message
+                if message.get("type") == "resource":
+                    self.resource_response = message
             text = f"[{radio}] decoded {message.get('type', '?')} {message.get('kind', '')}".rstrip()
-        elif kind == "test-passed":
-            text = f"exercise passed  integrity {data.get('integrity', '?')}"
+        elif kind == "resource-gateway-ready":
+            text = f"[{data.get('radio', '?')}] Atlas Resource gateway ready for source {data.get('allowedSource', '?')}"
+        elif kind == "exercise-complete":
+            text = f"response correlated  {data.get('correlation', '?')}"
         elif kind == "test-failed":
             text = f"exercise failed  {data.get('message', 'unknown error')}"
         elif kind == "adapter-stderr":
@@ -250,9 +324,11 @@ class RunView:
             text = f"cleanup error  {data.get('message', 'unknown error')}"
         else:
             text = f"{kind}  {compact_json(data)}"
-        self.logs.append(prefix + text)
+        rendered = prefix + text
+        self.logs.append(rendered)
         if len(self.logs) > 5000:
             del self.logs[:1000]
+        return rendered
 
     def _node_event(self, radio: str, event: dict[str, Any]) -> str:
         kind = str(event.get("type", "event"))
@@ -282,7 +358,7 @@ class RunView:
                 action = "received chunk"
             elif kind == "fragment-retransmitted":
                 self.retransmissions += 1
-                action = "resent missing chunk"
+                action = "resent unacknowledged chunk"
             else:
                 self.fragments_sent += 1
                 action = "sent chunk"
@@ -291,6 +367,11 @@ class RunView:
             self.receipts += 1
             action = "sent receipt" if kind == "receipt-sent" else "received receipt"
             return f"[{radio}] {action} bitmap {event.get('bitmap', '?')}"
+        if kind == "receipt-request-sent":
+            self.receipt_requests += 1
+            start = int(event.get("windowStart", 0)) + 1
+            count = int(event.get("windowCount", 0))
+            return f"[{radio}] requested receipt for chunks {start}-{start + count - 1}"
         if kind == "message-received":
             return f"[{radio}] delivered {event.get('messageName', '?')} via {event.get('delivery', '?')}"
         if kind == "transfer-completed":
@@ -312,14 +393,19 @@ def summary_lines(
     if summary is None:
         return [
             f"Frames sent A/B {view.frames_sent['A']}/{view.frames_sent['B']}   received A/B {view.frames_received['A']}/{view.frames_received['B']}",
-            f"Chunks sent {view.fragments_sent}   received {view.fragments_received}   retransmitted {view.retransmissions}   receipts {view.receipts}",
+            f"Chunks sent {view.fragments_sent}   received {view.fragments_received}   retransmitted {view.retransmissions}",
+            f"Receipt requests {view.receipt_requests}   receipt events {view.receipts}",
         ]
     request = summary.get("request", {})
+    response = summary.get("response", {})
+    verification = summary.get("verification", {})
     elapsed_ms = float(summary.get("elapsedMs", 0.0))
     lines = [
-        f"Status {summary.get('status', '?')}   elapsed {elapsed_ms:.2f} ms   integrity {summary.get('integrity', 'unconfirmed')}",
+        f"Status {summary.get('status', '?')}   condition {summary.get('condition', '?')}   elapsed {elapsed_ms:.2f} ms   correlation {verification.get('correlation', 'unconfirmed')}",
         f"Request {request.get('delivery', '?')}   encoded {request.get('encodedBytes', '?')} bytes   fragments {request.get('fragments', '?')}   retransmissions {request.get('retransmissions', '?')}",
-        f"Sender duration {float(request.get('durationMs', 0.0)):.2f} ms   receipts {request.get('receipts', 0)}",
+        f"Sender duration {float(request.get('durationMs', 0.0)):.2f} ms   receipt requests {request.get('receiptRequests', 0)}   request retries {request.get('receiptRequestRetries', 0)}   receipts {request.get('receipts', 0)}",
+        f"Response {response.get('delivery', '?')}   encoded {response.get('encodedBytes', '?')} bytes   fragments {response.get('fragments', '?')}   retransmissions {response.get('retransmissions', '?')}",
+        f"Response duration {float(response.get('durationMs', 0.0)):.2f} ms   receipt requests {response.get('receiptRequests', 0)}   request retries {response.get('receiptRequestRetries', 0)}   receipts {response.get('receipts', 0)}   digest {verification.get('responseDigest', 'not applicable')}",
         f"Observed frames sent A/B {view.frames_sent['A']}/{view.frames_sent['B']}   received A/B {view.frames_received['A']}/{view.frames_received['B']}",
     ]
     selected_channel = summary.get("selectedChannel")
@@ -327,7 +413,9 @@ def summary_lines(
         name = selected_channel.get("name")
         detail = f" {name}" if name else ""
         lines.insert(1, f"MeshCore channel {selected_channel['index']}{detail}")
-    if elapsed_ms > 0:
+    if "atlasStatus" in verification:
+        lines.append(f"Atlas status {verification['atlasStatus']}")
+    if elapsed_ms > 0 and config.payload_bytes is not None:
         rate = config.payload_bytes / (elapsed_ms / 1000)
         lines.append(f"Request payload per echo round trip {format_rate(rate)}")
     if view.snr_samples:
@@ -337,6 +425,9 @@ def summary_lines(
         )
     if summary.get("error"):
         lines.append(f"Error {summary['error']}")
+    diagnostic_errors = summary.get("diagnosticErrors", [])
+    if diagnostic_errors:
+        lines.append(f"Diagnostic errors {len(diagnostic_errors)}")
     lines.append(f"Artifacts {config.output}")
     return lines
 
@@ -345,6 +436,258 @@ def format_rate(bytes_per_second: float) -> str:
     if bytes_per_second >= 1024:
         return f"{bytes_per_second / 1024:.2f} KiB/s"
     return f"{bytes_per_second:.1f} B/s"
+
+
+@dataclass
+class ResourceDraft:
+    operation: str = "get"
+    resource_type: str = "entity"
+    request_id: str = field(
+        default_factory=lambda: f"fieldlink-{uuid.uuid4().hex[:12]}"
+    )
+    resource_id: str = "entity-fieldlink-demo"
+    limit: int = 50
+    cursor: str = ""
+    body: dict[str, Any] = field(default_factory=dict)
+
+    def message(self) -> dict[str, Any]:
+        request: dict[str, Any] = {
+            "type": "resource",
+            "kind": "request",
+            "operation": self.operation,
+            "request_id": self.request_id,
+            "resource_type": self.resource_type,
+        }
+        if self.operation in {"get", "patch", "delete"}:
+            request["resource_id"] = self.resource_id
+        if self.operation == "list":
+            query: dict[str, Any] = {"limit": self.limit}
+            if self.cursor:
+                query["cursor"] = self.cursor
+            request["query"] = query
+        if self.operation in {"create", "patch"}:
+            request["body"] = self.body
+        return request
+
+
+def resource_types(operation: str) -> tuple[str, ...]:
+    if operation in {"get", "list"}:
+        return ("entity", "object", "task")
+    return ("entity", "object")
+
+
+def default_resource_body(operation: str, resource_type: str) -> dict[str, Any]:
+    if operation == "create" and resource_type == "entity":
+        return {"entity_id": "entity-fieldlink-demo", "entity_type": "asset"}
+    if operation == "create":
+        return {"object_id": "object-fieldlink-demo", "type": "application/json"}
+    if resource_type == "entity":
+        return {"alias": "FieldLink update"}
+    return {"type": "application/json"}
+
+
+def resource_fields(draft: ResourceDraft) -> list[tuple[str, str, str]]:
+    fields = [
+        ("operation", "Operation", draft.operation),
+        ("resource_type", "Resource", draft.resource_type),
+        ("request_id", "Request ID", draft.request_id),
+    ]
+    if draft.operation in {"get", "patch", "delete"}:
+        fields.append(("resource_id", "Resource ID", draft.resource_id))
+    if draft.operation == "list":
+        fields.extend(
+            [
+                ("limit", "Limit", str(draft.limit)),
+                ("cursor", "Cursor", draft.cursor or "(none)"),
+            ]
+        )
+    if draft.operation in {"create", "patch"}:
+        count = len(draft.body)
+        body_summary = f"{count} field" if count == 1 else f"{count} fields"
+        fields.append(("body", "Body JSON", body_summary))
+    return fields
+
+
+def edit_resource_request(screen: curses.window) -> dict[str, Any]:
+    draft = ResourceDraft()
+    selected = 0
+    while True:
+        fields = resource_fields(draft)
+        selected %= len(fields)
+        draw_resource_editor(screen, draft, fields, selected)
+        key = screen.getch()
+        if key in (ord("q"), 27):
+            raise Cancelled()
+        if key == curses.KEY_UP:
+            selected = (selected - 1) % len(fields)
+        elif key == curses.KEY_DOWN:
+            selected = (selected + 1) % len(fields)
+        elif key in (ord("s"), ord("S")):
+            return draft.message()
+        elif key in (10, 13, curses.KEY_ENTER):
+            edit_resource_field(screen, draft, fields[selected][0])
+
+
+def draw_resource_editor(
+    screen: curses.window,
+    draft: ResourceDraft,
+    fields: list[tuple[str, str, str]],
+    selected: int,
+) -> None:
+    screen.erase()
+    height, width = screen.getmaxyx()
+    put(screen, 0, 0, "FieldLink Resource request", curses.A_BOLD)
+    put(screen, 1, 0, "Edit fields and inspect the exact JSON sent over FieldLink.", curses.A_DIM)
+    if width < 72 or height < 14:
+        put(screen, 4, 0, "Resize the terminal to at least 72 x 14.", curses.A_BOLD)
+        put(screen, height - 1, 0, "q back", curses.A_DIM)
+        screen.refresh()
+        return
+    divider = max(31, min(width // 2, 48))
+    separator = " | "
+    heading = f"{'Resource request':<{divider}}{separator}Generated JSON"
+    put(screen, 3, 0, heading[: width - 1], curses.A_BOLD)
+    preview = json.dumps(draft.message(), indent=2, ensure_ascii=False).splitlines()
+    visible_rows = min(max(len(fields), len(preview)), max(0, height - 6))
+    for index in range(visible_rows):
+        if index < len(fields):
+            _key, label, value = fields[index]
+            marker = ">" if index == selected else " "
+            left = f"{marker} {label:<12} {value}"[:divider]
+        else:
+            left = ""
+        right = preview[index] if index < len(preview) else ""
+        line = f"{left:<{divider}}{separator}{right}"
+        put(screen, index + 5, 0, line[: width - 1])
+    put(
+        screen,
+        height - 1,
+        0,
+        "↑/↓ select   Enter edit   s continue   q back",
+        curses.A_DIM,
+    )
+    screen.refresh()
+
+
+def edit_resource_field(
+    screen: curses.window, draft: ResourceDraft, field_name: str
+) -> None:
+    if field_name == "operation":
+        operations = ["create", "get", "list", "patch", "delete"]
+        draft.operation = operations[choose(screen, "Operation", operations)]
+        if draft.resource_type not in resource_types(draft.operation):
+            draft.resource_type = "entity"
+        if draft.operation in {"create", "patch"}:
+            draft.body = default_resource_body(draft.operation, draft.resource_type)
+        return
+    if field_name == "resource_type":
+        choices = list(resource_types(draft.operation))
+        draft.resource_type = choices[choose(screen, "Resource", choices)]
+        draft.resource_id = f"{draft.resource_type}-fieldlink-demo"
+        if draft.operation in {"create", "patch"}:
+            draft.body = default_resource_body(draft.operation, draft.resource_type)
+        return
+    if field_name == "request_id":
+        draft.request_id = read_text(
+            screen, "Request ID", draft.request_id, allow_empty=False
+        )
+    elif field_name == "resource_id":
+        draft.resource_id = read_text(
+            screen, "Resource ID", draft.resource_id, allow_empty=False
+        )
+    elif field_name == "limit":
+        draft.limit = read_integer(
+            screen,
+            "Maximum resources to return.",
+            draft.limit,
+            MAX_RESOURCE_LIST_LIMIT,
+            minimum=1,
+        )
+    elif field_name == "cursor":
+        draft.cursor = read_text(
+            screen,
+            "Cursor. Leave blank for the first page.",
+            draft.cursor,
+            clear_on_blank=True,
+        )
+    elif field_name == "body":
+        draft.body = edit_json_object(screen, draft.body)
+
+
+def read_text(
+    screen: curses.window,
+    prompt: str,
+    default: str,
+    *,
+    allow_empty: bool = True,
+    clear_on_blank: bool = False,
+) -> str:
+    while True:
+        screen.erase()
+        put(screen, 0, 0, "FieldLink Resource request", curses.A_BOLD)
+        put(screen, 2, 0, prompt)
+        put(screen, 4, 0, f"Value [{default}]: ")
+        curses.echo()
+        curses.curs_set(1)
+        try:
+            raw = screen.getstr(4, len(f"Value [{default}]: "), 1024).decode().strip()
+        finally:
+            curses.noecho()
+            curses.curs_set(0)
+        if raw:
+            return raw
+        if clear_on_blank and allow_empty:
+            return ""
+        if default or allow_empty:
+            return default if default else ""
+        put(screen, 6, 0, "A non-empty value is required.", curses.A_BOLD)
+        screen.getch()
+
+
+def edit_json_object(
+    screen: curses.window, current: dict[str, Any]
+) -> dict[str, Any]:
+    while True:
+        height, width = screen.getmaxyx()
+        popup_height = max(8, height - 4)
+        popup_width = max(40, width - 6)
+        top = max(0, (height - popup_height) // 2)
+        left = max(0, (width - popup_width) // 2)
+        popup = curses.newwin(popup_height, popup_width, top, left)
+        popup.erase()
+        popup.box()
+        put(popup, 0, 2, " Body JSON. Ctrl-G saves ", curses.A_BOLD)
+        editor = popup.derwin(popup_height - 2, popup_width - 2, 1, 1)
+        initial = json.dumps(current, indent=2, ensure_ascii=False)
+        try:
+            editor.addstr(initial[: (popup_height - 2) * (popup_width - 3)])
+        except curses.error:
+            pass
+        popup.noutrefresh()
+        editor.noutrefresh()
+        curses.doupdate()
+        curses.curs_set(1)
+        try:
+            raw = curses.textpad.Textbox(editor).edit().strip()
+        finally:
+            curses.curs_set(0)
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as error:
+            show_error(screen, f"Invalid JSON: {error.msg}")
+            continue
+        if not isinstance(value, dict):
+            show_error(screen, "Body JSON must be an object.")
+            continue
+        return value
+
+
+def show_error(screen: curses.window, message: str) -> None:
+    height, _width = screen.getmaxyx()
+    put(screen, height - 2, 0, message, curses.A_BOLD)
+    put(screen, height - 1, 0, "Press any key to continue", curses.A_DIM)
+    screen.refresh()
+    screen.getch()
 
 
 def choose(screen: curses.window, title: str, labels: list[str]) -> int:
@@ -381,7 +724,11 @@ def choose(screen: curses.window, title: str, labels: list[str]) -> int:
 
 
 def read_integer(
-    screen: curses.window, prompt: str, default: int, maximum: int
+    screen: curses.window,
+    prompt: str,
+    default: int,
+    maximum: int,
+    minimum: int = 0,
 ) -> int:
     while True:
         screen.erase()
@@ -397,9 +744,15 @@ def read_integer(
             curses.curs_set(0)
         if not raw:
             return default
-        if raw.isdigit() and int(raw) <= maximum:
+        if raw.isdigit() and minimum <= int(raw) <= maximum:
             return int(raw)
-        put(screen, 6, 0, f"Enter an integer from 0 through {maximum}.", curses.A_BOLD)
+        put(
+            screen,
+            6,
+            0,
+            f"Enter an integer from {minimum} through {maximum}.",
+            curses.A_BOLD,
+        )
         screen.getch()
 
 
@@ -412,6 +765,9 @@ def select_configuration(
     output_root: Path,
 ) -> RunConfiguration:
     message = messages[choose(screen, "Message", [item.label for item in messages])]
+    resource_request = (
+        edit_resource_request(screen) if message.name == "resource" else None
+    )
     radio_a = radios[
         choose(
             screen,
@@ -427,31 +783,54 @@ def select_configuration(
             [item.label for item in remaining],
         )
     ]
-    payload_labels = [item.label for item in message.presets] + ["Custom size"]
-    payload_index = choose(screen, "Payload", payload_labels)
-    if payload_index == len(message.presets):
-        payload_bytes = read_integer(
-            screen,
-            "Payload bytes. FieldLink will fragment it when needed.",
-            message.default_payload_bytes,
-            message.maximum_payload_bytes,
-        )
+    if resource_request is None:
+        payload_labels = [item.label for item in message.presets] + ["Custom size"]
+        payload_index = choose(screen, "Payload", payload_labels)
+        if payload_index == len(message.presets):
+            payload_bytes = read_integer(
+                screen,
+                "Payload bytes. FieldLink will fragment it when needed.",
+                message.default_payload_bytes,
+                message.maximum_payload_bytes,
+            )
+        else:
+            payload_bytes = message.presets[payload_index].payload_bytes
     else:
-        payload_bytes = message.presets[payload_index].payload_bytes
+        payload_bytes = None
     retry_strategy = strategies[
         choose(screen, "Retry strategy", strategies)
     ]
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = output_root.resolve() / f"{stamp}-tui-{message.name}-{os.getpid()}"
+    resource_request_path = (
+        write_resource_request_file(resource_request)
+        if resource_request is not None
+        else None
+    )
     return RunConfiguration(
         message=message,
         radio_a=radio_a,
         radio_b=radio_b,
         payload_bytes=payload_bytes,
+        resource_request=resource_request,
+        resource_request_path=resource_request_path,
         retry_strategy=retry_strategy,
         timeout_ms=timeout_ms,
         output=output,
     )
+
+
+def write_resource_request_file(request: dict[str, Any]) -> Path:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="fieldlink-resource-",
+        suffix=".json",
+        delete=False,
+    ) as handle:
+        json.dump(request, handle, separators=(",", ":"), ensure_ascii=False)
+        handle.write("\n")
+        return Path(handle.name)
 
 
 def pump(stream: TextIO, source: str, output: queue.Queue[tuple[str, str]]) -> None:
@@ -517,6 +896,7 @@ def run_live(
     screen: curses.window,
     process: subprocess.Popen[str],
     config: RunConfiguration,
+    transcript: RunTranscript | None = None,
 ) -> int:
     if process.stdout is None or process.stderr is None:
         raise RuntimeError("Could not capture FieldLink CLI output")
@@ -536,63 +916,97 @@ def run_live(
     screen.timeout(100)
     summary: dict[str, Any] | None = None
     drained = False
-    while True:
+    try:
         while True:
-            try:
-                source, line = output.get_nowait()
-            except queue.Empty:
-                break
-            view.add_output(source, line)
-        event_offset, events = read_new_events(config.output / "events.jsonl", event_offset)
-        for event in events:
-            view.observe(event)
-        if process.poll() is not None and not drained:
-            drained = True
-            for thread in threads:
-                thread.join(timeout=0.2)
-            while not output.empty():
-                source, line = output.get_nowait()
-                view.add_output(source, line)
+            while True:
+                try:
+                    source, line = output.get_nowait()
+                except queue.Empty:
+                    break
+                rendered = view.add_output(source, line)
+                if transcript is not None:
+                    transcript.append(rendered)
             event_offset, events = read_new_events(
                 config.output / "events.jsonl", event_offset
             )
             for event in events:
-                view.observe(event)
-            summary = load_summary(config.output / "summary.json")
-        finished = process.poll() is not None
-        scroll_top, maximum_scroll_top = draw_run(
-            screen,
-            config,
-            view,
-            summary,
-            scroll_top,
-            follow_tail,
-            cancelling,
-            finished,
-        )
-        key = screen.getch()
-        if key == curses.KEY_UP:
-            follow_tail = False
-            scroll_top = max(0, scroll_top - 1)
-        elif key == curses.KEY_DOWN:
-            scroll_top = min(maximum_scroll_top, scroll_top + 1)
-            follow_tail = scroll_top == maximum_scroll_top
-        elif process.poll() is None and key in (ord("q"), 27):
-            if not cancelling:
-                cancelling = True
-                stop_deadline = time.monotonic() + STOP_TIMEOUT_SECONDS
-                stop_process(process)
-        elif process.poll() is not None and key != -1:
-            return process.returncode or 0
-        if (
-            stop_deadline is not None
-            and process.poll() is None
-            and time.monotonic() >= stop_deadline
-        ):
-            kill_process(process)
-            return process.wait()
-        if process.poll() is not None and summary is None:
-            summary = load_summary(config.output / "summary.json")
+                rendered = view.observe(event)
+                if transcript is not None:
+                    transcript.append(rendered)
+            if process.poll() is not None and not drained:
+                drained = True
+                for thread in threads:
+                    thread.join(timeout=0.2)
+                while not output.empty():
+                    source, line = output.get_nowait()
+                    rendered = view.add_output(source, line)
+                    if transcript is not None:
+                        transcript.append(rendered)
+                event_offset, events = read_new_events(
+                    config.output / "events.jsonl", event_offset
+                )
+                for event in events:
+                    rendered = view.observe(event)
+                    if transcript is not None:
+                        transcript.append(rendered)
+                summary = load_summary(config.output / "summary.json")
+                if transcript is not None:
+                    transcript.finish(
+                        received_message(view, summary),
+                        summary_lines(summary, view, config),
+                    )
+            finished = process.poll() is not None
+            scroll_top, maximum_scroll_top = draw_run(
+                screen,
+                config,
+                view,
+                summary,
+                scroll_top,
+                follow_tail,
+                cancelling,
+                finished,
+            )
+            key = screen.getch()
+            if key == curses.KEY_UP:
+                follow_tail = False
+                scroll_top = max(0, scroll_top - 1)
+            elif key == curses.KEY_DOWN:
+                scroll_top = min(maximum_scroll_top, scroll_top + 1)
+                follow_tail = scroll_top == maximum_scroll_top
+            elif process.poll() is None and key in (ord("q"), 27):
+                if not cancelling:
+                    cancelling = True
+                    stop_deadline = time.monotonic() + STOP_TIMEOUT_SECONDS
+                    stop_process(process)
+            elif process.poll() is not None and key != -1:
+                return process.returncode or 0
+            if (
+                stop_deadline is not None
+                and process.poll() is None
+                and time.monotonic() >= stop_deadline
+            ):
+                kill_process(process)
+                return process.wait()
+            if process.poll() is not None and summary is None:
+                summary = load_summary(config.output / "summary.json")
+    finally:
+        if transcript is not None:
+            transcript.finish(
+                received_message(view, summary),
+                summary_lines(summary, view, config),
+            )
+
+
+def received_message(
+    view: RunView, summary: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    if view.received_message is not None:
+        return view.received_message
+    if isinstance(summary, dict):
+        candidate = summary.get("resourceResponse")
+        if isinstance(candidate, dict):
+            return candidate
+    return None
 
 
 def draw_run(
@@ -620,7 +1034,8 @@ def draw_run(
     ):
         style = (
             curses.A_BOLD
-            if line.startswith("FieldLink ") or line in {"Live events", "Run statistics"}
+            if line.startswith("FieldLink ")
+            or line in {"Live events", "Atlas response", "Run statistics"}
             else 0
         )
         put(screen, row, 0, line, style)
@@ -641,13 +1056,35 @@ def run_document_lines(
     else:
         name = f" {view.selected_channel_name}" if view.selected_channel_name else ""
         channel = f"channel {view.selected_channel}{name}"
+    if config.resource_request is None:
+        input_description = f"Payload {config.payload_bytes:,} bytes"
+    else:
+        input_description = (
+            f"Request {config.resource_request.get('operation', '?')} "
+            f"{config.resource_request.get('resource_type', '?')}"
+        )
+    response = view.resource_response
+    if response is None and isinstance(summary, dict):
+        candidate = summary.get("resourceResponse")
+        if isinstance(candidate, dict):
+            response = candidate
+    response_lines = (
+        []
+        if response is None
+        else [
+            "",
+            "Atlas response",
+            *json.dumps(response, indent=2, ensure_ascii=False).splitlines(),
+        ]
+    )
     return [
         f"FieldLink {config.message.name}  {state}",
         f"A {config.radio_a.path}  →  {channel}  →  B {config.radio_b.path}",
-        f"Payload {config.payload_bytes:,} bytes   retry {config.retry_strategy}",
+        f"{input_description}   retry {config.retry_strategy}",
         "",
         "Live events",
         *view.logs,
+        *response_lines,
         "",
         "Run statistics",
         *summary_lines(summary, view, config),
@@ -678,17 +1115,25 @@ def tui(
     config = select_configuration(
         screen, messages, radios, strategies, timeout_ms, output_root
     )
-    process = cli.start_test(config)
+    process: subprocess.Popen[str] | None = None
+    transcript = RunTranscript(RESULTS_TRANSCRIPT, config)
     try:
-        return run_live(screen, process, config)
+        process = cli.start_test(config)
+        return run_live(screen, process, config, transcript)
+    except Exception as error:
+        transcript.append(f"[tui] {type(error).__name__}: {error}")
+        raise
     finally:
-        if process.poll() is None:
+        if process is not None and process.poll() is None:
             stop_process(process)
             try:
                 process.wait(timeout=STOP_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
                 kill_process(process)
                 process.wait()
+        transcript.finish()
+        if config.resource_request_path is not None:
+            config.resource_request_path.unlink(missing_ok=True)
 
 
 def parse_arguments(arguments: list[str]) -> argparse.Namespace:

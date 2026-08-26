@@ -3,12 +3,24 @@ import { describe, expect, it } from "vitest";
 import { FIELDLINK_MAX_MESSAGE_BYTES } from "../src/frame.js";
 import {
   definitionForType,
+  attachResourceRequestHandler,
   messageRegistry,
+  resourceMessage,
   validateRegistry,
   type MessageDefinition,
+  type ResourceMessage,
+  type ResourceRequest,
+  type ResourceResponse,
   type SupportedMessage,
 } from "../src/messages/index.js";
 import { testMessage } from "../src/messages/test.js";
+import {
+  parseNodeId,
+  type NodeId,
+  type ReceivedMessage,
+  type SendOptions,
+  type SendResult,
+} from "../src/node.js";
 
 describe("message registry contracts", () => {
   it("has unique IDs and names and round-trips every example", () => {
@@ -126,3 +138,350 @@ describe("Test message", () => {
     expect(second.payload).toEqual(first.payload);
   });
 });
+
+describe("Resource message", () => {
+  it("supports the approved JSON CRUD request and response variants", () => {
+    const messages = [
+      {
+        type: "resource",
+        kind: "request",
+        operation: "create",
+        request_id: "create-entity",
+        resource_type: "entity",
+        body: { name: "Rescue 1", enabled: true },
+      },
+      {
+        type: "resource",
+        kind: "request",
+        operation: "get",
+        request_id: "get-task",
+        resource_type: "task",
+        resource_id: "task-123",
+      },
+      {
+        type: "resource",
+        kind: "request",
+        operation: "list",
+        request_id: "list-tasks",
+        resource_type: "task",
+        query: { limit: 25, cursor: "page-2" },
+      },
+      {
+        type: "resource",
+        kind: "request",
+        operation: "patch",
+        request_id: "patch-object",
+        resource_type: "object",
+        resource_id: "object-123",
+        body: { metadata: { title: "Updated" } },
+      },
+      {
+        type: "resource",
+        kind: "request",
+        operation: "delete",
+        request_id: "delete-entity",
+        resource_type: "entity",
+        resource_id: "entity-123",
+      },
+      {
+        type: "resource",
+        kind: "response",
+        request_id: "get-task",
+        status: 200,
+        body: { id: "task-123", tags: ["urgent", null] },
+      },
+    ] as const satisfies readonly ResourceMessage[];
+
+    for (const message of messages) {
+      expect(resourceMessage.validate(message)).toBe(true);
+      expect(resourceMessage.decode(resourceMessage.encode(message))).toEqual(
+        message,
+      );
+    }
+  });
+
+  it("keeps Task creation, mutation, and deletion out of generic CRUD", () => {
+    expect(
+      resourceMessage.validate({
+        type: "resource",
+        kind: "request",
+        operation: "create",
+        request_id: "create-task",
+        resource_type: "task",
+        body: { title: "Inspect site" },
+      }),
+    ).toBe(false);
+    expect(
+      resourceMessage.validate({
+        type: "resource",
+        kind: "request",
+        operation: "patch",
+        request_id: "patch-task",
+        resource_type: "task",
+        resource_id: "task-123",
+        body: { status: "complete" },
+      }),
+    ).toBe(false);
+    expect(
+      resourceMessage.validate({
+        type: "resource",
+        kind: "request",
+        operation: "delete",
+        request_id: "delete-task",
+        resource_type: "task",
+        resource_id: "task-123",
+      }),
+    ).toBe(false);
+  });
+
+  it("requires bounded pagination and exact operation envelopes", () => {
+    expect(
+      resourceMessage.validate({
+        type: "resource",
+        kind: "request",
+        operation: "list",
+        request_id: "list-entities",
+        resource_type: "entity",
+        query: { limit: 0 },
+      }),
+    ).toBe(false);
+    expect(
+      resourceMessage.validate({
+        type: "resource",
+        kind: "request",
+        operation: "list",
+        request_id: "list-entities",
+        resource_type: "entity",
+        query: { limit: 1001 },
+      }),
+    ).toBe(false);
+    expect(
+      resourceMessage.validate({
+        type: "resource",
+        kind: "request",
+        operation: "list",
+        request_id: "list-entities",
+        resource_type: "entity",
+        query: {},
+      }),
+    ).toBe(false);
+    expect(
+      resourceMessage.validate({
+        type: "resource",
+        kind: "request",
+        operation: "get",
+        request_id: "get-entity",
+        resource_type: "entity",
+        resource_id: "entity-123",
+        path: "/entities/entity-123",
+      }),
+    ).toBe(false);
+  });
+
+  it("accepts JSON values without silently coercing JavaScript values", () => {
+    const response = {
+      type: "resource",
+      kind: "response",
+      request_id: "response",
+      status: 200,
+    } as const;
+    expect(resourceMessage.validate({ ...response, body: null })).toBe(true);
+    expect(resourceMessage.validate({ ...response, body: new Date() })).toBe(
+      false,
+    );
+    expect(resourceMessage.validate({ ...response, body: undefined })).toBe(
+      false,
+    );
+    expect(resourceMessage.validate({ ...response, body: Number.NaN })).toBe(
+      false,
+    );
+  });
+
+  it("rejects invalid UTF-8 JSON and oversized encoded messages", () => {
+    expect(() => resourceMessage.decode(Uint8Array.of(0xff))).toThrow(
+      "valid UTF-8 JSON",
+    );
+    expect(() =>
+      resourceMessage.decode(new TextEncoder().encode("not-json")),
+    ).toThrow("valid UTF-8 JSON");
+    expect(() =>
+      resourceMessage.encode({
+        type: "resource",
+        kind: "response",
+        request_id: "oversized",
+        status: 200,
+        body: "x".repeat(FIELDLINK_MAX_MESSAGE_BYTES),
+      }),
+    ).toThrow("exceeds");
+  });
+
+  it("completes its delivery exercise only at the destination", () => {
+    const sent = resourceMessage.exercise.create(4096);
+    const received = resourceMessage.decode(resourceMessage.encode(sent));
+
+    expect(
+      resourceMessage.exercise.isComplete({
+        sent,
+        received,
+        side: "destination",
+      }),
+    ).toBe(true);
+    expect(
+      resourceMessage.exercise.isComplete({
+        sent,
+        received,
+        side: "source",
+      }),
+    ).toBe(false);
+    expect(
+      resourceMessage.exercise.isComplete({
+        sent,
+        received: { ...received, request_id: "different" },
+        side: "destination",
+      }),
+    ).toBe(false);
+  });
+
+  it("matches a Resource response at the original request source", () => {
+    const sent = {
+      type: "resource",
+      kind: "request",
+      operation: "get",
+      request_id: "request-1",
+      resource_type: "task",
+      resource_id: "task-1",
+    } as const;
+    const received = {
+      type: "resource",
+      kind: "response",
+      request_id: "request-1",
+      status: 200,
+      body: { task_id: "task-1" },
+    } as const;
+
+    expect(
+      resourceMessage.exercise.isComplete({
+        sent,
+        received,
+        side: "source",
+      }),
+    ).toBe(true);
+    expect(
+      resourceMessage.exercise.isComplete({
+        sent,
+        received,
+        side: "destination",
+      }),
+    ).toBe(false);
+  });
+
+  it("executes requests only for the allowed source and replays cached results", async () => {
+    const node = new ResourceHandlerNode();
+    const executor = new ResourceExecutorProbe();
+    const allowed = parseNodeId("aaaaaaaaaaaaaaaa");
+    attachResourceRequestHandler(node, executor, allowed);
+    const request = {
+      type: "resource",
+      kind: "request",
+      operation: "get",
+      request_id: "request-1",
+      resource_type: "task",
+      resource_id: "task-1",
+    } as const;
+
+    await node.emit(request, parseNodeId("cccccccccccccccc"));
+    await node.emit(request, allowed);
+    await node.emit(request, allowed);
+
+    expect(executor.requests).toHaveLength(1);
+    expect(node.sent).toHaveLength(2);
+    expect(node.sent[0]?.message).toMatchObject({
+      kind: "response",
+      request_id: "request-1",
+      status: 200,
+    });
+  });
+
+  it("rejects request ID reuse with different JSON", async () => {
+    const node = new ResourceHandlerNode();
+    const executor = new ResourceExecutorProbe();
+    const allowed = parseNodeId("aaaaaaaaaaaaaaaa");
+    attachResourceRequestHandler(node, executor, allowed);
+    const request = {
+      type: "resource",
+      kind: "request",
+      operation: "get",
+      request_id: "request-1",
+      resource_type: "task",
+      resource_id: "task-1",
+    } as const;
+
+    await node.emit(request, allowed);
+    await node.emit({ ...request, resource_id: "task-2" }, allowed);
+
+    expect(executor.requests).toHaveLength(1);
+    expect(node.sent[1]?.message).toMatchObject({ status: 409 });
+  });
+});
+
+class ResourceExecutorProbe {
+  readonly requests: ResourceRequest[] = [];
+
+  execute(request: ResourceRequest): Promise<ResourceResponse> {
+    this.requests.push(request);
+    return Promise.resolve({
+      type: "resource",
+      kind: "response",
+      request_id: request.request_id,
+      status: 200,
+      body: { ok: true },
+    });
+  }
+}
+
+class ResourceHandlerNode {
+  readonly sent: {
+    readonly message: SupportedMessage;
+    readonly options: SendOptions;
+  }[] = [];
+  #listener: ((message: ReceivedMessage) => void | Promise<void>) | undefined;
+
+  onMessage(
+    listener: (message: ReceivedMessage) => void | Promise<void>,
+  ): () => void {
+    this.#listener = listener;
+    return () => {
+      this.#listener = undefined;
+    };
+  }
+
+  send(message: SupportedMessage, options: SendOptions): Promise<SendResult> {
+    this.sent.push({ message, options });
+    return Promise.resolve({
+      logicalId: "0000000000000001",
+      messageType: 2,
+      messageName: "resource",
+      destination: parseNodeId(options.destination),
+      priority: "normal",
+      delivery: "complete",
+      encodedBytes: 1,
+      fragments: 1,
+      retransmissions: 0,
+      receiptRequests: 0,
+      receiptRequestRetries: 0,
+      receipts: 0,
+      durationMs: 1,
+    });
+  }
+
+  async emit(message: ResourceRequest, source: NodeId): Promise<void> {
+    await this.#listener?.({
+      message,
+      source,
+      destination: parseNodeId("bbbbbbbbbbbbbbbb"),
+      logicalId: "0000000000000001",
+      delivery: "complete",
+      receivedAt: new Date(),
+    });
+  }
+}

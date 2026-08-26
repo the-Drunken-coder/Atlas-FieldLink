@@ -49,10 +49,28 @@ describe("CLI arguments", () => {
       a: "/dev/cu.a",
       b: "/dev/cu.b",
       channel: 2,
-      payloadSize: 64,
+      input: { kind: "exercise", payloadSize: 64 },
       retryStrategy: "selective-window",
       timeoutMs: 1_800_000,
       allowInboxDrain: true,
+    });
+    expect(
+      parseCommand([
+        "test",
+        "--a",
+        "/dev/cu.a",
+        "--b",
+        "/dev/cu.b",
+        "--channel",
+        "2",
+        "--message",
+        "resource",
+        "--allow-inbox-drain",
+      ]),
+    ).toMatchObject({
+      name: "test",
+      message: "resource",
+      input: { kind: "exercise", payloadSize: 32 },
     });
   });
 
@@ -78,7 +96,10 @@ describe("CLI arguments", () => {
         "out",
       ]),
     ).toMatchObject({
-      payloadSize: FIELDLINK_MAX_MESSAGE_BYTES - 5,
+      input: {
+        kind: "exercise",
+        payloadSize: FIELDLINK_MAX_MESSAGE_BYTES - 5,
+      },
       timeoutMs: 1,
       output: "out",
     });
@@ -93,8 +114,49 @@ describe("CLI arguments", () => {
       "selective-window",
     );
     expect(() => parseCommand([...base, "--message", "missing"])).toThrow(
-      "--message must be one of: test",
+      "--message must be one of: test, resource",
     );
+  });
+
+  it("accepts a Resource request file instead of a synthetic payload", () => {
+    const base = [
+      "test",
+      "--a",
+      "a",
+      "--b",
+      "b",
+      "--message",
+      "resource",
+      "--allow-inbox-drain",
+    ];
+    expect(
+      parseCommand([...base, "--resource-request", "request.json"]),
+    ).toMatchObject({
+      input: { kind: "resource-request", path: "request.json" },
+    });
+    expect(() =>
+      parseCommand([
+        ...base,
+        "--resource-request",
+        "request.json",
+        "--payload-size",
+        "32",
+      ]),
+    ).toThrow("cannot be used together");
+    expect(() =>
+      parseCommand([
+        "test",
+        "--a",
+        "a",
+        "--b",
+        "b",
+        "--message",
+        "test",
+        "--resource-request",
+        "request.json",
+        "--allow-inbox-drain",
+      ]),
+    ).toThrow("requires --message resource");
   });
 
   it("selects a shared channel automatically unless explicitly overridden", () => {

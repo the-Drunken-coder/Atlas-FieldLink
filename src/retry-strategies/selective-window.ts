@@ -10,13 +10,24 @@ import {
 
 export const SELECTIVE_WINDOW_SIZE = 8;
 export const SELECTIVE_WINDOW_REPAIR_ROUNDS = 5;
-export const SELECTIVE_WINDOW_RECEIPT_TIMEOUT_MS = 30_000;
+export const SELECTIVE_WINDOW_RECEIPT_TIMEOUT_MS = 5_000;
+const SELECTIVE_WINDOW_CONTROL_TIMEOUT_MS = 30_000;
+const SELECTIVE_WINDOW_RECEIPT_REQUEST_ATTEMPTS = 2;
 
 class SelectiveWindowSender implements RetrySender {
   async run(session: TransferSenderSession): Promise<RetryResult> {
     await openTransfer(session);
     let retransmissions = 0;
+    let receiptRequests = 0;
+    let receiptRequestRetries = 0;
     let receipts = 0;
+    const requestReceipt = (windowStart: number, windowCount: number) =>
+      requestWindowReceipt(session, windowStart, windowCount, (retry) => {
+        receiptRequests += 1;
+        if (retry) {
+          receiptRequestRetries += 1;
+        }
+      });
 
     for (
       let windowStart = 0;
@@ -41,13 +52,14 @@ class SelectiveWindowSender implements RetrySender {
         }
 
         try {
-          const received = await session.requestReceipt(
-            windowStart,
-            windowCount,
-            SELECTIVE_WINDOW_RECEIPT_TIMEOUT_MS,
-          );
+          const received = await requestReceipt(windowStart, windowCount);
           if (received === undefined) {
-            return { retransmissions, receipts };
+            return {
+              retransmissions,
+              receiptRequests,
+              receiptRequestRetries,
+              receipts,
+            };
           }
           receipts += 1;
           missing = fullBitmap(windowCount) & ~received;
@@ -80,8 +92,13 @@ class SelectiveWindowSender implements RetrySender {
       attempt += 1
     ) {
       try {
-        await session.waitForCompletion(SELECTIVE_WINDOW_RECEIPT_TIMEOUT_MS);
-        return { retransmissions, receipts };
+        await session.waitForCompletion(SELECTIVE_WINDOW_CONTROL_TIMEOUT_MS);
+        return {
+          retransmissions,
+          receiptRequests,
+          receiptRequestRetries,
+          receipts,
+        };
       } catch (error: unknown) {
         throwIfAborted(session.signal);
         if (error instanceof TransferRejectedError) {
@@ -101,13 +118,14 @@ class SelectiveWindowSender implements RetrySender {
         );
         const windowCount = session.fragmentCount - windowStart;
         try {
-          const received = await session.requestReceipt(
-            windowStart,
-            windowCount,
-            SELECTIVE_WINDOW_RECEIPT_TIMEOUT_MS,
-          );
+          const received = await requestReceipt(windowStart, windowCount);
           if (received === undefined) {
-            return { retransmissions, receipts };
+            return {
+              retransmissions,
+              receiptRequests,
+              receiptRequestRetries,
+              receipts,
+            };
           }
           receipts += 1;
         } catch (receiptError: unknown) {
@@ -156,7 +174,7 @@ async function openTransfer(session: TransferSenderSession): Promise<void> {
   ) {
     throwIfAborted(session.signal);
     try {
-      await session.open(SELECTIVE_WINDOW_RECEIPT_TIMEOUT_MS);
+      await session.open(SELECTIVE_WINDOW_CONTROL_TIMEOUT_MS);
       return;
     } catch (error: unknown) {
       throwIfAborted(session.signal);
@@ -172,6 +190,37 @@ async function openTransfer(session: TransferSenderSession): Promise<void> {
       cause: lastError,
     },
   );
+}
+
+async function requestWindowReceipt(
+  session: TransferSenderSession,
+  windowStart: number,
+  windowCount: number,
+  onAttempt: (retry: boolean) => void,
+): Promise<number | undefined> {
+  let lastError: unknown;
+  for (
+    let attempt = 0;
+    attempt < SELECTIVE_WINDOW_RECEIPT_REQUEST_ATTEMPTS;
+    attempt += 1
+  ) {
+    throwIfAborted(session.signal);
+    onAttempt(attempt > 0);
+    try {
+      return await session.requestReceipt(
+        windowStart,
+        windowCount,
+        SELECTIVE_WINDOW_RECEIPT_TIMEOUT_MS,
+      );
+    } catch (error: unknown) {
+      throwIfAborted(session.signal);
+      if (error instanceof TransferRejectedError) {
+        throw error;
+      }
+      lastError = error;
+    }
+  }
+  throw lastError;
 }
 
 function fullBitmap(count: number): number {

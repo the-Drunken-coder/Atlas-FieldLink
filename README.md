@@ -78,13 +78,15 @@ A Node ID is the first eight bytes of the SHA-256 hash of a MeshCore public key,
 
 ## Messages
 
-Message-specific behavior lives in one file under `src/messages/`. A message definition owns its stable `uint16` ID, name, default priority, runtime validation, binary codec, examples, hardware exercise, and optional inbound handler. `src/messages/test.ts` documents and implements the only registered message.
+Message-specific behavior lives in one file under `src/messages/`. A message definition owns its stable `uint16` ID, name, default priority, runtime validation, binary codec, examples, hardware exercise, and optional inbound handler. FieldLink currently registers Test as message ID 1 and Resource as message ID 2.
 
 The explicit registry is `src/messages/index.ts`. Adding a message requires one new message file and one registry entry. Startup rejects duplicate IDs or names. Generic contract tests validate every registered example and codec round trip.
 
 The hardware exercise constructs a representative message and recognizes successful end-to-end delivery. This keeps message-specific test input and completion rules in the message file while the CLI continues to own radios, transport, evidence, and timing.
 
 Test has request and response variants. Both carry a `uint32` correlation ID and arbitrary bytes. A received request is echoed to its source with identical correlation and payload. A response is delivered to listeners and never echoed.
+
+Resource carries a typed UTF-8 JSON envelope for Entity and Object CRUD plus Task reads. Create and patch bodies use Atlas JSON; Object bodies are metadata only. Every request has a `request_id`, and every response returns the same ID, a numeric status, and an optional JSON body. Resource carries no HTTP routes or credentials. The two-radio test can explicitly enable an Atlas SDK gateway on adapter B; normal nodes do not execute Resource requests. See the [Resource message contract](docs/messages/resource.md) for its exact operations, gateway setup, security boundary, and exclusions.
 
 ## Delivery
 
@@ -98,7 +100,8 @@ FieldLink ships `selective-window`, retry strategy ID 1:
 - The sender transmits windows of eight fragments.
 - A one-byte receipt bitmap identifies received fragments.
 - Only missing fragments are repaired.
-- Each window allows five repair rounds with a 30-second receipt timeout.
+- Each window allows five repair rounds. A receipt request waits five seconds
+  and is retried once before any fragment repair.
 - Completion is sent only after length and SHA-256 validation.
 
 FieldLink permits one outbound transfer, four active inbound transfers, and 64 pending sends per node. Inactive inbound state expires after two minutes. High, normal, and bulk queues are checked between every MeshCore frame. Core Stats `queueLen` keeps the radio queue shallow so a high-priority complete message can preempt a bulk transfer.
@@ -149,11 +152,32 @@ npm run fieldlink -- test \
   --allow-inbox-drain
 ```
 
-`--payload-size` is the Test message payload, excluding its five-byte message-local header. It defaults to 64 bytes. The overall test timeout defaults to 30 minutes.
+`--payload-size` is the selected message's exercise payload, excluding its message-local envelope. Test defaults to 64 bytes. Resource defaults to 32 JSON string bytes and exercises delivery only; it does not call an Atlas API. The overall test timeout defaults to 30 minutes.
+
+To exercise the actual Atlas API, build the SDK in an Atlas Modernization
+checkout, copy `.env.example` to `.env`, and provide the checkout path, Atlas
+base URL, and API key. Then pass one Resource request JSON file:
+
+```bash
+npm run fieldlink -- test \
+  --a /dev/cu.usbmodem-A \
+  --b /dev/cu.usbmodem-B \
+  --message resource \
+  --resource-request request.json \
+  --retry-strategy selective-window \
+  --allow-inbox-drain
+```
+
+The CLI validates the JSON before opening a radio. After preflight it binds the
+destination gateway to radio A's Node ID, loads `.env` only in adapter B,
+handshakes through the Atlas SDK, sends the request across FieldLink, and waits
+for the matching response. The API key never enters the Resource message or
+evidence. See the [Resource message contract](docs/messages/resource.md#atlas-sdk-test-gateway)
+for setup and trust limitations.
 
 Before starting the adapters, the controller asks MeshCore for every channel slot available on both radios. It chooses the lowest configured slot whose name and key fingerprint match exactly. This inspection does not write radio configuration or transmit RF. If no slot matches, the test stops with an error. `--channel <index>` skips automatic selection and forces one slot for diagnostics.
 
-The controller then starts one adapter per radio, verifies distinct identities and matching LoRa and selected-channel settings, and sends one deterministic Test request from A to B. B's registered handler echoes it. The test passes only when A receives the matching response with identical bytes and, for a fragmented response, B receives the final transfer completion.
+The controller then starts one adapter per radio, verifies distinct identities and matching LoRa and selected-channel settings, and sends one deterministic Test request from A to B. B's registered handler echoes it. The test passes only when A receives the matching response with identical bytes, any fragmented response finishes, cleanup succeeds, and neither adapter reports a listener or protocol error.
 
 ## Terminal console
 
@@ -163,7 +187,7 @@ Run the standard-library Python console from the repository root:
 npm run fieldlink:tui
 ```
 
-Use the arrow keys and Enter to select a registered message, source radio, destination radio, payload, and retry strategy. The console reads both lists from the real FieldLink CLI. Radio entries are USB serial candidates and remain marked unverified until MeshCore preflight succeeds. FieldLink finds the shared MeshCore channel automatically and shows the chosen slot in the live log. Every registered message supplies its own runnable hardware exercise.
+Use the arrow keys and Enter to select a registered message, source radio, destination radio, input, and retry strategy. The console reads both lists from the real FieldLink CLI. Radio entries are USB serial candidates and remain marked unverified until MeshCore preflight succeeds. FieldLink finds the shared MeshCore channel automatically and shows the chosen slot in the live log.
 
 Test offers these presets:
 
@@ -172,9 +196,18 @@ Test offers these presets:
 - 4096 payload bytes across 32 fragments
 - a custom size up to the message limit
 
+When you select Resource, the console shows operation-aware fields on the left
+and the generated request JSON on the right. Choose `create`, `get`, `list`,
+`patch`, or `delete`; select the allowed resource type; fill its ID, page query,
+or body; then press `s` to continue. Body JSON uses a multiline editor where
+Ctrl-G saves. The console skips synthetic payload selection, enables the Atlas
+SDK gateway on B, and displays the returned Resource response in the run
+transcript. A manual CLI run can still use `--payload-size` to exercise
+Resource transport without calling Atlas.
+
 The test starts after retry-strategy selection. During the run, the console shows the CLI's RF and inbox-drain warning, then follows `events.jsonl` for frames, fragmentation, receipts, retransmissions, delivery on both radios, SNR, errors, and cleanup. The header, events, and statistics form one scrolling transcript. It follows new events until you press the up arrow, then holds that position while more events arrive. Press the down arrow to return to the bottom. Press `q` to stop cooperatively.
 
-The console writes the normal `manifest.json`, `events.jsonl`, and `summary.json` under `results/`. It does not implement radio or delivery behavior itself. It launches `fieldlink test` and renders its evidence.
+When a test starts, the console replaces `tools/results.txt` with a human-readable transcript of that run. The exact Resource request JSON is at the top, events are flushed into the file while the test runs, and the decoded response is at the bottom after the run finishes. The normal timestamped `manifest.json`, `events.jsonl`, and `summary.json` under `results/` remain the complete machine-readable evidence and are not overwritten. The console does not implement radio or delivery behavior itself. It launches `fieldlink test` and renders its evidence.
 
 ## Inbox and evidence safety
 
@@ -185,6 +218,15 @@ Before either radio opens, `fieldlink test` creates:
 - `manifest.json` with requested test inputs
 - `events.jsonl` for streamed inbox, frame, message, fragment, receipt, retry, SNR, interruption, error, and cleanup evidence
 - `summary.json` with an initial `running` state that is replaced by the final or partial result
+
+The final summary records request and response delivery separately. Each side
+includes encoded bytes, fragments, retransmissions, receipts, and sender
+duration when available, including receipt requests and their retries for
+transfers. Verification reports response correlation, the fragment digest when
+a transfer was used, and the Atlas status for a Resource response. A successful
+run is `clean` when neither direction needed recovery and `recovered` when a
+fragment repair or receipt-request retry succeeded. Listener and protocol errors
+make the final run fail even if the expected response arrived first.
 
 Each adapter also creates `adapters/a/events.jsonl` or `adapters/b/events.jsonl` before opening its radio. It appends every consumed inbox item to that local file before sending the item to the controller. The root `events.jsonl` remains the combined test transcript.
 

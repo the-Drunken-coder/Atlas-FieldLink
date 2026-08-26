@@ -180,7 +180,10 @@ describe("NDJSON adapter server", () => {
     expect(await reader.nextType("ready")).toMatchObject({
       processId: 123,
       nodeId: nodeB,
-      supportedMessages: [{ id: 1, name: "test" }],
+      supportedMessages: [
+        { id: 1, name: "test" },
+        { id: 2, name: "resource" },
+      ],
       retryStrategies: [{ id: 1, name: "selective-window" }],
     });
     expect(started).toBe(true);
@@ -257,6 +260,70 @@ describe("NDJSON adapter server", () => {
     input.write(`${JSON.stringify({ id: 3, type: "close" })}\n`);
     expect(await reader.nextType("response")).toMatchObject({
       id: 3,
+      ok: true,
+    });
+    input.end();
+    await serving;
+    reader.close();
+  });
+
+  it("enables the Atlas Resource gateway only after activation", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const node = new FieldLinkNode({
+      nodeId: nodeB,
+      transport: new MemoryTransport(),
+    });
+    const enableResourceGateway = vi.fn(() => Promise.resolve());
+    const reader = lineReader(output);
+    const serving = serveAdapter({
+      path: "/dev/cu.test",
+      channel: 1,
+      input,
+      output,
+      createRuntime: () =>
+        Promise.resolve({
+          node,
+          enableResourceGateway,
+          ready: ready(123),
+        }),
+    });
+    await reader.nextType("ready");
+    input.write(
+      `${JSON.stringify({
+        id: 1,
+        type: "enable-resource-gateway",
+        allowedSource: nodeA,
+      })}\n`,
+    );
+    expect(await reader.nextType("response")).toMatchObject({
+      id: 1,
+      ok: false,
+      error: "Adapter is not activated",
+    });
+    input.write(`${JSON.stringify({ id: 2, type: "activate" })}\n`);
+    expect(await reader.nextType("response")).toMatchObject({
+      id: 2,
+      ok: true,
+    });
+    input.write(
+      `${JSON.stringify({
+        id: 3,
+        type: "enable-resource-gateway",
+        allowedSource: nodeA,
+      })}\n`,
+    );
+    expect(await reader.nextType("response")).toMatchObject({
+      id: 3,
+      ok: true,
+    });
+    expect(enableResourceGateway).toHaveBeenCalledWith(
+      nodeA,
+      expect.any(AbortSignal),
+    );
+    input.write(`${JSON.stringify({ id: 4, type: "close" })}\n`);
+    expect(await reader.nextType("response")).toMatchObject({
+      id: 4,
       ok: true,
     });
     input.end();
@@ -451,6 +518,7 @@ describe("adapter process proxy", () => {
       program: nodeScript(cooperativeChildScript()),
     });
     await adapter.activate();
+    await expect(adapter.enableResourceGateway(nodeA)).resolves.toBeUndefined();
     const result = await adapter.send(
       {
         type: "test",
@@ -668,7 +736,7 @@ describe("adapter process proxy", () => {
 
   it("drains the final response before treating child exit as failure", async () => {
     const script = `${writeReady()}
-${activateThen('const response={type:"response",id:request.id,ok:true,result:{logicalId:"0000000000000001",messageType:1,messageName:"test",destination:request.destination,priority:"normal",delivery:"complete",encodedBytes:5,fragments:1,retransmissions:0,receipts:0,durationMs:1}};process.stdout.write(JSON.stringify(response)+"\\n",()=>process.exit(0));')}`;
+${activateThen('const response={type:"response",id:request.id,ok:true,result:{logicalId:"0000000000000001",messageType:1,messageName:"test",destination:request.destination,priority:"normal",delivery:"complete",encodedBytes:5,fragments:1,retransmissions:0,receiptRequests:0,receiptRequestRetries:0,receipts:0,durationMs:1}};process.stdout.write(JSON.stringify(response)+"\\n",()=>process.exit(0));')}`;
     const adapter = await AdapterProcessNode.start({
       path: "test",
       channel: 1,
@@ -901,6 +969,7 @@ function ready(processId: number, channelIndex = 1) {
     nodeId: nodeB,
     supportedMessages: [
       { id: 1, name: "test", defaultPriority: "normal" as const },
+      { id: 2, name: "resource", defaultPriority: "normal" as const },
     ],
     retryStrategies: [{ id: 1, name: "selective-window" as const }],
     delivery: {
@@ -999,7 +1068,7 @@ function cooperativeChildScript(): string {
   return `${writeReady()}
 let pending="";
 process.stdin.setEncoding("utf8");
-process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="activate"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n");}else if(request.type==="send"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true,result:{logicalId:"0000000000000001",messageType:1,messageName:"test",destination:request.destination,priority:"normal",delivery:"complete",encodedBytes:7,fragments:1,retransmissions:0,receipts:0,durationMs:1}})+"\\n");}else if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}}});`;
+process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="activate"||request.type==="enable-resource-gateway"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n");}else if(request.type==="send"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true,result:{logicalId:"0000000000000001",messageType:1,messageName:"test",destination:request.destination,priority:"normal",delivery:"complete",encodedBytes:7,fragments:1,retransmissions:0,receiptRequests:0,receiptRequestRetries:0,receipts:0,durationMs:1}})+"\\n");}else if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}}});`;
 }
 
 function listenerFailureChildScript(): string {

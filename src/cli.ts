@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { readFile } from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,7 +46,7 @@ const HELP = `Usage:
   fieldlink radios list [--json]
   fieldlink messages list [--json]
   fieldlink adapter --radio <port> --channel <index> --output <directory> --allow-inbox-drain
-  fieldlink test --a <port> --b <port> [--channel auto|<index>] [--message <name>] [--payload-size <bytes>] [--retry-strategy selective-window] [--timeout-ms <ms>] [--output <directory>] --allow-inbox-drain
+  fieldlink test --a <port> --b <port> [--channel auto|<index>] [--message <name>] [--payload-size <bytes> | --resource-request <json-file>] [--retry-strategy selective-window] [--timeout-ms <ms>] [--output <directory>] --allow-inbox-drain
 
 Defaults:
   --channel auto
@@ -80,6 +81,11 @@ export async function main(arguments_: readonly string[]): Promise<number> {
 }
 
 async function runHardwareTest(command: TestCommand): Promise<number> {
+  const definition = definitionForName(command.message);
+  if (definition === undefined) {
+    throw new Error(`Message ${command.message} disappeared from registry`);
+  }
+  const sent = await testInputMessage(command, definition);
   const startedAt = new Date().toISOString();
   const controller = new AbortController();
   let artifactSink: TestArtifacts | undefined = undefined;
@@ -151,7 +157,7 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
       startedAt,
       radios: { a: command.a, b: command.b },
       channel: command.channel,
-      payloadSize: command.payloadSize,
+      input: testEvidenceInput(command, sent),
       retryStrategy: command.retryStrategy,
       timeoutMs: command.timeoutMs,
       inboxDrainAccepted: command.allowInboxDrain,
@@ -187,6 +193,12 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
   let durationMs: number | undefined;
   let selectedChannel: number | undefined;
   const cleanupErrors: string[] = [];
+  const diagnosticErrors: {
+    readonly radio: "A" | "B";
+    readonly type: "listener-error" | "protocol-error" | "transport-error";
+    readonly message: string;
+    readonly logicalId?: string;
+  }[] = [];
   try {
     throwIfAborted(controller.signal);
     selectedChannel = await resolveTestChannel(
@@ -201,6 +213,9 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
       controller.signal,
       record,
       preserveEvidence,
+      (error) => {
+        diagnosticErrors.push(error);
+      },
     );
     verifyPreflight(a, b);
     await Promise.all([
@@ -212,11 +227,13 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
       b: adapterEvidence(b, command.b),
       channel: a.channel,
     });
-    const definition = definitionForName(command.message);
-    if (definition === undefined) {
-      throw new Error(`Message ${command.message} disappeared from registry`);
+    if (command.input.kind === "resource-request") {
+      await b.enableResourceGateway(a.nodeId, controller.signal);
+      record("resource-gateway-ready", {
+        radio: "B",
+        allowedSource: a.nodeId,
+      });
     }
-    const sent = definition.exercise.create(command.payloadSize);
     const completionPromise = waitForExerciseCompletion(
       a,
       b,
@@ -237,9 +254,10 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
     } finally {
       durationMs = performance.now() - start;
     }
-    record("test-passed", {
+    record("exercise-complete", {
       message: command.message,
       sendResult,
+      response: completion.response,
       completion: {
         side: completion.side,
         source: completion.received.source,
@@ -248,7 +266,10 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
         logicalId: completion.received.logicalId,
       },
       durationMs,
-      integrity: "matched",
+      correlation: "matched",
+      ...(completion.response.delivery === "transfer"
+        ? { responseDigest: "verified" }
+        : {}),
     });
   } catch (error: unknown) {
     runError = asError(error);
@@ -287,18 +308,30 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
     runError !== undefined ||
     artifactError !== undefined ||
     cleanupErrors.length > 0 ||
+    diagnosticErrors.length > 0 ||
     sendResult === undefined ||
     completion === undefined;
+  const condition = interrupted
+    ? "interrupted"
+    : failed
+      ? "failed"
+      : (sendResult?.retransmissions ?? 0) > 0 ||
+          (sendResult?.receiptRequestRetries ?? 0) > 0 ||
+          (completion?.response.retransmissions ?? 0) > 0 ||
+          (completion?.response.receiptRequestRetries ?? 0) > 0
+        ? "recovered"
+        : "clean";
   const summary = {
     command: "test",
     message: command.message,
     startedAt,
     finishedAt: new Date().toISOString(),
     status: interrupted ? "interrupted" : failed ? "failed" : "passed",
+    condition,
     interrupted,
     ...(interrupted || failed ? { partial: true } : {}),
     ...(interruptedBy === undefined ? {} : { interruptedBy }),
-    payloadSize: command.payloadSize,
+    input: testEvidenceInput(command, sent),
     retryStrategy: command.retryStrategy,
     channelSelection: command.channel,
     ...(selectedChannel === undefined
@@ -320,13 +353,28 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
             snrDb: completion.received.snrDb,
             logicalId: completion.received.logicalId,
           },
-          integrity: "matched",
+          response: completion.response,
+          verification: {
+            correlation: "matched",
+            ...(completion.response.delivery === "transfer"
+              ? { responseDigest: "verified" }
+              : {}),
+            ...(completion.received.message.type === "resource" &&
+            completion.received.message.kind === "response"
+              ? { atlasStatus: completion.received.message.status }
+              : {}),
+          },
+          ...(completion.received.message.type === "resource" &&
+          completion.received.message.kind === "response"
+            ? { resourceResponse: completion.received.message }
+            : {}),
         }),
     ...(durationMs === undefined ? {} : { elapsedMs: durationMs }),
     ...(runError === undefined ? {} : { error: runError.message }),
     ...(artifactError === undefined
       ? {}
       : { artifactError: artifactError.message }),
+    diagnosticErrors,
     cleanupErrors,
   };
   let finishError: Error | undefined;
@@ -351,20 +399,59 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
   ) {
     process.stdout.write(
       [
-        `Test passed: ${command.message}, ${command.payloadSize} payload bytes`,
+        `Test passed: ${command.message}, ${testInputDescription(command)}`,
         `Request delivery: ${sendResult.delivery}`,
         `MeshCore channel: ${selectedChannel}`,
-        `Fragments: ${sendResult.fragments}`,
-        `Retransmissions: ${sendResult.retransmissions}`,
+        `Request fragments: ${sendResult.fragments}`,
+        `Request retransmissions: ${sendResult.retransmissions}`,
+        `Request receipt-request retries: ${sendResult.receiptRequestRetries}`,
+        `Response fragments: ${completion?.response.fragments ?? "?"}`,
+        `Response retransmissions: ${completion?.response.retransmissions ?? "?"}`,
+        `Response receipt-request retries: ${completion?.response.receiptRequestRetries ?? "?"}`,
+        `Condition: ${condition}`,
         `Elapsed: ${durationMs.toFixed(2)} ms`,
         `Artifacts: ${artifacts.paths.directory}`,
       ].join("\n") + "\n",
     );
   } else {
-    process.stderr.write(`fieldlink: ${runError?.message ?? "test failed"}\n`);
+    process.stderr.write(
+      `fieldlink: ${runError?.message ?? diagnosticErrors[0]?.message ?? "test failed"}\n`,
+    );
     process.stderr.write(`Artifacts: ${artifacts.paths.directory}\n`);
   }
   return interrupted ? 130 : failed ? 1 : 0;
+}
+
+async function testInputMessage(
+  command: TestCommand,
+  definition: MessageDefinition<SupportedMessage>,
+): Promise<SupportedMessage> {
+  if (command.input.kind === "exercise") {
+    return definition.exercise.create(command.input.payloadSize);
+  }
+  const message = definition.decode(await readFile(command.input.path));
+  if (message.type !== "resource" || message.kind !== "request") {
+    throw new Error(
+      "--resource-request must contain one valid Resource request JSON object",
+    );
+  }
+  return message;
+}
+
+function testInputDescription(command: TestCommand): string {
+  return command.input.kind === "exercise"
+    ? `${command.input.payloadSize} payload bytes`
+    : `request JSON from ${command.input.path}`;
+}
+
+function testEvidenceInput(command: TestCommand, sent: SupportedMessage) {
+  if (command.input.kind === "exercise") {
+    return command.input;
+  }
+  if (sent.type !== "resource" || sent.kind !== "request") {
+    throw new Error("Resource request evidence received an invalid message");
+  }
+  return { kind: "resource-request" as const, request: sent };
 }
 
 async function startAdapterPair(
@@ -374,6 +461,12 @@ async function startAdapterPair(
   signal: AbortSignal,
   record: (type: string, data: unknown) => void,
   preserveEvidence: (type: string, data: unknown) => Promise<void>,
+  onDiagnosticError: (error: {
+    readonly radio: "A" | "B";
+    readonly type: "listener-error" | "protocol-error" | "transport-error";
+    readonly message: string;
+    readonly logicalId?: string;
+  }) => void,
 ): Promise<readonly [AdapterProcessNode, AdapterProcessNode]> {
   const startupController = new AbortController();
   const startupSignal = AbortSignal.any([signal, startupController.signal]);
@@ -399,6 +492,11 @@ async function startAdapterPair(
         preserveEvidence("inbox-message", { radio: label, message }),
       onListenerError: (error) => {
         record("listener-error", { radio: label, message: error.message });
+        onDiagnosticError({
+          radio: label,
+          type: "listener-error",
+          message: error.message,
+        });
       },
       onStderr: (message) => {
         record("adapter-stderr", { radio: label, message });
@@ -426,6 +524,20 @@ async function startAdapterPair(
     ] as const) {
       node.onEvent((event) => {
         record("node-event", { radio: label, event });
+        if (
+          (event.type === "protocol-error" ||
+            event.type === "transport-error") &&
+          typeof event.message === "string"
+        ) {
+          onDiagnosticError({
+            radio: label,
+            type: event.type,
+            message: event.message,
+            ...(typeof event.logicalId === "string"
+              ? { logicalId: event.logicalId }
+              : {}),
+          });
+        }
       });
       node.onMessage((message) => {
         record("message", { radio: label, message });
@@ -597,6 +709,20 @@ function verifyMatchingChannels(
 export interface ExerciseCompletion {
   readonly side: "source" | "destination";
   readonly received: ReceivedMessage;
+  readonly response: ExerciseResponseEvidence;
+}
+
+export interface ExerciseResponseEvidence {
+  readonly logicalId: string;
+  readonly delivery: "complete" | "transfer";
+  readonly encodedBytes: number;
+  readonly fragments: number;
+  readonly retransmissions: number;
+  readonly receiptRequests: number;
+  readonly receiptRequestRetries: number;
+  readonly receipts: number;
+  readonly retryStrategy?: string;
+  readonly durationMs?: number;
 }
 
 export interface ExerciseNode {
@@ -618,19 +744,38 @@ export function waitForExerciseCompletion(
 ): Promise<ExerciseCompletion> {
   return new Promise<ExerciseCompletion>((resolve, reject) => {
     const subscriptions: (() => void)[] = [];
-    const completedTransfers = new Set<string>();
+    const startedTransfers = new Map<
+      string,
+      {
+        readonly at: string;
+        readonly encodedBytes: number;
+        readonly fragmentCount: number;
+        readonly retryStrategy?: string;
+      }
+    >();
+    const completedTransfers = new Map<
+      string,
+      {
+        readonly at: string;
+        readonly retransmissions: number;
+        readonly receipts: number;
+      }
+    >();
+    const receiptRequests = new Map<string, number>();
+    const receiptRequestWindows = new Map<string, Set<string>>();
+    const receiptRequestRetries = new Map<string, number>();
     const failedTransfers = new Map<string, Error>();
     const echoTransfers = new Set<string>();
     const expectedHandlerLogicalIds = new Set<string>();
     const exerciseKey = definition.exercise.key(sent);
-    let matched: ExerciseCompletion | undefined;
+    let matched: Omit<ExerciseCompletion, "response"> | undefined;
     let settled = false;
 
     const transferKey = (sender: NodeId, logicalId: string): string =>
       `${sender}:${logicalId}`;
     const expectedSender = (side: ExerciseCompletion["side"]): NodeId =>
       side === "source" ? destinationNode.nodeId : sourceNode.nodeId;
-    const finish = (candidate: ExerciseCompletion): void => {
+    const finish = (candidate: Omit<ExerciseCompletion, "response">): void => {
       if (settled) {
         return;
       }
@@ -646,14 +791,60 @@ export function waitForExerciseCompletion(
           reject(failure);
           return;
         }
-        if (!completedTransfers.has(key)) {
+        const completed = completedTransfers.get(key);
+        if (completed === undefined) {
           matched = candidate;
           return;
         }
+        const started = startedTransfers.get(key);
+        const encodedBytes =
+          started?.encodedBytes ??
+          definition.encode(candidate.received.message).length;
+        settled = true;
+        cleanup();
+        resolve({
+          ...candidate,
+          response: {
+            logicalId: candidate.received.logicalId,
+            delivery: "transfer",
+            encodedBytes,
+            fragments:
+              started?.fragmentCount ??
+              Math.ceil(encodedBytes / TRANSFER_FRAGMENT_BYTES),
+            retransmissions: completed.retransmissions,
+            receiptRequests: receiptRequests.get(key) ?? 0,
+            receiptRequestRetries: receiptRequestRetries.get(key) ?? 0,
+            receipts: completed.receipts,
+            ...(started?.retryStrategy === undefined
+              ? {}
+              : { retryStrategy: started.retryStrategy }),
+            ...(started === undefined
+              ? {}
+              : {
+                  durationMs: Math.max(
+                    0,
+                    Date.parse(completed.at) - Date.parse(started.at),
+                  ),
+                }),
+          },
+        });
+        return;
       }
       settled = true;
       cleanup();
-      resolve(candidate);
+      resolve({
+        ...candidate,
+        response: {
+          logicalId: candidate.received.logicalId,
+          delivery: "complete",
+          encodedBytes: definition.encode(candidate.received.message).length,
+          fragments: 1,
+          retransmissions: 0,
+          receiptRequests: 0,
+          receiptRequestRetries: 0,
+          receipts: 0,
+        },
+      });
     };
     const listenForMessage = (
       node: ExerciseNode,
@@ -697,21 +888,62 @@ export function waitForExerciseCompletion(
       subscriptions.push(
         node.onEvent((event: FieldLinkEvent) => {
           if (
+            event.type === "transfer-started" &&
+            typeof event.logicalId === "string" &&
+            typeof event.encodedBytes === "number" &&
+            typeof event.fragmentCount === "number"
+          ) {
+            startedTransfers.set(transferKey(node.nodeId, event.logicalId), {
+              at: event.at,
+              encodedBytes: event.encodedBytes,
+              fragmentCount: event.fragmentCount,
+              ...(typeof event.retryStrategy === "string"
+                ? { retryStrategy: event.retryStrategy }
+                : {}),
+            });
+          }
+          if (
+            event.type === "receipt-request-sent" &&
+            typeof event.logicalId === "string" &&
+            typeof event.windowStart === "number" &&
+            typeof event.windowCount === "number"
+          ) {
+            const key = transferKey(node.nodeId, event.logicalId);
+            receiptRequests.set(key, (receiptRequests.get(key) ?? 0) + 1);
+            const window = `${event.windowStart}:${event.windowCount}`;
+            const windows = receiptRequestWindows.get(key) ?? new Set<string>();
+            if (windows.has(window)) {
+              receiptRequestRetries.set(
+                key,
+                (receiptRequestRetries.get(key) ?? 0) + 1,
+              );
+            } else {
+              windows.add(window);
+              receiptRequestWindows.set(key, windows);
+            }
+          }
+          if (
             node === destinationNode &&
             event.type === "protocol-error" &&
             typeof event.logicalId === "string" &&
             expectedHandlerLogicalIds.has(event.logicalId) &&
-            typeof event.message === "string" &&
-            event.message.startsWith("Message handler failed:")
+            typeof event.message === "string"
           ) {
-            settled = true;
-            cleanup();
-            reject(
-              new Error(
-                `Echo handler failed:${event.message.slice("Message handler failed:".length)}`,
-              ),
-            );
-            return;
+            const eventMessage = event.message;
+            const handlerPrefix = [
+              "Message handler failed:",
+              "Message listener failed:",
+            ].find((prefix) => eventMessage.startsWith(prefix));
+            if (handlerPrefix !== undefined) {
+              settled = true;
+              cleanup();
+              reject(
+                new Error(
+                  `${handlerPrefix === "Message handler failed:" ? "Echo" : "Resource"} handler failed:${eventMessage.slice(handlerPrefix.length)}`,
+                ),
+              );
+              return;
+            }
           }
           if (
             node === destinationNode &&
@@ -732,7 +964,14 @@ export function waitForExerciseCompletion(
           }
           const key = transferKey(node.nodeId, event.logicalId);
           if (event.type === "transfer-completed") {
-            completedTransfers.add(key);
+            completedTransfers.set(key, {
+              at: event.at,
+              retransmissions:
+                typeof event.retransmissions === "number"
+                  ? event.retransmissions
+                  : 0,
+              receipts: typeof event.receipts === "number" ? event.receipts : 0,
+            });
           } else {
             const message =
               typeof event.error === "string" ? event.error : "unknown error";

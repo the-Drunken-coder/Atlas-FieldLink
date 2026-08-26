@@ -176,6 +176,66 @@ describe("FieldLinkNode delivery", () => {
     await Promise.all([a.close(), b.close()]);
   });
 
+  it("retries a lost receipt request before repairing fragments", async () => {
+    const [transportA, transportB] = memoryTransportPair();
+    let droppedFragment = false;
+    let droppedReceiptRequest = false;
+    transportA.drop = (bytes) => {
+      const frame = decodeFrame(bytes);
+      if (
+        !droppedFragment &&
+        frame.kind === FrameKind.fragment &&
+        frame.fragmentIndex === 2
+      ) {
+        droppedFragment = true;
+        return true;
+      }
+      if (!droppedReceiptRequest && frame.kind === FrameKind.receiptRequest) {
+        droppedReceiptRequest = true;
+        return true;
+      }
+      return false;
+    };
+    const a = new FieldLinkNode({
+      nodeId: nodeA,
+      transport: transportA,
+      retryTimeoutMs: 10,
+    });
+    const b = new FieldLinkNode({
+      nodeId: nodeB,
+      transport: transportB,
+      retryTimeoutMs: 10,
+    });
+
+    const result = await a.send(test("response", 600), {
+      destination: nodeB,
+    });
+    const frames = transportA.sent.map(decodeFrame);
+    const fragmentCounts = new Map<number, number>();
+    for (const frame of frames) {
+      if (frame.kind === FrameKind.fragment) {
+        fragmentCounts.set(
+          frame.fragmentIndex,
+          (fragmentCounts.get(frame.fragmentIndex) ?? 0) + 1,
+        );
+      }
+    }
+
+    expect(result.retransmissions).toBe(1);
+    expect(result.receiptRequests).toBe(3);
+    expect(result.receiptRequestRetries).toBe(1);
+    expect(fragmentCounts.get(2)).toBe(2);
+    expect(
+      [...fragmentCounts.entries()]
+        .filter(([index]) => index !== 2)
+        .every(([, count]) => count === 1),
+    ).toBe(true);
+    expect(
+      frames.filter((frame) => frame.kind === FrameKind.receiptRequest),
+    ).toHaveLength(3);
+    await Promise.all([a.close(), b.close()]);
+  });
+
   it("repairs a burst without resending received fragments", async () => {
     const [transportA, transportB] = memoryTransportPair();
     const missing = new Set([1, 2, 3]);
@@ -557,6 +617,49 @@ describe("FieldLinkNode delivery", () => {
     await expect(
       a.send(test("response", 300), { destination: nodeB }),
     ).resolves.toMatchObject({ delivery: "transfer", retransmissions: 0 });
+    await Promise.all([a.close(), b.close()]);
+  });
+
+  it("answers a late receipt request with one completion frame", async () => {
+    const [transportA, transportB] = memoryTransportPair();
+    const a = new FieldLinkNode({
+      nodeId: nodeA,
+      transport: transportA,
+      retryTimeoutMs: 10,
+    });
+    const b = new FieldLinkNode({
+      nodeId: nodeB,
+      transport: transportB,
+      retryTimeoutMs: 10,
+    });
+    const events: FieldLinkEvent[] = [];
+    b.onEvent((event) => {
+      events.push(event);
+    });
+    const result = await a.send(test("response", 200), {
+      destination: nodeB,
+    });
+    await Promise.all([transportA.settle(), transportB.settle()]);
+    const sentBeforeRequest = transportB.sent.length;
+
+    transportB.inject({
+      bytes: encodeFrame({
+        transmissionId: 99,
+        kind: FrameKind.receiptRequest,
+        source: nodeA,
+        destination: nodeB,
+        logicalId: BigInt(`0x${result.logicalId}`),
+        windowStart: 0,
+        windowCount: 2,
+      }),
+    });
+    await transportB.settle();
+    await eventually(() => transportB.sent.length === sentBeforeRequest + 1);
+
+    expect(
+      transportB.sent.slice(sentBeforeRequest).map(decodeFrame),
+    ).toMatchObject([{ kind: FrameKind.completion }]);
+    expect(events.some((event) => event.type === "protocol-error")).toBe(false);
     await Promise.all([a.close(), b.close()]);
   });
 

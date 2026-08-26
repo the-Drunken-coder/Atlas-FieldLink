@@ -21,6 +21,8 @@ export interface TransferReceiverState {
 
 export interface RetryResult {
   readonly retransmissions: number;
+  readonly receiptRequests: number;
+  readonly receiptRequestRetries: number;
   readonly receipts: number;
 }
 

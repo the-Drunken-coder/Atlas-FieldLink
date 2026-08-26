@@ -29,10 +29,10 @@ export interface MessageDefinition<Message> {
   encode(message: Message): Uint8Array;
   decode(bytes: Uint8Array): Message;
   readonly exercise: MessageExercise<Message>;
-  readonly onMessage?: (
+  onMessage?(
     message: Message,
     context: MessageHandlerContext,
-  ) => void | Promise<void>;
+  ): void | Promise<void>;
 }
 
 /** The broad value accepted by a message-local reply without importing the registry. */

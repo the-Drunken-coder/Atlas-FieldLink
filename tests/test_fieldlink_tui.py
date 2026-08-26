@@ -24,6 +24,8 @@ class FieldLinkTuiTests(unittest.TestCase):
             radio_a=TUI.RadioChoice("/dev/cu.a", None, None),
             radio_b=TUI.RadioChoice("/dev/cu.b", None, None),
             payload_bytes=4096,
+            resource_request=None,
+            resource_request_path=None,
             retry_strategy="selective-window",
             timeout_ms=1000,
             output=Path("results/run"),
@@ -36,6 +38,109 @@ class FieldLinkTuiTests(unittest.TestCase):
         self.assertEqual(command[command.index("--message") + 1], "test")
         self.assertEqual(command[command.index("--payload-size") + 1], "4096")
         self.assertNotIn("--channel", command)
+
+    def test_builds_a_resource_request_command_without_a_payload_size(self):
+        config = self.config()
+        resource = TUI.RunConfiguration(
+            message=TUI.MessageChoice(2, "resource", "normal", 32, 1_048_483, ()),
+            radio_a=config.radio_a,
+            radio_b=config.radio_b,
+            payload_bytes=None,
+            resource_request={
+                "type": "resource",
+                "kind": "request",
+                "operation": "get",
+                "request_id": "req-1",
+                "resource_type": "task",
+                "resource_id": "task-1",
+            },
+            resource_request_path=Path("/tmp/request.json"),
+            retry_strategy=config.retry_strategy,
+            timeout_ms=config.timeout_ms,
+            output=config.output,
+        )
+
+        command = TUI.build_test_command(resource)
+
+        self.assertEqual(
+            command[command.index("--resource-request") + 1],
+            "/tmp/request.json",
+        )
+        self.assertNotIn("--payload-size", command)
+
+    def test_resource_draft_generates_operation_specific_json(self):
+        draft = TUI.ResourceDraft(
+            operation="list",
+            resource_type="task",
+            request_id="req-list",
+            limit=25,
+            cursor="next",
+        )
+        self.assertEqual(
+            draft.message(),
+            {
+                "type": "resource",
+                "kind": "request",
+                "operation": "list",
+                "request_id": "req-list",
+                "resource_type": "task",
+                "query": {"limit": 25, "cursor": "next"},
+            },
+        )
+
+    def test_resource_editor_keeps_fields_inside_the_left_pane(self):
+        draft = TUI.ResourceDraft(
+            operation="create",
+            request_id="request-" + "x" * 100,
+            body={"entity_id": "entity-fieldlink-demo", "entity_type": "asset"},
+        )
+        fields = TUI.resource_fields(draft)
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (41, 103)
+
+        with mock.patch.object(TUI, "put") as put:
+            TUI.draw_resource_editor(screen, draft, fields, len(fields) - 1)
+
+        left_fields = [
+            call.args[3]
+            for call in put.call_args_list
+            if call.args[2] == 0 and 5 <= call.args[1] < 40
+        ]
+        self.assertGreaterEqual(len(left_fields), len(fields))
+        self.assertTrue(all(line[48:51] == " | " for line in left_fields))
+        body_row = left_fields[len(fields) - 1]
+        self.assertIn("Body JSON    2 fields", body_row[:48])
+        self.assertNotIn("entity-fieldlink-demo", body_row[:48])
+        self.assertTrue(
+            any("entity-fieldlink-demo" in line[51:] for line in left_fields)
+        )
+
+    def test_body_editor_draws_its_popup_before_accepting_input(self):
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (41, 103)
+        popup = mock.Mock()
+        editor = mock.Mock()
+        popup.derwin.return_value = editor
+        textbox = mock.Mock()
+        textbox.edit.return_value = '{"alias":"updated"}'
+        order = []
+        popup.noutrefresh.side_effect = lambda: order.append("popup")
+        editor.noutrefresh.side_effect = lambda: order.append("editor")
+        textbox.edit.side_effect = lambda: (
+            order.append("input") or '{"alias":"updated"}'
+        )
+
+        with (
+            mock.patch.object(TUI.curses, "newwin", return_value=popup),
+            mock.patch.object(TUI.curses, "doupdate", side_effect=lambda: order.append("screen")),
+            mock.patch.object(TUI.curses, "curs_set"),
+            mock.patch.object(TUI.curses.textpad, "Textbox", return_value=textbox),
+            mock.patch.object(TUI, "put"),
+        ):
+            result = TUI.edit_json_object(screen, {"alias": "old"})
+
+        self.assertEqual(result, {"alias": "updated"})
+        self.assertEqual(order, ["popup", "editor", "screen", "input"])
 
     def test_marks_radio_candidates_unverified(self):
         choice = TUI.RadioChoice("/dev/cu.usbserial-4", "Silicon Labs", "0001")
@@ -76,12 +181,64 @@ class FieldLinkTuiTests(unittest.TestCase):
             mock.patch.object(TUI, "select_configuration", return_value=self.config()),
             mock.patch.object(TUI, "run_live", side_effect=KeyboardInterrupt),
             mock.patch.object(TUI, "stop_process") as stop_process,
+            mock.patch.object(TUI, "RunTranscript"),
         ):
             with self.assertRaises(KeyboardInterrupt):
                 TUI.tui(screen, cli, [], [], [], 1000, Path("results"))
 
         stop_process.assert_called_once_with(process)
         process.wait.assert_called_once_with(timeout=TUI.STOP_TIMEOUT_SECONDS)
+
+    def test_results_transcript_overwrites_and_orders_the_run(self):
+        config = self.config()
+        request = {
+            "type": "resource",
+            "kind": "request",
+            "operation": "list",
+            "request_id": "req-list",
+            "resource_type": "task",
+            "query": {"limit": 25},
+        }
+        resource = TUI.RunConfiguration(
+            message=TUI.MessageChoice(2, "resource", "normal", 32, 1_048_483, ()),
+            radio_a=config.radio_a,
+            radio_b=config.radio_b,
+            payload_bytes=None,
+            resource_request=request,
+            resource_request_path=Path("/tmp/request.json"),
+            retry_strategy=config.retry_strategy,
+            timeout_ms=config.timeout_ms,
+            output=config.output,
+        )
+        response = {
+            "type": "resource",
+            "kind": "response",
+            "request_id": "req-list",
+            "status": 200,
+            "body": {"items": [{"task_id": "task-1"}]},
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.txt"
+            path.write_text("old run", encoding="utf-8")
+            transcript = TUI.RunTranscript(path, resource)
+            transcript.append("12:00:00 [A] sent request")
+            transcript.append("12:00:01 [A] received response")
+            transcript.finish(response, ["Status passed"])
+            transcript.finish()
+            rendered = path.read_text(encoding="utf-8")
+
+        self.assertNotIn("old run", rendered)
+        self.assertLess(
+            rendered.index('\"operation\": \"list\"'), rendered.index("RUN LOG")
+        )
+        self.assertLess(rendered.index("RUN LOG"), rendered.index("sent request"))
+        self.assertLess(rendered.index("sent request"), rendered.index("RUN RESULT"))
+        self.assertLess(
+            rendered.index("RUN RESULT"), rendered.index("RECEIVED MESSAGE")
+        )
+        self.assertTrue(rendered.rstrip().endswith("}"))
+        self.assertIn('\"task_id\": \"task-1\"', rendered)
 
     def test_live_stop_force_kills_after_the_deadline(self):
         screen = mock.Mock()
@@ -163,7 +320,11 @@ class FieldLinkTuiTests(unittest.TestCase):
 
         summary = {
             "status": "passed",
-            "integrity": "matched",
+            "condition": "recovered",
+            "verification": {
+                "correlation": "matched",
+                "responseDigest": "verified",
+            },
             "elapsedMs": 2000,
             "selectedChannel": {"index": 2, "name": "fieldlink"},
             "request": {
@@ -171,13 +332,32 @@ class FieldLinkTuiTests(unittest.TestCase):
                 "encodedBytes": 4101,
                 "fragments": 32,
                 "retransmissions": 0,
+                "receiptRequests": 4,
+                "receiptRequestRetries": 0,
                 "receipts": 4,
                 "durationMs": 1500,
+            },
+            "response": {
+                "delivery": "transfer",
+                "encodedBytes": 4101,
+                "fragments": 32,
+                "retransmissions": 1,
+                "receiptRequests": 5,
+                "receiptRequestRetries": 1,
+                "receipts": 4,
+                "durationMs": 1750,
             },
         }
         rendered = "\n".join(TUI.summary_lines(summary, view, self.config()))
         self.assertIn("passed", rendered)
         self.assertIn("MeshCore channel 2 fieldlink", rendered)
+        self.assertIn("Response transfer", rendered)
+        self.assertIn("retransmissions 1", rendered)
+        self.assertIn("condition recovered", rendered)
+        self.assertIn("receipt requests 4", rendered)
+        self.assertIn("receipt requests 5", rendered)
+        self.assertIn("request retries 1", rendered)
+        self.assertIn("digest verified", rendered)
         self.assertIn("Request payload per echo round trip 2.00 KiB/s", rendered)
 
         document = TUI.run_document_lines(
@@ -189,6 +369,52 @@ class FieldLinkTuiTests(unittest.TestCase):
             document.index("Run statistics"),
             next(index for index, line in enumerate(document) if line.startswith("Status ")),
         )
+
+    def test_renders_the_resource_response_json(self):
+        config = self.config()
+        resource = TUI.RunConfiguration(
+            message=TUI.MessageChoice(2, "resource", "normal", 32, 1_048_483, ()),
+            radio_a=config.radio_a,
+            radio_b=config.radio_b,
+            payload_bytes=None,
+            resource_request={
+                "type": "resource",
+                "kind": "request",
+                "operation": "get",
+                "request_id": "req-1",
+                "resource_type": "task",
+                "resource_id": "task-1",
+            },
+            resource_request_path=Path("/tmp/request.json"),
+            retry_strategy=config.retry_strategy,
+            timeout_ms=config.timeout_ms,
+            output=config.output,
+        )
+        view = TUI.RunView()
+        view.observe(
+            {
+                "type": "message",
+                "data": {
+                    "radio": "A",
+                    "message": {
+                        "message": {
+                            "type": "resource",
+                            "kind": "response",
+                            "request_id": "req-1",
+                            "status": 200,
+                            "body": {"task_id": "task-1"},
+                        }
+                    },
+                },
+            }
+        )
+
+        rendered = "\n".join(
+            TUI.run_document_lines(resource, view, None, "running")
+        )
+        self.assertIn("Request get task", rendered)
+        self.assertIn("Atlas response", rendered)
+        self.assertIn('"task_id": "task-1"', rendered)
 
     def test_reads_only_complete_jsonl_records(self):
         with tempfile.TemporaryDirectory() as directory:

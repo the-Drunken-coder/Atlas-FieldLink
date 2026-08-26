@@ -5,8 +5,10 @@ import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import type { AdapterCommand } from "./args.js";
+import { createAtlasResourceExecutorFromEnvironment } from "./atlas-resource-executor.js";
 import { AdapterEvidence } from "./evidence.js";
 import { messageRegistry, type SupportedMessage } from "./messages/index.js";
+import { attachResourceRequestHandler } from "./messages/resource.js";
 import {
   FieldLinkNode,
   type FieldLinkEvent,
@@ -67,6 +69,11 @@ interface AdapterRuntime {
   readonly ready: AdapterReady;
   readonly start?: () => Promise<void>;
   readonly activate?: () => Promise<void>;
+  readonly enableResourceGateway?: (
+    allowedSource: NodeId,
+    signal?: AbortSignal,
+  ) => Promise<void>;
+  readonly dispose?: () => void;
 }
 
 interface RuntimeFactoryOptions {
@@ -92,6 +99,11 @@ type AdapterRequest =
       readonly retryStrategy?: RetryStrategyName;
     }
   | { readonly id: number; readonly type: "activate" }
+  | {
+      readonly id: number;
+      readonly type: "enable-resource-gateway";
+      readonly allowedSource: NodeId;
+    }
   | { readonly id: number; readonly type: "abort"; readonly targetId: number }
   | { readonly id: number; readonly type: "close" }
   | { readonly id: number; readonly type: "parent-ready" }
@@ -279,6 +291,7 @@ export async function serveAdapter(
           controller.abort(new Error("Adapter is closing"));
         }
         await Promise.allSettled(activeOperations.values());
+        runtime.dispose?.();
         await runtime.node.close();
         await writer.write({ type: "response", id: request.id, ok: true });
         break;
@@ -290,6 +303,37 @@ export async function serveAdapter(
           ok: false,
           error: "Adapter is not activated",
         });
+        continue;
+      }
+
+      if (request.type === "enable-resource-gateway") {
+        const controller = new AbortController();
+        active.set(request.id, controller);
+        const operation = Promise.resolve()
+          .then(() => {
+            if (runtime.enableResourceGateway === undefined) {
+              throw new Error("Adapter runtime has no Atlas Resource gateway");
+            }
+            return runtime.enableResourceGateway(
+              request.allowedSource,
+              controller.signal,
+            );
+          })
+          .then(
+            () => writer.write({ type: "response", id: request.id, ok: true }),
+            (error: unknown) =>
+              writer.write({
+                type: "response",
+                id: request.id,
+                ok: false,
+                error: asError(error).message,
+              }),
+          )
+          .finally(() => {
+            active.delete(request.id);
+            activeOperations.delete(request.id);
+          });
+        activeOperations.set(request.id, operation);
         continue;
       }
 
@@ -341,6 +385,7 @@ export async function serveAdapter(
     }
     await Promise.allSettled(activeOperations.values());
     if (!closing) {
+      runtime.dispose?.();
       await runtime.node.close();
     }
     await writer.flush();
@@ -370,10 +415,37 @@ async function createDefaultRuntime(
       nodeId: identity.nodeId,
       transport,
     });
+    let resourceGateway:
+      | { readonly allowedSource: NodeId; readonly unsubscribe: () => void }
+      | undefined;
     return {
       node,
       start: () => transport.startInbox({ deliverDatagrams: false }),
       activate: () => transport.enableDatagramDelivery(),
+      enableResourceGateway: async (allowedSource, signal) => {
+        if (resourceGateway !== undefined) {
+          if (resourceGateway.allowedSource !== allowedSource) {
+            throw new Error(
+              "Atlas Resource gateway is already bound to another source",
+            );
+          }
+          return;
+        }
+        const executor =
+          await createAtlasResourceExecutorFromEnvironment(signal);
+        resourceGateway = {
+          allowedSource,
+          unsubscribe: attachResourceRequestHandler(
+            node,
+            executor,
+            allowedSource,
+          ),
+        };
+      },
+      dispose: () => {
+        resourceGateway?.unsubscribe();
+        resourceGateway = undefined;
+      },
       ready: {
         processId: options.processId,
         identity: safeRadioIdentity(identity),
@@ -707,6 +779,19 @@ export class AdapterProcessNode {
     return this.#activation;
   }
 
+  enableResourceGateway(
+    allowedSource: NodeId,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (!this.#activated) {
+      return Promise.reject(new Error("Adapter is not activated"));
+    }
+    return this.#request(
+      { type: "enable-resource-gateway", allowedSource },
+      signal,
+    ).then(() => undefined);
+  }
+
   send(message: SupportedMessage, options: SendOptions): Promise<SendResult> {
     if (!this.#activated) {
       return Promise.reject(new Error("Adapter is not activated"));
@@ -807,6 +892,7 @@ export class AdapterProcessNode {
     operation:
       | Omit<Extract<AdapterRequest, { type: "send" }>, "id">
       | Omit<Extract<AdapterRequest, { type: "activate" }>, "id">
+      | Omit<Extract<AdapterRequest, { type: "enable-resource-gateway" }>, "id">
       | Omit<Extract<AdapterRequest, { type: "close" }>, "id">
       | Omit<Extract<AdapterRequest, { type: "abort" }>, "id">,
     signal: AbortSignal | undefined,
@@ -1171,6 +1257,16 @@ function parseAdapterRequest(line: string): AdapterRequest {
   if (value.type === "activate") {
     return { type: "activate", id: value.id };
   }
+  if (
+    value.type === "enable-resource-gateway" &&
+    isNodeId(value.allowedSource)
+  ) {
+    return {
+      type: "enable-resource-gateway",
+      id: value.id,
+      allowedSource: value.allowedSource,
+    };
+  }
   if (value.type === "abort" && isRequestId(value.targetId)) {
     return { type: "abort", id: value.id, targetId: value.targetId };
   }
@@ -1294,6 +1390,8 @@ function isSendResult(value: unknown): value is SendResult {
     (value.retryStrategy === undefined ||
       value.retryStrategy === "selective-window") &&
     isNonnegativeInteger(value.retransmissions) &&
+    isNonnegativeInteger(value.receiptRequests) &&
+    isNonnegativeInteger(value.receiptRequestRetries) &&
     isNonnegativeInteger(value.receipts) &&
     typeof value.durationMs === "number"
   );

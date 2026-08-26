@@ -9,6 +9,11 @@ import {
 import { resolve } from "node:path";
 
 import type { TestCommand } from "./args.js";
+import type { ResourceRequest } from "./messages/resource.js";
+
+export type TestEvidenceInput =
+  | { readonly kind: "exercise"; readonly payloadSize: number }
+  | { readonly kind: "resource-request"; readonly request: ResourceRequest };
 
 export interface TestManifest {
   readonly command: "test";
@@ -16,7 +21,7 @@ export interface TestManifest {
   readonly startedAt: string;
   readonly radios: { readonly a: string; readonly b: string };
   readonly channel: TestCommand["channel"];
-  readonly payloadSize: number;
+  readonly input: TestEvidenceInput;
   readonly retryStrategy: TestCommand["retryStrategy"];
   readonly timeoutMs: number;
   readonly inboxDrainAccepted: true;

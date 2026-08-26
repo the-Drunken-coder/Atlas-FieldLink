@@ -18,5 +18,16 @@ export {
   type AdapterReady,
   type StartAdapterProcessOptions,
 } from "./adapter-process.js";
-export { messageRegistry, type MessageDefinition } from "./messages/index.js";
+export {
+  messageRegistry,
+  resourceMessage,
+  type JsonObject,
+  type JsonValue,
+  type MessageDefinition,
+  type ResourceListQuery,
+  type ResourceMessage,
+  type ResourceRequest,
+  type ResourceResponse,
+  type ResourceType,
+} from "./messages/index.js";
 export type { RetryStrategyName } from "./retry-strategies/index.js";
