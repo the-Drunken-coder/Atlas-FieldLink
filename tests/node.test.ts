@@ -51,6 +51,26 @@ describe("selective-window retry evidence", () => {
       selectiveWindowStrategy.createSender().run(session),
     ).resolves.toMatchObject({ transferOpenRetries: 1 });
   });
+
+  it("counts recovery after a completion timeout", async () => {
+    let completionAttempts = 0;
+    const session = {
+      fragmentCount: 1,
+      open: () => Promise.resolve(),
+      sendFragment: () => Promise.resolve(),
+      requestReceipt: () => Promise.resolve(1),
+      waitForCompletion: () => {
+        completionAttempts += 1;
+        return completionAttempts === 1
+          ? Promise.reject(new Error("completion dropped"))
+          : Promise.resolve();
+      },
+    } satisfies TransferSenderSession;
+
+    await expect(
+      selectiveWindowStrategy.createSender().run(session),
+    ).resolves.toMatchObject({ completionRetries: 1 });
+  });
 });
 
 describe("FieldLinkNode delivery", () => {

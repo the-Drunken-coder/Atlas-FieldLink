@@ -29,6 +29,7 @@ DISCOVERY_TIMEOUT_SECONDS = 30
 STOP_TIMEOUT_SECONDS = 30
 MAX_TIMEOUT_MS = 24 * 60 * 60 * 1000
 MAX_RESOURCE_LIST_LIMIT = 1000
+MAX_RESOURCE_REQUEST_ID_BYTES = 256
 
 
 class Cancelled(Exception):
@@ -402,9 +403,9 @@ def summary_lines(
     elapsed_ms = float(summary.get("elapsedMs", 0.0))
     lines = [
         f"Status {summary.get('status', '?')}   condition {summary.get('condition', '?')}   elapsed {elapsed_ms:.2f} ms   correlation {verification.get('correlation', 'unconfirmed')}",
-        f"Request {request.get('delivery', '?')}   encoded {request.get('encodedBytes', '?')} bytes   fragments {request.get('fragments', '?')}   open retries {request.get('transferOpenRetries', 0)}   retransmissions {request.get('retransmissions', '?')}",
+        f"Request {request.get('delivery', '?')}   encoded {request.get('encodedBytes', '?')} bytes   fragments {request.get('fragments', '?')}   open retries {request.get('transferOpenRetries', 0)}   completion retries {request.get('completionRetries', 0)}   retransmissions {request.get('retransmissions', '?')}",
         f"Sender duration {float(request.get('durationMs', 0.0)):.2f} ms   receipt requests {request.get('receiptRequests', 0)}   request retries {request.get('receiptRequestRetries', 0)}   receipts {request.get('receipts', 0)}",
-        f"Response {response.get('delivery', '?')}   encoded {response.get('encodedBytes', '?')} bytes   fragments {response.get('fragments', '?')}   open retries {response.get('transferOpenRetries', 0)}   retransmissions {response.get('retransmissions', '?')}",
+        f"Response {response.get('delivery', '?')}   encoded {response.get('encodedBytes', '?')} bytes   fragments {response.get('fragments', '?')}   open retries {response.get('transferOpenRetries', 0)}   completion retries {response.get('completionRetries', 0)}   retransmissions {response.get('retransmissions', '?')}",
         f"Response duration {float(response.get('durationMs', 0.0)):.2f} ms   receipt requests {response.get('receiptRequests', 0)}   request retries {response.get('receiptRequestRetries', 0)}   receipts {response.get('receipts', 0)}   digest {verification.get('responseDigest', 'not applicable')}",
         f"Observed frames sent A/B {view.frames_sent['A']}/{view.frames_sent['B']}   received A/B {view.frames_received['A']}/{view.frames_received['B']}",
     ]
@@ -589,7 +590,11 @@ def edit_resource_field(
         return
     if field_name == "request_id":
         draft.request_id = read_text(
-            screen, "Request ID", draft.request_id, allow_empty=False
+            screen,
+            "Request ID",
+            draft.request_id,
+            allow_empty=False,
+            maximum_utf8_bytes=MAX_RESOURCE_REQUEST_ID_BYTES,
         )
     elif field_name == "resource_id":
         draft.resource_id = read_text(
@@ -621,6 +626,7 @@ def read_text(
     *,
     allow_empty: bool = True,
     clear_on_blank: bool = False,
+    maximum_utf8_bytes: int | None = None,
 ) -> str:
     while True:
         screen.erase()
@@ -635,6 +641,19 @@ def read_text(
             curses.noecho()
             curses.curs_set(0)
         if raw:
+            if (
+                maximum_utf8_bytes is not None
+                and len(raw.encode("utf-8")) > maximum_utf8_bytes
+            ):
+                put(
+                    screen,
+                    6,
+                    0,
+                    f"Enter at most {maximum_utf8_bytes} UTF-8 bytes.",
+                    curses.A_BOLD,
+                )
+                screen.getch()
+                continue
             return raw
         if clear_on_blank and allow_empty:
             return ""

@@ -736,7 +736,7 @@ describe("adapter process proxy", () => {
 
   it("drains the final response before treating child exit as failure", async () => {
     const script = `${writeReady()}
-${activateThen('const response={type:"response",id:request.id,ok:true,result:{logicalId:"0000000000000001",messageType:1,messageName:"test",destination:request.destination,priority:"normal",delivery:"complete",encodedBytes:5,fragments:1,transferOpenRetries:0,retransmissions:0,receiptRequests:0,receiptRequestRetries:0,receipts:0,durationMs:1}};process.stdout.write(JSON.stringify(response)+"\\n",()=>process.exit(0));')}`;
+${activateThen('const response={type:"response",id:request.id,ok:true,result:{logicalId:"0000000000000001",messageType:1,messageName:"test",destination:request.destination,priority:"normal",delivery:"complete",encodedBytes:5,fragments:1,transferOpenRetries:0,completionRetries:0,retransmissions:0,receiptRequests:0,receiptRequestRetries:0,receipts:0,durationMs:1}};process.stdout.write(JSON.stringify(response)+"\\n",()=>process.exit(0));')}`;
     const adapter = await AdapterProcessNode.start({
       path: "test",
       channel: 1,
@@ -1068,7 +1068,7 @@ function cooperativeChildScript(): string {
   return `${writeReady()}
 let pending="";
 process.stdin.setEncoding("utf8");
-process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="activate"||request.type==="enable-resource-gateway"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n");}else if(request.type==="send"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true,result:{logicalId:"0000000000000001",messageType:1,messageName:"test",destination:request.destination,priority:"normal",delivery:"complete",encodedBytes:7,fragments:1,transferOpenRetries:0,retransmissions:0,receiptRequests:0,receiptRequestRetries:0,receipts:0,durationMs:1}})+"\\n");}else if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}}});`;
+process.stdin.on("data",chunk=>{pending+=chunk;let i;while((i=pending.indexOf("\\n"))>=0){const line=pending.slice(0,i);pending=pending.slice(i+1);if(!line)continue;const request=JSON.parse(line);if(request.type==="activate"||request.type==="enable-resource-gateway"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n");}else if(request.type==="send"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true,result:{logicalId:"0000000000000001",messageType:1,messageName:"test",destination:request.destination,priority:"normal",delivery:"complete",encodedBytes:7,fragments:1,transferOpenRetries:0,completionRetries:0,retransmissions:0,receiptRequests:0,receiptRequestRetries:0,receipts:0,durationMs:1}})+"\\n");}else if(request.type==="close"){process.stdout.write(JSON.stringify({type:"response",id:request.id,ok:true})+"\\n",()=>process.exit(0));}}});`;
 }
 
 function listenerFailureChildScript(): string {

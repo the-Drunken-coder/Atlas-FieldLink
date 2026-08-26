@@ -115,6 +115,32 @@ class FieldLinkTuiTests(unittest.TestCase):
             any("entity-fieldlink-demo" in line[51:] for line in left_fields)
         )
 
+    def test_request_id_editor_enforces_the_utf8_byte_limit(self):
+        screen = mock.Mock()
+        screen.getstr.side_effect = [
+            ("é" * 129).encode(),
+            "request-valid".encode(),
+        ]
+
+        with (
+            mock.patch.object(TUI.curses, "echo"),
+            mock.patch.object(TUI.curses, "noecho"),
+            mock.patch.object(TUI.curses, "curs_set"),
+            mock.patch.object(TUI, "put") as put,
+        ):
+            result = TUI.read_text(
+                screen,
+                "Request ID",
+                "request-default",
+                allow_empty=False,
+                maximum_utf8_bytes=TUI.MAX_RESOURCE_REQUEST_ID_BYTES,
+            )
+
+        self.assertEqual(result, "request-valid")
+        self.assertTrue(
+            any("at most 256 UTF-8 bytes" in call.args[3] for call in put.call_args_list)
+        )
+
     def test_body_editor_draws_its_popup_before_accepting_input(self):
         screen = mock.Mock()
         screen.getmaxyx.return_value = (41, 103)
@@ -445,6 +471,8 @@ class FieldLinkTuiTests(unittest.TestCase):
                 "delivery": "transfer",
                 "encodedBytes": 4101,
                 "fragments": 32,
+                "transferOpenRetries": 0,
+                "completionRetries": 0,
                 "retransmissions": 0,
                 "receiptRequests": 4,
                 "receiptRequestRetries": 0,
@@ -455,6 +483,8 @@ class FieldLinkTuiTests(unittest.TestCase):
                 "delivery": "transfer",
                 "encodedBytes": 4101,
                 "fragments": 32,
+                "transferOpenRetries": 0,
+                "completionRetries": 1,
                 "retransmissions": 1,
                 "receiptRequests": 5,
                 "receiptRequestRetries": 1,
@@ -467,6 +497,7 @@ class FieldLinkTuiTests(unittest.TestCase):
         self.assertIn("MeshCore channel 2 fieldlink", rendered)
         self.assertIn("Response transfer", rendered)
         self.assertIn("retransmissions 1", rendered)
+        self.assertIn("completion retries 1", rendered)
         self.assertIn("condition recovered", rendered)
         self.assertIn("receipt requests 4", rendered)
         self.assertIn("receipt requests 5", rendered)

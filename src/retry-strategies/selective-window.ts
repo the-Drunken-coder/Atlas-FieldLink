@@ -18,6 +18,7 @@ const SELECTIVE_WINDOW_RECEIPT_REQUEST_ATTEMPTS = 2;
 class SelectiveWindowSender implements RetrySender {
   async run(session: TransferSenderSession): Promise<RetryResult> {
     const transferOpenRetries = await openTransfer(session);
+    let completionRetries = 0;
     let retransmissions = 0;
     let receiptRequests = 0;
     let receiptRequestRetries = 0;
@@ -57,6 +58,7 @@ class SelectiveWindowSender implements RetrySender {
           if (received === undefined) {
             return {
               transferOpenRetries,
+              completionRetries,
               retransmissions,
               receiptRequests,
               receiptRequestRetries,
@@ -97,6 +99,7 @@ class SelectiveWindowSender implements RetrySender {
         await session.waitForCompletion(SELECTIVE_WINDOW_CONTROL_TIMEOUT_MS);
         return {
           transferOpenRetries,
+          completionRetries,
           retransmissions,
           receiptRequests,
           receiptRequestRetries,
@@ -113,6 +116,7 @@ class SelectiveWindowSender implements RetrySender {
             { cause: error },
           );
         }
+        completionRetries += 1;
         const windowStart = Math.max(
           0,
           session.fragmentCount -
@@ -125,6 +129,7 @@ class SelectiveWindowSender implements RetrySender {
           if (received === undefined) {
             return {
               transferOpenRetries,
+              completionRetries,
               retransmissions,
               receiptRequests,
               receiptRequestRetries,

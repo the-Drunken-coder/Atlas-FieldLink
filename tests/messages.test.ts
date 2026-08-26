@@ -611,6 +611,7 @@ class ResourceHandlerNode {
       encodedBytes: 1,
       fragments: 1,
       transferOpenRetries: 0,
+      completionRetries: 0,
       retransmissions: 0,
       receiptRequests: 0,
       receiptRequestRetries: 0,

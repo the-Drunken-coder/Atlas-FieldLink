@@ -51,7 +51,7 @@ const HELP = `Usage:
 Defaults:
   --channel auto
   --message test
-  --payload-size 64
+  --payload-size 64 for test; 32 for resource
   --retry-strategy selective-window
   --timeout-ms 1800000
 `;
@@ -316,9 +316,11 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
     : failed
       ? "failed"
       : (sendResult?.transferOpenRetries ?? 0) > 0 ||
+          (sendResult?.completionRetries ?? 0) > 0 ||
           (sendResult?.retransmissions ?? 0) > 0 ||
           (sendResult?.receiptRequestRetries ?? 0) > 0 ||
           (completion?.response.transferOpenRetries ?? 0) > 0 ||
+          (completion?.response.completionRetries ?? 0) > 0 ||
           (completion?.response.retransmissions ?? 0) > 0 ||
           (completion?.response.receiptRequestRetries ?? 0) > 0
         ? "recovered"
@@ -406,10 +408,12 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
         `MeshCore channel: ${selectedChannel}`,
         `Request fragments: ${sendResult.fragments}`,
         `Request transfer-open retries: ${sendResult.transferOpenRetries}`,
+        `Request completion retries: ${sendResult.completionRetries}`,
         `Request retransmissions: ${sendResult.retransmissions}`,
         `Request receipt-request retries: ${sendResult.receiptRequestRetries}`,
         `Response fragments: ${completion?.response.fragments ?? "?"}`,
         `Response transfer-open retries: ${completion?.response.transferOpenRetries ?? "?"}`,
+        `Response completion retries: ${completion?.response.completionRetries ?? "?"}`,
         `Response retransmissions: ${completion?.response.retransmissions ?? "?"}`,
         `Response receipt-request retries: ${completion?.response.receiptRequestRetries ?? "?"}`,
         `Condition: ${condition}`,
@@ -722,6 +726,7 @@ export interface ExerciseResponseEvidence {
   readonly encodedBytes: number;
   readonly fragments: number;
   readonly transferOpenRetries: number;
+  readonly completionRetries: number;
   readonly retransmissions: number;
   readonly receiptRequests: number;
   readonly receiptRequestRetries: number;
@@ -763,6 +768,7 @@ export function waitForExerciseCompletion(
       {
         readonly at: string;
         readonly transferOpenRetries: number;
+        readonly completionRetries: number;
         readonly retransmissions: number;
         readonly receiptRequests: number;
         readonly receiptRequestRetries: number;
@@ -817,6 +823,7 @@ export function waitForExerciseCompletion(
               started?.fragmentCount ??
               Math.ceil(encodedBytes / TRANSFER_FRAGMENT_BYTES),
             transferOpenRetries: completed.transferOpenRetries,
+            completionRetries: completed.completionRetries,
             retransmissions: completed.retransmissions,
             receiptRequests: completed.receiptRequests,
             receiptRequestRetries: completed.receiptRequestRetries,
@@ -846,6 +853,7 @@ export function waitForExerciseCompletion(
           encodedBytes: definition.encode(candidate.received.message).length,
           fragments: 1,
           transferOpenRetries: 0,
+          completionRetries: 0,
           retransmissions: 0,
           receiptRequests: 0,
           receiptRequestRetries: 0,
@@ -956,6 +964,10 @@ export function waitForExerciseCompletion(
               transferOpenRetries:
                 typeof event.transferOpenRetries === "number"
                   ? event.transferOpenRetries
+                  : 0,
+              completionRetries:
+                typeof event.completionRetries === "number"
+                  ? event.completionRetries
                   : 0,
               retransmissions:
                 typeof event.retransmissions === "number"

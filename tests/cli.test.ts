@@ -23,6 +23,18 @@ import {
 import { memoryTransportPair } from "./helpers.js";
 
 describe("CLI message catalog", () => {
+  it("describes payload defaults for both messages", async () => {
+    const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    try {
+      await expect(main(["--help"])).resolves.toBe(0);
+      expect(write).toHaveBeenCalledWith(
+        expect.stringContaining("--payload-size 64 for test; 32 for resource"),
+      );
+    } finally {
+      write.mockRestore();
+    }
+  });
+
   it("lists every registered message with runnable payload presets", () => {
     const catalog = buildMessageCatalog();
 
@@ -390,6 +402,7 @@ describe("CLI message exercise", () => {
       at: "2026-08-25T12:00:05.000Z",
       logicalId,
       transferOpenRetries: 2,
+      completionRetries: 3,
       retransmissions: 0,
       receiptRequests: 2,
       receiptRequestRetries: 1,
@@ -412,6 +425,7 @@ describe("CLI message exercise", () => {
     await expect(completion).resolves.toMatchObject({
       response: {
         transferOpenRetries: 2,
+        completionRetries: 3,
         retransmissions: 0,
         receiptRequests: 2,
         receiptRequestRetries: 1,
