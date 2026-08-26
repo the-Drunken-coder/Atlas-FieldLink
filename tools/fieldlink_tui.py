@@ -669,7 +669,11 @@ def edit_json_object(
         try:
             editor.addstr(initial)
         except curses.error:
-            pass
+            show_error(
+                screen,
+                "Body JSON does not fit this terminal. Resize before editing it.",
+            )
+            return current
         popup.noutrefresh()
         editor.noutrefresh()
         curses.doupdate()
@@ -1004,18 +1008,31 @@ def received_message(
     summary: dict[str, Any] | None,
     config: RunConfiguration,
 ) -> dict[str, Any] | None:
+    correlated = selected_resource_response(view, summary, config)
+    if correlated is not None or config.resource_request is not None:
+        return correlated
+    return view.received_message
+
+
+def selected_resource_response(
+    view: RunView,
+    summary: dict[str, Any] | None,
+    config: RunConfiguration,
+) -> dict[str, Any] | None:
     if isinstance(summary, dict):
         candidate = summary.get("resourceResponse")
         if isinstance(candidate, dict):
             return candidate
-    if config.resource_request is not None:
-        expected_request_id = config.resource_request.get("request_id")
-        if view.resource_response is not None and (
-            view.resource_response.get("request_id") == expected_request_id
-        ):
-            return view.resource_response
-        return None
-    return view.received_message
+    expected_request_id = (
+        config.resource_request.get("request_id")
+        if config.resource_request is not None
+        else None
+    )
+    if view.resource_response is not None and (
+        view.resource_response.get("request_id") == expected_request_id
+    ):
+        return view.resource_response
+    return None
 
 
 def draw_run(
@@ -1072,19 +1089,7 @@ def run_document_lines(
             f"Request {config.resource_request.get('operation', '?')} "
             f"{config.resource_request.get('resource_type', '?')}"
         )
-    response = None
-    if isinstance(summary, dict):
-        candidate = summary.get("resourceResponse")
-        if isinstance(candidate, dict):
-            response = candidate
-    if response is None and view.resource_response is not None:
-        expected_request_id = (
-            config.resource_request.get("request_id")
-            if config.resource_request is not None
-            else None
-        )
-        if view.resource_response.get("request_id") == expected_request_id:
-            response = view.resource_response
+    response = selected_resource_response(view, summary, config)
     response_lines = (
         []
         if response is None

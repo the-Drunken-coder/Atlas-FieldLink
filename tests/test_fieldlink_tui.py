@@ -161,6 +161,27 @@ class FieldLinkTuiTests(unittest.TestCase):
         show_error.assert_called_once()
         textbox.assert_not_called()
 
+    def test_body_editor_preserves_json_when_curses_rejects_it(self):
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (41, 103)
+        popup = mock.Mock()
+        editor = mock.Mock()
+        editor.addstr.side_effect = TUI.curses.error
+        popup.derwin.return_value = editor
+        current = {"notes": "wide characters: 漢字"}
+
+        with (
+            mock.patch.object(TUI.curses, "newwin", return_value=popup),
+            mock.patch.object(TUI, "show_error") as show_error,
+            mock.patch.object(TUI.curses.textpad, "Textbox") as textbox,
+            mock.patch.object(TUI, "put"),
+        ):
+            result = TUI.edit_json_object(screen, current)
+
+        self.assertIs(result, current)
+        show_error.assert_called_once()
+        textbox.assert_not_called()
+
     def test_marks_radio_candidates_unverified(self):
         choice = TUI.RadioChoice("/dev/cu.usbserial-4", "Silicon Labs", "0001")
         self.assertEqual(
