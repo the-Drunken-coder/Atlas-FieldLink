@@ -406,7 +406,7 @@ describe("Resource message", () => {
     const node = new ResourceHandlerNode();
     const executor = new ResourceExecutorProbe();
     const allowed = parseNodeId("aaaaaaaaaaaaaaaa");
-    attachResourceRequestHandler(node, executor, allowed);
+    const dispose = attachResourceRequestHandler(node, executor, allowed);
     const request = {
       type: "resource",
       kind: "request",
@@ -427,6 +427,9 @@ describe("Resource message", () => {
       request_id: "request-1",
       status: 200,
     });
+    expect(node.sent[0]?.options.signal?.aborted).toBe(false);
+    await dispose();
+    expect(node.sent[0]?.options.signal?.aborted).toBe(true);
   });
 
   it("rejects request ID reuse with different JSON", async () => {
@@ -607,6 +610,7 @@ class ResourceHandlerNode {
       delivery: "complete",
       encodedBytes: 1,
       fragments: 1,
+      transferOpenRetries: 0,
       retransmissions: 0,
       receiptRequests: 0,
       receiptRequestRetries: 0,

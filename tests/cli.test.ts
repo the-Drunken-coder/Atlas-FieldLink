@@ -389,6 +389,7 @@ describe("CLI message exercise", () => {
       type: "transfer-completed",
       at: "2026-08-25T12:00:05.000Z",
       logicalId,
+      transferOpenRetries: 2,
       retransmissions: 0,
       receiptRequests: 2,
       receiptRequestRetries: 1,
@@ -410,6 +411,7 @@ describe("CLI message exercise", () => {
 
     await expect(completion).resolves.toMatchObject({
       response: {
+        transferOpenRetries: 2,
         retransmissions: 0,
         receiptRequests: 2,
         receiptRequestRetries: 1,

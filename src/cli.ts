@@ -315,8 +315,10 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
     ? "interrupted"
     : failed
       ? "failed"
-      : (sendResult?.retransmissions ?? 0) > 0 ||
+      : (sendResult?.transferOpenRetries ?? 0) > 0 ||
+          (sendResult?.retransmissions ?? 0) > 0 ||
           (sendResult?.receiptRequestRetries ?? 0) > 0 ||
+          (completion?.response.transferOpenRetries ?? 0) > 0 ||
           (completion?.response.retransmissions ?? 0) > 0 ||
           (completion?.response.receiptRequestRetries ?? 0) > 0
         ? "recovered"
@@ -403,9 +405,11 @@ async function runHardwareTest(command: TestCommand): Promise<number> {
         `Request delivery: ${sendResult.delivery}`,
         `MeshCore channel: ${selectedChannel}`,
         `Request fragments: ${sendResult.fragments}`,
+        `Request transfer-open retries: ${sendResult.transferOpenRetries}`,
         `Request retransmissions: ${sendResult.retransmissions}`,
         `Request receipt-request retries: ${sendResult.receiptRequestRetries}`,
         `Response fragments: ${completion?.response.fragments ?? "?"}`,
+        `Response transfer-open retries: ${completion?.response.transferOpenRetries ?? "?"}`,
         `Response retransmissions: ${completion?.response.retransmissions ?? "?"}`,
         `Response receipt-request retries: ${completion?.response.receiptRequestRetries ?? "?"}`,
         `Condition: ${condition}`,
@@ -717,6 +721,7 @@ export interface ExerciseResponseEvidence {
   readonly delivery: "complete" | "transfer";
   readonly encodedBytes: number;
   readonly fragments: number;
+  readonly transferOpenRetries: number;
   readonly retransmissions: number;
   readonly receiptRequests: number;
   readonly receiptRequestRetries: number;
@@ -757,6 +762,7 @@ export function waitForExerciseCompletion(
       string,
       {
         readonly at: string;
+        readonly transferOpenRetries: number;
         readonly retransmissions: number;
         readonly receiptRequests: number;
         readonly receiptRequestRetries: number;
@@ -810,6 +816,7 @@ export function waitForExerciseCompletion(
             fragments:
               started?.fragmentCount ??
               Math.ceil(encodedBytes / TRANSFER_FRAGMENT_BYTES),
+            transferOpenRetries: completed.transferOpenRetries,
             retransmissions: completed.retransmissions,
             receiptRequests: completed.receiptRequests,
             receiptRequestRetries: completed.receiptRequestRetries,
@@ -838,6 +845,7 @@ export function waitForExerciseCompletion(
           delivery: "complete",
           encodedBytes: definition.encode(candidate.received.message).length,
           fragments: 1,
+          transferOpenRetries: 0,
           retransmissions: 0,
           receiptRequests: 0,
           receiptRequestRetries: 0,
@@ -945,6 +953,10 @@ export function waitForExerciseCompletion(
           if (event.type === "transfer-completed") {
             completedTransfers.set(key, {
               at: event.at,
+              transferOpenRetries:
+                typeof event.transferOpenRetries === "number"
+                  ? event.transferOpenRetries
+                  : 0,
               retransmissions:
                 typeof event.retransmissions === "number"
                   ? event.retransmissions

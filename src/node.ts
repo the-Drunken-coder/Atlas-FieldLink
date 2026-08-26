@@ -82,6 +82,7 @@ export interface SendResult {
   readonly encodedBytes: number;
   readonly fragments: number;
   readonly retryStrategy?: RetryStrategyName;
+  readonly transferOpenRetries: number;
   readonly retransmissions: number;
   readonly receiptRequests: number;
   readonly receiptRequestRetries: number;
@@ -240,6 +241,7 @@ export class FieldLinkNode {
           delivery: "complete",
           encodedBytes: body.length,
           fragments: 1,
+          transferOpenRetries: 0,
           retransmissions: 0,
           receiptRequests: 0,
           receiptRequestRetries: 0,
@@ -278,6 +280,7 @@ export class FieldLinkNode {
         encodedBytes: body.length,
         fragments: Math.ceil(body.length / TRANSFER_FRAGMENT_BYTES),
         retryStrategy: strategy.name,
+        transferOpenRetries: retry.transferOpenRetries,
         retransmissions: retry.retransmissions,
         receiptRequests: retry.receiptRequests,
         receiptRequestRetries: retry.receiptRequestRetries,

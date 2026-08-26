@@ -17,7 +17,7 @@ const SELECTIVE_WINDOW_RECEIPT_REQUEST_ATTEMPTS = 2;
 
 class SelectiveWindowSender implements RetrySender {
   async run(session: TransferSenderSession): Promise<RetryResult> {
-    await openTransfer(session);
+    const transferOpenRetries = await openTransfer(session);
     let retransmissions = 0;
     let receiptRequests = 0;
     let receiptRequestRetries = 0;
@@ -56,6 +56,7 @@ class SelectiveWindowSender implements RetrySender {
           const received = await requestReceipt(windowStart, windowCount);
           if (received === undefined) {
             return {
+              transferOpenRetries,
               retransmissions,
               receiptRequests,
               receiptRequestRetries,
@@ -95,6 +96,7 @@ class SelectiveWindowSender implements RetrySender {
       try {
         await session.waitForCompletion(SELECTIVE_WINDOW_CONTROL_TIMEOUT_MS);
         return {
+          transferOpenRetries,
           retransmissions,
           receiptRequests,
           receiptRequestRetries,
@@ -122,6 +124,7 @@ class SelectiveWindowSender implements RetrySender {
           const received = await requestReceipt(windowStart, windowCount);
           if (received === undefined) {
             return {
+              transferOpenRetries,
               retransmissions,
               receiptRequests,
               receiptRequestRetries,
@@ -166,7 +169,7 @@ export const selectiveWindowStrategy = {
   createReceiver: () => new SelectiveWindowReceiver(),
 } satisfies RetryStrategy;
 
-async function openTransfer(session: TransferSenderSession): Promise<void> {
+async function openTransfer(session: TransferSenderSession): Promise<number> {
   let lastError: unknown;
   for (
     let attempt = 0;
@@ -176,7 +179,7 @@ async function openTransfer(session: TransferSenderSession): Promise<void> {
     throwIfAborted(session.signal);
     try {
       await session.open(SELECTIVE_WINDOW_CONTROL_TIMEOUT_MS);
-      return;
+      return attempt;
     } catch (error: unknown) {
       throwIfAborted(session.signal);
       if (error instanceof TransferRejectedError) {

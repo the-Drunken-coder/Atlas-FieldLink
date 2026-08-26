@@ -1434,6 +1434,7 @@ function isSendResult(value: unknown): value is SendResult {
     isNonnegativeInteger(value.fragments) &&
     (value.retryStrategy === undefined ||
       value.retryStrategy === "selective-window") &&
+    isNonnegativeInteger(value.transferOpenRetries) &&
     isNonnegativeInteger(value.retransmissions) &&
     isNonnegativeInteger(value.receiptRequests) &&
     isNonnegativeInteger(value.receiptRequestRetries) &&

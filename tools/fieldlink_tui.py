@@ -402,9 +402,9 @@ def summary_lines(
     elapsed_ms = float(summary.get("elapsedMs", 0.0))
     lines = [
         f"Status {summary.get('status', '?')}   condition {summary.get('condition', '?')}   elapsed {elapsed_ms:.2f} ms   correlation {verification.get('correlation', 'unconfirmed')}",
-        f"Request {request.get('delivery', '?')}   encoded {request.get('encodedBytes', '?')} bytes   fragments {request.get('fragments', '?')}   retransmissions {request.get('retransmissions', '?')}",
+        f"Request {request.get('delivery', '?')}   encoded {request.get('encodedBytes', '?')} bytes   fragments {request.get('fragments', '?')}   open retries {request.get('transferOpenRetries', 0)}   retransmissions {request.get('retransmissions', '?')}",
         f"Sender duration {float(request.get('durationMs', 0.0)):.2f} ms   receipt requests {request.get('receiptRequests', 0)}   request retries {request.get('receiptRequestRetries', 0)}   receipts {request.get('receipts', 0)}",
-        f"Response {response.get('delivery', '?')}   encoded {response.get('encodedBytes', '?')} bytes   fragments {response.get('fragments', '?')}   retransmissions {response.get('retransmissions', '?')}",
+        f"Response {response.get('delivery', '?')}   encoded {response.get('encodedBytes', '?')} bytes   fragments {response.get('fragments', '?')}   open retries {response.get('transferOpenRetries', 0)}   retransmissions {response.get('retransmissions', '?')}",
         f"Response duration {float(response.get('durationMs', 0.0)):.2f} ms   receipt requests {response.get('receiptRequests', 0)}   request retries {response.get('receiptRequestRetries', 0)}   receipts {response.get('receipts', 0)}   digest {verification.get('responseDigest', 'not applicable')}",
         f"Observed frames sent A/B {view.frames_sent['A']}/{view.frames_sent['B']}   received A/B {view.frames_received['A']}/{view.frames_received['B']}",
     ]
@@ -689,6 +689,11 @@ def edit_json_object(
             continue
         if not isinstance(value, dict):
             show_error(screen, "Body JSON must be an object.")
+            continue
+        try:
+            json.dumps(value, allow_nan=False)
+        except ValueError:
+            show_error(screen, "Body JSON numbers must be finite.")
             continue
         return value
 

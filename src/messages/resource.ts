@@ -410,7 +410,10 @@ export function attachResourceRequestHandler(
 
     const resolved = await response;
     if (isActive(lifecycleSignal)) {
-      await node.send(resolved, { destination: received.source });
+      await node.send(resolved, {
+        destination: received.source,
+        signal: lifecycleSignal,
+      });
     }
   }
 

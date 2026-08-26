@@ -142,6 +142,29 @@ class FieldLinkTuiTests(unittest.TestCase):
         self.assertEqual(result, {"alias": "updated"})
         self.assertEqual(order, ["popup", "editor", "screen", "input"])
 
+    def test_body_editor_rejects_non_finite_json_numbers(self):
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (41, 103)
+        popup = mock.Mock()
+        popup.derwin.return_value = mock.Mock()
+        textbox = mock.Mock()
+        textbox.edit.side_effect = ['{"value":1e400}', '{"value":1}']
+
+        with (
+            mock.patch.object(TUI.curses, "newwin", return_value=popup),
+            mock.patch.object(TUI.curses, "doupdate"),
+            mock.patch.object(TUI.curses, "curs_set"),
+            mock.patch.object(TUI.curses.textpad, "Textbox", return_value=textbox),
+            mock.patch.object(TUI, "show_error") as show_error,
+            mock.patch.object(TUI, "put"),
+        ):
+            result = TUI.edit_json_object(screen, {})
+
+        self.assertEqual(result, {"value": 1})
+        show_error.assert_called_once_with(
+            screen, "Body JSON numbers must be finite."
+        )
+
     def test_body_editor_preserves_json_that_does_not_fit(self):
         screen = mock.Mock()
         screen.getmaxyx.return_value = (8, 40)

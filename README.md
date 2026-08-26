@@ -115,7 +115,7 @@ FieldLink ships `selective-window`, retry strategy ID 1:
 - The sender transmits windows of eight fragments.
 - A one-byte receipt bitmap identifies received fragments.
 - Only missing fragments are repaired.
-- Each window allows five repair rounds. A receipt request waits five seconds
+- Each window allows five repair rounds. A receipt request waits 30 seconds
   and is retried once before any fragment repair.
 - Completion is sent only after length and SHA-256 validation.
 

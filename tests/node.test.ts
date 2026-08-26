@@ -16,11 +16,42 @@ import {
   type FieldLinkEvent,
   type ReceivedMessage,
 } from "../src/node.js";
+import { selectiveWindowStrategy } from "../src/retry-strategies/selective-window.js";
+import type { TransferSenderSession } from "../src/retry.js";
 import { eventually, MemoryTransport, memoryTransportPair } from "./helpers.js";
 
 const nodeA = parseNodeId("aaaaaaaaaaaaaaaa");
 const nodeB = parseNodeId("bbbbbbbbbbbbbbbb");
 const elsewhere = parseNodeId("cccccccccccccccc");
+
+describe("selective-window retry evidence", () => {
+  it("counts a recovered transfer-open retry", async () => {
+    let openAttempts = 0;
+    const session = {
+      fragmentCount: 1,
+      open() {
+        openAttempts += 1;
+        if (openAttempts === 1) {
+          return Promise.reject(new Error("transfer start dropped"));
+        }
+        return Promise.resolve();
+      },
+      sendFragment() {
+        return Promise.resolve();
+      },
+      requestReceipt() {
+        return Promise.resolve(1);
+      },
+      waitForCompletion() {
+        return Promise.resolve();
+      },
+    } satisfies TransferSenderSession;
+
+    await expect(
+      selectiveWindowStrategy.createSender().run(session),
+    ).resolves.toMatchObject({ transferOpenRetries: 1 });
+  });
+});
 
 describe("FieldLinkNode delivery", () => {
   it("uses a complete frame at the exact threshold and echoes once", async () => {
