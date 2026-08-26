@@ -1,15 +1,19 @@
 import type { MessageDefinition } from "./definition.js";
+import { resourceMessage } from "./resource.js";
 import { testMessage } from "./test.js";
 
-export const messageRegistry = [testMessage] as const;
+const registeredMessages = [testMessage, resourceMessage] as const;
 
 type MessageFromDefinition<Definition> =
   Definition extends MessageDefinition<infer Message> ? Message : never;
 
 export type SupportedMessage = MessageFromDefinition<
-  (typeof messageRegistry)[number]
+  (typeof registeredMessages)[number]
 >;
-export type MessageName = (typeof messageRegistry)[number]["name"];
+export type MessageName = (typeof registeredMessages)[number]["name"];
+
+export const messageRegistry: readonly MessageDefinition<SupportedMessage>[] =
+  registeredMessages;
 
 validateRegistry(messageRegistry);
 
@@ -107,4 +111,17 @@ export type {
   MessageHandlerContext,
 } from "./definition.js";
 export { MessageValidationError } from "./definition.js";
+export {
+  attachResourceRequestHandler,
+  isJsonValue,
+  resourceMessage,
+  type JsonObject,
+  type JsonValue,
+  type ResourceListQuery,
+  type ResourceMessage,
+  type ResourceRequest,
+  type ResourceRequestExecutor,
+  type ResourceResponse,
+  type ResourceType,
+} from "./resource.js";
 export { testMessage, type TestMessage } from "./test.js";

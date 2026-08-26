@@ -35,13 +35,17 @@ export interface AdapterCommand {
 
 export type ChannelSelection = number | "auto";
 
+export type TestInput =
+  | { readonly kind: "exercise"; readonly payloadSize: number }
+  | { readonly kind: "resource-request"; readonly path: string };
+
 export interface TestCommand {
   readonly name: "test";
   readonly message: MessageName;
   readonly a: string;
   readonly b: string;
   readonly channel: ChannelSelection;
-  readonly payloadSize: number;
+  readonly input: TestInput;
   readonly retryStrategy: RetryStrategyName;
   readonly timeoutMs: number;
   readonly allowInboxDrain: true;
@@ -110,6 +114,7 @@ function parseTestCommand(arguments_: readonly string[]): TestCommand {
     channel: { type: "string" },
     message: { type: "string", default: "test" },
     "payload-size": { type: "string" },
+    "resource-request": { type: "string" },
     "retry-strategy": { type: "string", default: "selective-window" },
     "timeout-ms": { type: "string", default: String(DEFAULT_TIMEOUT_MS) },
     output: { type: "string" },
@@ -137,21 +142,40 @@ function parseTestCommand(arguments_: readonly string[]): TestCommand {
       `--retry-strategy must be one of: ${retryStrategies.map((item) => item.name).join(", ")}`,
     );
   }
+  const resourceRequest = parsed["resource-request"];
+  if (resourceRequest !== undefined && definition.name !== "resource") {
+    throw new UsageError("--resource-request requires --message resource");
+  }
+  if (resourceRequest !== undefined && parsed["payload-size"] !== undefined) {
+    throw new UsageError(
+      "--resource-request and --payload-size cannot be used together",
+    );
+  }
   return {
     name: "test",
     message: definition.name,
     a,
     b,
     channel: parseTestChannel(parsed.channel),
-    payloadSize: integer(
-      parsed["payload-size"] ?? String(definition.exercise.defaultPayloadBytes),
-      "--payload-size",
-      0,
-      Math.min(
-        FIELDLINK_MAX_MESSAGE_BYTES,
-        definition.exercise.maximumPayloadBytes,
-      ),
-    ),
+    input:
+      resourceRequest === undefined
+        ? {
+            kind: "exercise",
+            payloadSize: integer(
+              parsed["payload-size"] ??
+                String(definition.exercise.defaultPayloadBytes),
+              "--payload-size",
+              0,
+              Math.min(
+                FIELDLINK_MAX_MESSAGE_BYTES,
+                definition.exercise.maximumPayloadBytes,
+              ),
+            ),
+          }
+        : {
+            kind: "resource-request",
+            path: required(resourceRequest, "--resource-request"),
+          },
     retryStrategy: strategy.name,
     timeoutMs: integer(
       required(parsed["timeout-ms"], "--timeout-ms"),

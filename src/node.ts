@@ -82,7 +82,11 @@ export interface SendResult {
   readonly encodedBytes: number;
   readonly fragments: number;
   readonly retryStrategy?: RetryStrategyName;
+  readonly transferOpenRetries: number;
+  readonly completionRetries: number;
   readonly retransmissions: number;
+  readonly receiptRequests: number;
+  readonly receiptRequestRetries: number;
   readonly receipts: number;
   readonly durationMs: number;
 }
@@ -238,7 +242,11 @@ export class FieldLinkNode {
           delivery: "complete",
           encodedBytes: body.length,
           fragments: 1,
+          transferOpenRetries: 0,
+          completionRetries: 0,
           retransmissions: 0,
+          receiptRequests: 0,
+          receiptRequestRetries: 0,
           receipts: 0,
           durationMs: performance.now() - startedAt,
         };
@@ -274,7 +282,11 @@ export class FieldLinkNode {
         encodedBytes: body.length,
         fragments: Math.ceil(body.length / TRANSFER_FRAGMENT_BYTES),
         retryStrategy: strategy.name,
+        transferOpenRetries: retry.transferOpenRetries,
+        completionRetries: retry.completionRetries,
         retransmissions: retry.retransmissions,
+        receiptRequests: retry.receiptRequests,
+        receiptRequestRetries: retry.receiptRequestRetries,
         receipts: retry.receipts,
         durationMs: performance.now() - startedAt,
       };
@@ -424,6 +436,13 @@ export class FieldLinkNode {
           options.priority,
           options.signal,
         );
+        this.#emit({
+          type: "receipt-request-sent",
+          at: new Date().toISOString(),
+          logicalId: key,
+          windowStart,
+          windowCount,
+        });
         return signals.waitForReceipt(
           windowStart,
           sequence,
@@ -790,13 +809,19 @@ export class FieldLinkNode {
       return;
     }
     transfer.lastActivity = this.#now();
-    const bitmap = transfer.completed
-      ? (1 << frame.windowCount) - 1
-      : transfer.receiver.receipt(
-          frame.windowStart,
-          frame.windowCount,
-          (index) => transfer.received[index] === 1,
-        );
+    if (transfer.completed) {
+      await this.#submit(
+        responseFrame(frame, FrameKind.completion),
+        "high",
+        undefined,
+      );
+      return;
+    }
+    const bitmap = transfer.receiver.receipt(
+      frame.windowStart,
+      frame.windowCount,
+      (index) => transfer.received[index] === 1,
+    );
     await this.#submit(
       {
         ...responseBase(frame),
@@ -816,13 +841,6 @@ export class FieldLinkNode {
       windowCount: frame.windowCount,
       bitmap,
     });
-    if (transfer.completed) {
-      await this.#submit(
-        responseFrame(frame, FrameKind.completion),
-        "high",
-        undefined,
-      );
-    }
   }
 
   #receiveOutboundControl(
@@ -901,6 +919,7 @@ export class FieldLinkNode {
         .catch((error: unknown) => {
           this.#protocolError(
             `Message listener failed: ${asError(error).message}`,
+            { logicalId: received.logicalId },
           );
         });
     }

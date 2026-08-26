@@ -16,11 +16,62 @@ import {
   type FieldLinkEvent,
   type ReceivedMessage,
 } from "../src/node.js";
+import { selectiveWindowStrategy } from "../src/retry-strategies/selective-window.js";
+import type { TransferSenderSession } from "../src/retry.js";
 import { eventually, MemoryTransport, memoryTransportPair } from "./helpers.js";
 
 const nodeA = parseNodeId("aaaaaaaaaaaaaaaa");
 const nodeB = parseNodeId("bbbbbbbbbbbbbbbb");
 const elsewhere = parseNodeId("cccccccccccccccc");
+
+describe("selective-window retry evidence", () => {
+  it("counts a recovered transfer-open retry", async () => {
+    let openAttempts = 0;
+    const session = {
+      fragmentCount: 1,
+      open() {
+        openAttempts += 1;
+        if (openAttempts === 1) {
+          return Promise.reject(new Error("transfer start dropped"));
+        }
+        return Promise.resolve();
+      },
+      sendFragment() {
+        return Promise.resolve();
+      },
+      requestReceipt() {
+        return Promise.resolve(1);
+      },
+      waitForCompletion() {
+        return Promise.resolve();
+      },
+    } satisfies TransferSenderSession;
+
+    await expect(
+      selectiveWindowStrategy.createSender().run(session),
+    ).resolves.toMatchObject({ transferOpenRetries: 1 });
+  });
+
+  it("counts recovery after a completion timeout", async () => {
+    let completionAttempts = 0;
+    const session = {
+      fragmentCount: 1,
+      open: () => Promise.resolve(),
+      sendFragment: () => Promise.resolve(),
+      requestReceipt: () => Promise.resolve(1),
+      waitForCompletion: () => {
+        completionAttempts += 1;
+        return completionAttempts === 1
+          ? Promise.reject(new Error("completion dropped"))
+          : Promise.resolve();
+      },
+    } satisfies TransferSenderSession;
+
+    await expect(
+      selectiveWindowStrategy.createSender().run(session),
+    ).resolves.toMatchObject({ completionRetries: 1 });
+  });
+});
 
 describe("FieldLinkNode delivery", () => {
   it("uses a complete frame at the exact threshold and echoes once", async () => {
@@ -173,6 +224,66 @@ describe("FieldLinkNode delivery", () => {
         ),
       ).size,
     ).toBe(2);
+    await Promise.all([a.close(), b.close()]);
+  });
+
+  it("retries a lost receipt request before repairing fragments", async () => {
+    const [transportA, transportB] = memoryTransportPair();
+    let droppedFragment = false;
+    let droppedReceiptRequest = false;
+    transportA.drop = (bytes) => {
+      const frame = decodeFrame(bytes);
+      if (
+        !droppedFragment &&
+        frame.kind === FrameKind.fragment &&
+        frame.fragmentIndex === 2
+      ) {
+        droppedFragment = true;
+        return true;
+      }
+      if (!droppedReceiptRequest && frame.kind === FrameKind.receiptRequest) {
+        droppedReceiptRequest = true;
+        return true;
+      }
+      return false;
+    };
+    const a = new FieldLinkNode({
+      nodeId: nodeA,
+      transport: transportA,
+      retryTimeoutMs: 10,
+    });
+    const b = new FieldLinkNode({
+      nodeId: nodeB,
+      transport: transportB,
+      retryTimeoutMs: 10,
+    });
+
+    const result = await a.send(test("response", 600), {
+      destination: nodeB,
+    });
+    const frames = transportA.sent.map(decodeFrame);
+    const fragmentCounts = new Map<number, number>();
+    for (const frame of frames) {
+      if (frame.kind === FrameKind.fragment) {
+        fragmentCounts.set(
+          frame.fragmentIndex,
+          (fragmentCounts.get(frame.fragmentIndex) ?? 0) + 1,
+        );
+      }
+    }
+
+    expect(result.retransmissions).toBe(1);
+    expect(result.receiptRequests).toBe(3);
+    expect(result.receiptRequestRetries).toBe(1);
+    expect(fragmentCounts.get(2)).toBe(2);
+    expect(
+      [...fragmentCounts.entries()]
+        .filter(([index]) => index !== 2)
+        .every(([, count]) => count === 1),
+    ).toBe(true);
+    expect(
+      frames.filter((frame) => frame.kind === FrameKind.receiptRequest),
+    ).toHaveLength(3);
     await Promise.all([a.close(), b.close()]);
   });
 
@@ -557,6 +668,49 @@ describe("FieldLinkNode delivery", () => {
     await expect(
       a.send(test("response", 300), { destination: nodeB }),
     ).resolves.toMatchObject({ delivery: "transfer", retransmissions: 0 });
+    await Promise.all([a.close(), b.close()]);
+  });
+
+  it("answers a late receipt request with one completion frame", async () => {
+    const [transportA, transportB] = memoryTransportPair();
+    const a = new FieldLinkNode({
+      nodeId: nodeA,
+      transport: transportA,
+      retryTimeoutMs: 10,
+    });
+    const b = new FieldLinkNode({
+      nodeId: nodeB,
+      transport: transportB,
+      retryTimeoutMs: 10,
+    });
+    const events: FieldLinkEvent[] = [];
+    b.onEvent((event) => {
+      events.push(event);
+    });
+    const result = await a.send(test("response", 200), {
+      destination: nodeB,
+    });
+    await Promise.all([transportA.settle(), transportB.settle()]);
+    const sentBeforeRequest = transportB.sent.length;
+
+    transportB.inject({
+      bytes: encodeFrame({
+        transmissionId: 99,
+        kind: FrameKind.receiptRequest,
+        source: nodeA,
+        destination: nodeB,
+        logicalId: BigInt(`0x${result.logicalId}`),
+        windowStart: 0,
+        windowCount: 2,
+      }),
+    });
+    await transportB.settle();
+    await eventually(() => transportB.sent.length === sentBeforeRequest + 1);
+
+    expect(
+      transportB.sent.slice(sentBeforeRequest).map(decodeFrame),
+    ).toMatchObject([{ kind: FrameKind.completion }]);
+    expect(events.some((event) => event.type === "protocol-error")).toBe(false);
     await Promise.all([a.close(), b.close()]);
   });
 
