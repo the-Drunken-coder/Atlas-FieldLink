@@ -176,6 +176,31 @@ describe("Atlas Resource executor", () => {
     expect(JSON.stringify(result.body)).toContain("exceeds");
   });
 
+  it("bounds oversized Atlas error details", async () => {
+    const client = atlasClient();
+    client.tasks.get.mockRejectedValue(
+      new Error("x".repeat(FIELDLINK_MAX_MESSAGE_BYTES)),
+    );
+    const executor = new AtlasResourceExecutor(client);
+
+    await expect(
+      executor.execute({
+        type: "resource",
+        kind: "request",
+        operation: "get",
+        request_id: "error-1",
+        resource_type: "task",
+        resource_id: "task-1",
+      }),
+    ).resolves.toEqual({
+      type: "resource",
+      kind: "response",
+      request_id: "error-1",
+      status: 502,
+      body: { error: "Atlas request failed" },
+    });
+  });
+
   it("loads the built SDK from the configured Atlas Modernization checkout", async () => {
     const checkout = await mkdtemp(join(tmpdir(), "fieldlink-atlas-sdk-"));
     const sdkDirectory = join(

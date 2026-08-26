@@ -84,20 +84,13 @@ export class AtlasResourceExecutor implements ResourceRequestExecutor {
       return await abortable(this.#execute(request, signal), signal);
     } catch (error: unknown) {
       const apiError = atlasAPIError(error);
-      return {
-        type: "resource",
-        kind: "response",
-        request_id: request.request_id,
-        status: apiError?.status ?? 502,
-        body: {
-          error:
-            apiError?.message ??
-            (error instanceof Error ? error.message : "Atlas request failed"),
-          ...(apiError?.errorCode === undefined
-            ? {}
-            : { error_code: apiError.errorCode }),
-        },
-      };
+      return errorResponse(
+        request.request_id,
+        apiError?.status ?? 502,
+        apiError?.message ??
+          (error instanceof Error ? error.message : "Atlas request failed"),
+        apiError?.errorCode,
+      );
     }
   }
 
@@ -281,6 +274,38 @@ function response(
   } satisfies ResourceResponse;
   resourceMessage.encode(candidate);
   return candidate;
+}
+
+function errorResponse(
+  requestId: string,
+  status: number,
+  message: string,
+  errorCode: string | undefined,
+): ResourceResponse {
+  const detailed = {
+    type: "resource",
+    kind: "response",
+    request_id: requestId,
+    status,
+    body: {
+      error: message,
+      ...(errorCode === undefined ? {} : { error_code: errorCode }),
+    },
+  } satisfies ResourceResponse;
+  try {
+    resourceMessage.encode(detailed);
+    return detailed;
+  } catch {
+    const bounded = {
+      type: "resource",
+      kind: "response",
+      request_id: requestId,
+      status,
+      body: { error: "Atlas request failed" },
+    } satisfies ResourceResponse;
+    resourceMessage.encode(bounded);
+    return bounded;
+  }
 }
 
 function listBody(

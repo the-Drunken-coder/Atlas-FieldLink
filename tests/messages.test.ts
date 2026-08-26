@@ -308,6 +308,22 @@ describe("Resource message", () => {
     expect(isJsonValue(cycle)).toBe(false);
   });
 
+  it("bounds Resource request IDs so every correlation response can fit", () => {
+    const request = {
+      type: "resource",
+      kind: "request",
+      operation: "get",
+      resource_type: "task",
+      resource_id: "task-1",
+    } as const;
+    expect(
+      resourceMessage.validate({ ...request, request_id: "x".repeat(256) }),
+    ).toBe(true);
+    expect(
+      resourceMessage.validate({ ...request, request_id: "x".repeat(257) }),
+    ).toBe(false);
+  });
+
   it("rejects invalid UTF-8 JSON and oversized encoded messages", () => {
     expect(() => resourceMessage.decode(Uint8Array.of(0xff))).toThrow(
       "valid UTF-8 JSON",

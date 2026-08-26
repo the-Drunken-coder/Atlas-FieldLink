@@ -41,7 +41,8 @@ Every request starts with these fields:
 ```
 
 `request_id` correlates exactly one response with its request. It is an
-application identifier, not a FieldLink transfer ID or delivery receipt.
+application identifier of at most 256 UTF-8 bytes, not a FieldLink transfer ID
+or delivery receipt.
 
 | Operation | Resources                  | Additional fields           | Meaning                                               |
 | --------- | -------------------------- | --------------------------- | ----------------------------------------------------- |

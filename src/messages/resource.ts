@@ -9,6 +9,7 @@ import {
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
+const MAX_RESOURCE_REQUEST_ID_BYTES = 256;
 let nextExerciseRequestId = randomInt(0x1_0000_0000);
 
 export type JsonValue =
@@ -528,7 +529,10 @@ function isMutableResourceType(value: unknown): value is "entity" | "object" {
 }
 
 function isRequestId(value: unknown): value is string {
-  return isNonEmptyString(value);
+  return (
+    isNonEmptyString(value) &&
+    textEncoder.encode(value).length <= MAX_RESOURCE_REQUEST_ID_BYTES
+  );
 }
 
 function isNonEmptyString(value: unknown): value is string {

@@ -659,8 +659,15 @@ def edit_json_object(
         put(popup, 0, 2, " Body JSON. Ctrl-G saves ", curses.A_BOLD)
         editor = popup.derwin(popup_height - 2, popup_width - 2, 1, 1)
         initial = json.dumps(current, indent=2, ensure_ascii=False)
+        capacity = (popup_height - 2) * (popup_width - 3)
+        if len(initial) > capacity:
+            show_error(
+                screen,
+                "Body JSON does not fit this terminal. Resize before editing it.",
+            )
+            return current
         try:
-            editor.addstr(initial[: (popup_height - 2) * (popup_width - 3)])
+            editor.addstr(initial)
         except curses.error:
             pass
         popup.noutrefresh()
