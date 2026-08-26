@@ -4,6 +4,7 @@ import { pathToFileURL } from "node:url";
 
 import {
   isJsonValue,
+  resourceMessage,
   type JsonObject,
   type JsonValue,
   type ResourceRequest,
@@ -62,6 +63,7 @@ type AtlasClientConstructor = new (options: {
   readonly baseUrl: string;
   readonly apiKey: string;
   readonly sync: false;
+  readonly fetch?: typeof globalThis.fetch;
 }) => AtlasClientLike;
 
 export class AtlasResourceExecutor implements ResourceRequestExecutor {
@@ -71,9 +73,15 @@ export class AtlasResourceExecutor implements ResourceRequestExecutor {
     this.#client = client;
   }
 
-  async execute(request: ResourceRequest): Promise<ResourceResponse> {
+  async execute(
+    request: ResourceRequest,
+    signal?: AbortSignal,
+  ): Promise<ResourceResponse> {
     try {
-      return await this.#execute(request);
+      if (signal?.aborted === true) {
+        throw abortError(signal);
+      }
+      return await abortable(this.#execute(request, signal), signal);
     } catch (error: unknown) {
       const apiError = atlasAPIError(error);
       return {
@@ -93,7 +101,10 @@ export class AtlasResourceExecutor implements ResourceRequestExecutor {
     }
   }
 
-  async #execute(request: ResourceRequest): Promise<ResourceResponse> {
+  async #execute(
+    request: ResourceRequest,
+    signal: AbortSignal | undefined,
+  ): Promise<ResourceResponse> {
     switch (request.operation) {
       case "create":
         return response(
@@ -105,7 +116,7 @@ export class AtlasResourceExecutor implements ResourceRequestExecutor {
         return response(
           request.request_id,
           200,
-          await this.#read(request.resource_type, request.resource_id),
+          await this.#read(request.resource_type, request.resource_id, signal),
         );
       case "list":
         return response(
@@ -141,14 +152,22 @@ export class AtlasResourceExecutor implements ResourceRequestExecutor {
     return type === "entity" ? this.#client.entities : this.#client.objects;
   }
 
-  #read(type: ResourceType, id: string): Promise<unknown> {
+  #read(
+    type: ResourceType,
+    id: string,
+    signal: AbortSignal | undefined,
+  ): Promise<unknown> {
+    const options = {
+      fresh: true,
+      ...(signal === undefined ? {} : { signal }),
+    };
     switch (type) {
       case "entity":
-        return this.#client.entities.get(id, { fresh: true });
+        return this.#client.entities.get(id, options);
       case "object":
-        return this.#client.objects.get(id, { fresh: true });
+        return this.#client.objects.get(id, options);
       case "task":
-        return this.#client.tasks.get(id, { fresh: true });
+        return this.#client.tasks.get(id, options);
     }
   }
 
@@ -222,7 +241,25 @@ export async function createAtlasResourceExecutorFromEnvironment(
     throw new Error(`Atlas SDK entry does not export AtlasClient: ${sdkEntry}`);
   }
   const AtlasClient = loaded.AtlasClient as AtlasClientConstructor;
-  const client = new AtlasClient({ baseUrl, apiKey, sync: false });
+  const client = new AtlasClient({
+    baseUrl,
+    apiKey,
+    sync: false,
+    ...(signal === undefined
+      ? {}
+      : {
+          fetch: (input, init) => {
+            const requestSignal = init?.signal;
+            return globalThis.fetch(input, {
+              ...init,
+              signal:
+                requestSignal === undefined || requestSignal === null
+                  ? signal
+                  : AbortSignal.any([signal, requestSignal]),
+            });
+          },
+        }),
+  });
   await client.handshake(signal === undefined ? undefined : { signal });
   return new AtlasResourceExecutor(client);
 }
@@ -235,13 +272,15 @@ function response(
   if (!isJsonValue(value)) {
     throw new TypeError("Atlas SDK returned a non-JSON resource");
   }
-  return {
+  const candidate = {
     type: "resource",
     kind: "response",
     request_id: requestId,
     status,
     body: value,
-  };
+  } satisfies ResourceResponse;
+  resourceMessage.encode(candidate);
+  return candidate;
 }
 
 function listBody(
@@ -333,4 +372,31 @@ function requiredEnvironment(name: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function abortable<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (signal === undefined) {
+    return promise;
+  }
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => {
+      reject(abortError(signal));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    void promise.then(resolve, reject).then(() => {
+      signal.removeEventListener("abort", abort);
+    });
+    if (signal.aborted) {
+      abort();
+    }
+  });
+}
+
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error("Atlas Resource request aborted");
 }

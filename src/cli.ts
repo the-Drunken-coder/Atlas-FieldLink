@@ -758,12 +758,11 @@ export function waitForExerciseCompletion(
       {
         readonly at: string;
         readonly retransmissions: number;
+        readonly receiptRequests: number;
+        readonly receiptRequestRetries: number;
         readonly receipts: number;
       }
     >();
-    const receiptRequests = new Map<string, number>();
-    const receiptRequestWindows = new Map<string, Set<string>>();
-    const receiptRequestRetries = new Map<string, number>();
     const failedTransfers = new Map<string, Error>();
     const echoTransfers = new Set<string>();
     const expectedHandlerLogicalIds = new Set<string>();
@@ -812,8 +811,8 @@ export function waitForExerciseCompletion(
               started?.fragmentCount ??
               Math.ceil(encodedBytes / TRANSFER_FRAGMENT_BYTES),
             retransmissions: completed.retransmissions,
-            receiptRequests: receiptRequests.get(key) ?? 0,
-            receiptRequestRetries: receiptRequestRetries.get(key) ?? 0,
+            receiptRequests: completed.receiptRequests,
+            receiptRequestRetries: completed.receiptRequestRetries,
             receipts: completed.receipts,
             ...(started?.retryStrategy === undefined
               ? {}
@@ -903,26 +902,6 @@ export function waitForExerciseCompletion(
             });
           }
           if (
-            event.type === "receipt-request-sent" &&
-            typeof event.logicalId === "string" &&
-            typeof event.windowStart === "number" &&
-            typeof event.windowCount === "number"
-          ) {
-            const key = transferKey(node.nodeId, event.logicalId);
-            receiptRequests.set(key, (receiptRequests.get(key) ?? 0) + 1);
-            const window = `${event.windowStart}:${event.windowCount}`;
-            const windows = receiptRequestWindows.get(key) ?? new Set<string>();
-            if (windows.has(window)) {
-              receiptRequestRetries.set(
-                key,
-                (receiptRequestRetries.get(key) ?? 0) + 1,
-              );
-            } else {
-              windows.add(window);
-              receiptRequestWindows.set(key, windows);
-            }
-          }
-          if (
             node === destinationNode &&
             event.type === "protocol-error" &&
             typeof event.logicalId === "string" &&
@@ -969,6 +948,14 @@ export function waitForExerciseCompletion(
               retransmissions:
                 typeof event.retransmissions === "number"
                   ? event.retransmissions
+                  : 0,
+              receiptRequests:
+                typeof event.receiptRequests === "number"
+                  ? event.receiptRequests
+                  : 0,
+              receiptRequestRetries:
+                typeof event.receiptRequestRetries === "number"
+                  ? event.receiptRequestRetries
                   : 0,
               receipts: typeof event.receipts === "number" ? event.receipts : 0,
             });

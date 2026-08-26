@@ -189,6 +189,57 @@ class FieldLinkTuiTests(unittest.TestCase):
         stop_process.assert_called_once_with(process)
         process.wait.assert_called_once_with(timeout=TUI.STOP_TIMEOUT_SECONDS)
 
+    def test_tui_removes_the_request_file_when_transcript_setup_fails(self):
+        config = self.config()
+        with tempfile.TemporaryDirectory() as directory:
+            request_path = Path(directory) / "request.json"
+            request_path.write_text("{}", encoding="utf-8")
+            resource = TUI.RunConfiguration(
+                message=TUI.MessageChoice(2, "resource", "normal", 32, 1_048_483, ()),
+                radio_a=config.radio_a,
+                radio_b=config.radio_b,
+                payload_bytes=None,
+                resource_request={"request_id": "req-1"},
+                resource_request_path=request_path,
+                retry_strategy=config.retry_strategy,
+                timeout_ms=config.timeout_ms,
+                output=config.output,
+            )
+            with (
+                mock.patch.object(TUI.curses, "curs_set"),
+                mock.patch.object(TUI, "select_configuration", return_value=resource),
+                mock.patch.object(
+                    TUI, "RunTranscript", side_effect=OSError("transcript failed")
+                ),
+            ):
+                with self.assertRaisesRegex(OSError, "transcript failed"):
+                    TUI.tui(mock.Mock(), mock.Mock(), [], [], [], 1000, Path("results"))
+
+            self.assertFalse(request_path.exists())
+
+    def test_prefers_the_summary_resource_response(self):
+        view = TUI.RunView(
+            received_message={
+                "type": "resource",
+                "kind": "response",
+                "request_id": "stale",
+                "status": 200,
+            }
+        )
+        correlated = {
+            "type": "resource",
+            "kind": "response",
+            "request_id": "expected",
+            "status": 200,
+        }
+
+        self.assertEqual(
+            TUI.received_message(
+                view, {"resourceResponse": correlated}, self.config()
+            ),
+            correlated,
+        )
+
     def test_results_transcript_overwrites_and_orders_the_run(self):
         config = self.config()
         request = {

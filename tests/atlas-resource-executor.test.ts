@@ -7,6 +7,7 @@ import {
   AtlasResourceExecutor,
   createAtlasResourceExecutorFromEnvironment,
 } from "../src/atlas-resource-executor.js";
+import { FIELDLINK_MAX_MESSAGE_BYTES } from "../src/frame.js";
 
 describe("Atlas Resource executor", () => {
   it("maps Resource CRUD operations onto the Atlas SDK", async () => {
@@ -151,6 +152,28 @@ describe("Atlas Resource executor", () => {
         error_code: "TASK_NOT_FOUND",
       },
     });
+  });
+
+  it("returns a small error response when Atlas data exceeds FieldLink's bound", async () => {
+    const client = atlasClient();
+    client.tasks.get.mockResolvedValue("x".repeat(FIELDLINK_MAX_MESSAGE_BYTES));
+    const executor = new AtlasResourceExecutor(client);
+
+    const result = await executor.execute({
+      type: "resource",
+      kind: "request",
+      operation: "get",
+      request_id: "oversized-1",
+      resource_type: "task",
+      resource_id: "task-1",
+    });
+    expect(result).toMatchObject({
+      type: "resource",
+      kind: "response",
+      request_id: "oversized-1",
+      status: 502,
+    });
+    expect(JSON.stringify(result.body)).toContain("exceeds");
   });
 
   it("loads the built SDK from the configured Atlas Modernization checkout", async () => {

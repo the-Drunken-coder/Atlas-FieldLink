@@ -89,7 +89,10 @@ export type ResourceRequest = Extract<ResourceMessage, { kind: "request" }>;
 export type ResourceResponse = Extract<ResourceMessage, { kind: "response" }>;
 
 export interface ResourceRequestExecutor {
-  execute(request: ResourceRequest): Promise<ResourceResponse>;
+  execute(
+    request: ResourceRequest,
+    signal?: AbortSignal,
+  ): Promise<ResourceResponse>;
 }
 
 const exerciseEnvelopeBytes = textEncoder.encode(
@@ -316,7 +319,13 @@ export function attachResourceRequestHandler(
   node: Pick<FieldLinkNode, "onMessage" | "send">,
   executor: ResourceRequestExecutor,
   allowedSource: NodeId,
-): () => void {
+  signal?: AbortSignal,
+): () => Promise<void> {
+  const ownedController = new AbortController();
+  const lifecycleSignal =
+    signal === undefined
+      ? ownedController.signal
+      : AbortSignal.any([ownedController.signal, signal]);
   const cached = new Map<
     string,
     {
@@ -324,10 +333,23 @@ export function attachResourceRequestHandler(
       readonly response: Promise<ResourceResponse>;
     }
   >();
+  const settledKeys = new Set<string>();
+  const active = new Set<Promise<void>>();
 
-  return node.onMessage(async (received: ReceivedMessage) => {
+  const unsubscribe = node.onMessage((received: ReceivedMessage) => {
+    const operation = handle(received);
+    active.add(operation);
+    void operation.then(
+      () => active.delete(operation),
+      () => active.delete(operation),
+    );
+    return operation;
+  });
+
+  async function handle(received: ReceivedMessage): Promise<void> {
     const message = received.message;
     if (
+      lifecycleSignal.aborted ||
       received.source !== allowedSource ||
       message.type !== "resource" ||
       message.kind !== "request"
@@ -338,7 +360,7 @@ export function attachResourceRequestHandler(
     const key = `${received.source}:${message.request_id}`;
     const encodedRequest = JSON.stringify(message);
     const previous = cached.get(key);
-    let response: Promise<ResourceResponse>;
+    let response: Promise<ResourceResponse> | undefined;
     if (previous !== undefined) {
       response =
         previous.encodedRequest === encodedRequest
@@ -352,23 +374,50 @@ export function attachResourceRequestHandler(
             });
     } else {
       if (cached.size >= MAX_CACHED_RESOURCE_REQUESTS) {
-        const oldest = cached.keys().next().value;
-        if (oldest !== undefined) {
-          cached.delete(oldest);
+        const settled = [...cached].find(([cachedKey]) =>
+          settledKeys.has(cachedKey),
+        );
+        if (settled === undefined) {
+          response = Promise.resolve({
+            type: "resource",
+            kind: "response",
+            request_id: message.request_id,
+            status: 503,
+            body: { error: "Atlas Resource gateway is at request capacity" },
+          });
+        } else {
+          cached.delete(settled[0]);
+          settledKeys.delete(settled[0]);
         }
       }
-      response = executor.execute(message).catch(() => ({
-        type: "resource",
-        kind: "response",
-        request_id: message.request_id,
-        status: 500,
-        body: { error: "Atlas Resource request failed" },
-      }));
-      cached.set(key, { encodedRequest, response });
+      if (response === undefined) {
+        response = executor
+          .execute(message, lifecycleSignal)
+          .catch(() => ({
+            type: "resource" as const,
+            kind: "response" as const,
+            request_id: message.request_id,
+            status: 500,
+            body: { error: "Atlas Resource request failed" },
+          }))
+          .finally(() => {
+            settledKeys.add(key);
+          });
+        cached.set(key, { encodedRequest, response });
+      }
     }
 
-    await node.send(await response, { destination: received.source });
-  });
+    const resolved = await response;
+    if (isActive(lifecycleSignal)) {
+      await node.send(resolved, { destination: received.source });
+    }
+  }
+
+  return async () => {
+    unsubscribe();
+    ownedController.abort(new Error("Atlas Resource gateway disposed"));
+    await Promise.allSettled(active);
+  };
 }
 
 function isResponse(value: Record<string, unknown>): boolean {
@@ -400,10 +449,21 @@ function isJsonObject(value: unknown): value is JsonObject {
 }
 
 export function isJsonValue(value: unknown): value is JsonValue {
-  const pending = [value];
-  const seen = new WeakSet<object>();
+  const pending: (
+    | { readonly value: unknown; readonly exiting: false }
+    | { readonly value: object; readonly exiting: true }
+  )[] = [{ value, exiting: false }];
+  const active = new WeakSet<object>();
   while (pending.length > 0) {
-    const current = pending.pop();
+    const item = pending.pop();
+    if (item === undefined) {
+      continue;
+    }
+    if (item.exiting) {
+      active.delete(item.value);
+      continue;
+    }
+    const current = item.value;
     if (
       current === null ||
       typeof current === "string" ||
@@ -417,10 +477,11 @@ export function isJsonValue(value: unknown): value is JsonValue {
       }
       continue;
     }
-    if (typeof current !== "object" || seen.has(current)) {
+    if (typeof current !== "object" || active.has(current)) {
       return false;
     }
-    seen.add(current);
+    active.add(current);
+    pending.push({ value: current, exiting: true });
     if (Array.isArray(current)) {
       const keys = Object.keys(current);
       if (
@@ -433,7 +494,7 @@ export function isJsonValue(value: unknown): value is JsonValue {
         if (keys[index] !== String(index)) {
           return false;
         }
-        pending.push(current[index]);
+        pending.push({ value: current[index], exiting: false });
       }
       continue;
     }
@@ -452,7 +513,7 @@ export function isJsonValue(value: unknown): value is JsonValue {
       ) {
         return false;
       }
-      pending.push(descriptor.value);
+      pending.push({ value: descriptor.value, exiting: false });
     }
   }
   return true;
@@ -472,6 +533,10 @@ function isRequestId(value: unknown): value is string {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
+}
+
+function isActive(signal: AbortSignal): boolean {
+  return !signal.aborted;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

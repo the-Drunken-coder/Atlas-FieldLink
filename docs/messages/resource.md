@@ -151,7 +151,7 @@ npm run build:sdk
 Copy `.env.example` to `.env` in Atlas-FieldLink and fill in:
 
 ```dotenv
-ATLAS_MODERNIZATION_PATH=/absolute/path/to/Atlas Modernization
+ATLAS_MODERNIZATION_PATH="/absolute/path/to/Atlas Modernization"
 ATLAS_BASE_URL=https://your-atlas-api.example
 ATLAS_API_KEY=your-api-key
 ```

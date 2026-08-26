@@ -73,7 +73,7 @@ interface AdapterRuntime {
     allowedSource: NodeId,
     signal?: AbortSignal,
   ) => Promise<void>;
-  readonly dispose?: () => void;
+  readonly dispose?: () => Promise<void>;
 }
 
 interface RuntimeFactoryOptions {
@@ -291,7 +291,7 @@ export async function serveAdapter(
           controller.abort(new Error("Adapter is closing"));
         }
         await Promise.allSettled(activeOperations.values());
-        runtime.dispose?.();
+        await runtime.dispose?.();
         await runtime.node.close();
         await writer.write({ type: "response", id: request.id, ok: true });
         break;
@@ -385,7 +385,7 @@ export async function serveAdapter(
     }
     await Promise.allSettled(activeOperations.values());
     if (!closing) {
-      runtime.dispose?.();
+      await runtime.dispose?.();
       await runtime.node.close();
     }
     await writer.flush();
@@ -416,7 +416,18 @@ async function createDefaultRuntime(
       transport,
     });
     let resourceGateway:
-      | { readonly allowedSource: NodeId; readonly unsubscribe: () => void }
+      | {
+          readonly allowedSource: NodeId;
+          readonly controller: AbortController;
+          readonly disposeHandler: () => Promise<void>;
+        }
+      | undefined;
+    let resourceGatewayPending:
+      | {
+          readonly allowedSource: NodeId;
+          readonly controller: AbortController;
+          readonly promise: Promise<void>;
+        }
       | undefined;
     return {
       node,
@@ -431,20 +442,54 @@ async function createDefaultRuntime(
           }
           return;
         }
-        const executor =
-          await createAtlasResourceExecutorFromEnvironment(signal);
-        resourceGateway = {
-          allowedSource,
-          unsubscribe: attachResourceRequestHandler(
-            node,
-            executor,
+        if (resourceGatewayPending !== undefined) {
+          if (resourceGatewayPending.allowedSource !== allowedSource) {
+            throw new Error(
+              "Atlas Resource gateway is already being bound to another source",
+            );
+          }
+          await resourceGatewayPending.promise;
+          return;
+        }
+        const controller = new AbortController();
+        const lifecycleSignal =
+          signal === undefined
+            ? controller.signal
+            : AbortSignal.any([controller.signal, signal]);
+        const promise = (async () => {
+          const executor =
+            await createAtlasResourceExecutorFromEnvironment(lifecycleSignal);
+          if (lifecycleSignal.aborted) {
+            throw abortError(lifecycleSignal);
+          }
+          resourceGateway = {
             allowedSource,
-          ),
-        };
+            controller,
+            disposeHandler: attachResourceRequestHandler(
+              node,
+              executor,
+              allowedSource,
+              controller.signal,
+            ),
+          };
+        })();
+        resourceGatewayPending = { allowedSource, controller, promise };
+        try {
+          await promise;
+        } finally {
+          if (resourceGatewayPending.promise === promise) {
+            resourceGatewayPending = undefined;
+          }
+        }
       },
-      dispose: () => {
-        resourceGateway?.unsubscribe();
+      dispose: async () => {
+        const pending = resourceGatewayPending;
+        pending?.controller.abort(new Error("Adapter is closing"));
+        await pending?.promise.catch(() => undefined);
+        const gateway = resourceGateway;
         resourceGateway = undefined;
+        gateway?.controller.abort(new Error("Adapter is closing"));
+        await gateway?.disposeHandler();
       },
       ready: {
         processId: options.processId,

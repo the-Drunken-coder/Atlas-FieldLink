@@ -305,7 +305,7 @@ class RunView:
             message = data.get("message", {}).get("message", {})
             if isinstance(message, dict) and message.get("kind") == "response":
                 self.received_message = message
-                if message.get("type") == "resource":
+                if message.get("type") == "resource" and radio == "A":
                     self.resource_response = message
             text = f"[{radio}] decoded {message.get('type', '?')} {message.get('kind', '')}".rstrip()
         elif kind == "resource-gateway-ready":
@@ -950,11 +950,6 @@ def run_live(
                     if transcript is not None:
                         transcript.append(rendered)
                 summary = load_summary(config.output / "summary.json")
-                if transcript is not None:
-                    transcript.finish(
-                        received_message(view, summary),
-                        summary_lines(summary, view, config),
-                    )
             finished = process.poll() is not None
             scroll_top, maximum_scroll_top = draw_run(
                 screen,
@@ -992,21 +987,28 @@ def run_live(
     finally:
         if transcript is not None:
             transcript.finish(
-                received_message(view, summary),
+                received_message(view, summary, config),
                 summary_lines(summary, view, config),
             )
 
 
 def received_message(
-    view: RunView, summary: dict[str, Any] | None
+    view: RunView,
+    summary: dict[str, Any] | None,
+    config: RunConfiguration,
 ) -> dict[str, Any] | None:
-    if view.received_message is not None:
-        return view.received_message
     if isinstance(summary, dict):
         candidate = summary.get("resourceResponse")
         if isinstance(candidate, dict):
             return candidate
-    return None
+    if config.resource_request is not None:
+        expected_request_id = config.resource_request.get("request_id")
+        if view.resource_response is not None and (
+            view.resource_response.get("request_id") == expected_request_id
+        ):
+            return view.resource_response
+        return None
+    return view.received_message
 
 
 def draw_run(
@@ -1063,11 +1065,19 @@ def run_document_lines(
             f"Request {config.resource_request.get('operation', '?')} "
             f"{config.resource_request.get('resource_type', '?')}"
         )
-    response = view.resource_response
-    if response is None and isinstance(summary, dict):
+    response = None
+    if isinstance(summary, dict):
         candidate = summary.get("resourceResponse")
         if isinstance(candidate, dict):
             response = candidate
+    if response is None and view.resource_response is not None:
+        expected_request_id = (
+            config.resource_request.get("request_id")
+            if config.resource_request is not None
+            else None
+        )
+        if view.resource_response.get("request_id") == expected_request_id:
+            response = view.resource_response
     response_lines = (
         []
         if response is None
@@ -1116,12 +1126,14 @@ def tui(
         screen, messages, radios, strategies, timeout_ms, output_root
     )
     process: subprocess.Popen[str] | None = None
-    transcript = RunTranscript(RESULTS_TRANSCRIPT, config)
+    transcript: RunTranscript | None = None
     try:
+        transcript = RunTranscript(RESULTS_TRANSCRIPT, config)
         process = cli.start_test(config)
         return run_live(screen, process, config, transcript)
     except Exception as error:
-        transcript.append(f"[tui] {type(error).__name__}: {error}")
+        if transcript is not None:
+            transcript.append(f"[tui] {type(error).__name__}: {error}")
         raise
     finally:
         if process is not None and process.poll() is None:
@@ -1131,7 +1143,8 @@ def tui(
             except subprocess.TimeoutExpired:
                 kill_process(process)
                 process.wait()
-        transcript.finish()
+        if transcript is not None:
+            transcript.finish()
         if config.resource_request_path is not None:
             config.resource_request_path.unlink(missing_ok=True)
 

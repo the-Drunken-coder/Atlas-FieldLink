@@ -352,7 +352,7 @@ describe("CLI message exercise", () => {
     ).toBe(false);
   });
 
-  it("reports a repeated response receipt request as recovery", async () => {
+  it("uses the response sender's receipt retry totals", async () => {
     const source = new ExerciseNodeProbe("aaaaaaaaaaaaaaaa");
     const destination = new ExerciseNodeProbe("bbbbbbbbbbbbbbbb");
     const controller = new AbortController();
@@ -390,6 +390,8 @@ describe("CLI message exercise", () => {
       at: "2026-08-25T12:00:05.000Z",
       logicalId,
       retransmissions: 0,
+      receiptRequests: 2,
+      receiptRequestRetries: 1,
       receipts: 4,
     });
     source.emitMessage({

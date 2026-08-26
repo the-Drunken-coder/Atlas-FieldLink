@@ -4,6 +4,7 @@ import { FIELDLINK_MAX_MESSAGE_BYTES } from "../src/frame.js";
 import {
   definitionForType,
   attachResourceRequestHandler,
+  isJsonValue,
   messageRegistry,
   resourceMessage,
   validateRegistry,
@@ -295,6 +296,16 @@ describe("Resource message", () => {
     expect(resourceMessage.validate({ ...response, body: Number.NaN })).toBe(
       false,
     );
+    const shared = { unit: "m" };
+    expect(
+      resourceMessage.validate({
+        ...response,
+        body: { width: shared, height: shared },
+      }),
+    ).toBe(true);
+    const cycle: { self?: unknown } = {};
+    cycle.self = cycle;
+    expect(isJsonValue(cycle)).toBe(false);
   });
 
   it("rejects invalid UTF-8 JSON and oversized encoded messages", () => {
@@ -422,6 +433,62 @@ describe("Resource message", () => {
     expect(executor.requests).toHaveLength(1);
     expect(node.sent[1]?.message).toMatchObject({ status: 409 });
   });
+
+  it("does not evict in-flight Resource requests at cache capacity", async () => {
+    const node = new ResourceHandlerNode();
+    const executor = new BlockingResourceExecutor();
+    const allowed = parseNodeId("aaaaaaaaaaaaaaaa");
+    const dispose = attachResourceRequestHandler(node, executor, allowed);
+    const requests = Array.from({ length: 64 }, (_, index) => ({
+      type: "resource" as const,
+      kind: "request" as const,
+      operation: "get" as const,
+      request_id: `request-${index}`,
+      resource_type: "task" as const,
+      resource_id: `task-${index}`,
+    }));
+    const first = requests[0];
+    if (first === undefined) {
+      throw new Error("Expected one Resource request");
+    }
+    const pending = requests.map((request) => node.emit(request, allowed));
+    await Promise.resolve();
+
+    await node.emit({ ...first, request_id: "request-at-capacity" }, allowed);
+    const replay = node.emit(first, allowed);
+    await Promise.resolve();
+
+    expect(executor.requests).toHaveLength(64);
+    expect(node.sent[0]?.message).toMatchObject({ status: 503 });
+    executor.resolveAll();
+    await Promise.all([...pending, replay]);
+    await dispose();
+  });
+
+  it("aborts active Resource executions before detaching the gateway", async () => {
+    const node = new ResourceHandlerNode();
+    const executor = new AbortingResourceExecutor();
+    const allowed = parseNodeId("aaaaaaaaaaaaaaaa");
+    const dispose = attachResourceRequestHandler(node, executor, allowed);
+    const received = node.emit(
+      {
+        type: "resource",
+        kind: "request",
+        operation: "get",
+        request_id: "request-1",
+        resource_type: "task",
+        resource_id: "task-1",
+      },
+      allowed,
+    );
+    await executor.started;
+
+    await dispose();
+    await received;
+
+    expect(executor.aborted).toBe(true);
+    expect(node.sent).toHaveLength(0);
+  });
 });
 
 class ResourceExecutorProbe {
@@ -435,6 +502,64 @@ class ResourceExecutorProbe {
       request_id: request.request_id,
       status: 200,
       body: { ok: true },
+    });
+  }
+}
+
+class BlockingResourceExecutor {
+  readonly requests: ResourceRequest[] = [];
+  readonly #resolvers: ((response: ResourceResponse) => void)[] = [];
+
+  execute(request: ResourceRequest): Promise<ResourceResponse> {
+    this.requests.push(request);
+    return new Promise((resolve) => {
+      this.#resolvers.push(resolve);
+    });
+  }
+
+  resolveAll(): void {
+    for (const [index, resolve] of this.#resolvers.entries()) {
+      resolve({
+        type: "resource",
+        kind: "response",
+        request_id: this.requests[index]?.request_id ?? "missing",
+        status: 200,
+      });
+    }
+  }
+}
+
+class AbortingResourceExecutor {
+  aborted = false;
+  readonly started: Promise<void>;
+  readonly #markStarted: () => void;
+
+  constructor() {
+    let markStarted: () => void = () => undefined;
+    this.started = new Promise((resolve) => {
+      markStarted = resolve;
+    });
+    this.#markStarted = markStarted;
+  }
+
+  execute(
+    _request: ResourceRequest,
+    signal?: AbortSignal,
+  ): Promise<ResourceResponse> {
+    this.#markStarted();
+    return new Promise((_resolve, reject) => {
+      const abort = () => {
+        this.aborted = true;
+        reject(
+          signal?.reason instanceof Error
+            ? signal.reason
+            : new Error("Resource execution aborted"),
+        );
+      };
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted === true) {
+        abort();
+      }
     });
   }
 }
