@@ -1,5 +1,7 @@
 # Atlas FieldLink
 
+For the current evidence map, project boundaries and continuation state, see [project context](docs/project-context.md).
+
 FieldLink delivers registered binary messages through one MeshCore Companion USB radio. The public module is `FieldLinkNode`. A thin NDJSON adapter exposes the same interface across a process boundary, and the local `fieldlink test` command starts two adapters to prove a real RF echo.
 
 ```text

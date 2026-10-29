@@ -2,6 +2,10 @@
 
 This is the entry point for project documentation. Keep the root `README.md` focused on setup, hardware requirements, commands, and expected behavior. Add focused documents here when a subject needs more room.
 
+## Current context
+
+[Project context and continuation](project-context.md) maps implemented scope, current integration boundaries, retained files, and the next evidence needed. It does not replace the operational instructions or define a new protocol version.
+
 ## Project documents
 
 | Location                                                                                                                 | What it holds                                                  | Use it when                                                   |
